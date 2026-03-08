@@ -1,0 +1,40 @@
+# Entorno virtual
+venv/
+ENV/
+env/
+
+# Python
+*.pyc
+*.pyo
+*.pyd
+__pycache__/
+*.so
+
+# Distribución
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Logs y temporales
+*.log
+*.tmp
+*.swp
+*.DS_Store
+
+# Configuración de editores
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Archivos de Jupyter
+.ipynb_checkpoints/
+
+# Archivos de Mininet (si generas topologías o logs)
+*.out
+*.txt
+*.topo
+
+# Configuración sensible
+*.env
