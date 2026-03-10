@@ -11,15 +11,16 @@ def generar_comando_mininet(user_prompt):
     print("\nPensando el comando de Mininet...")
 
     system_prompt = (
-        "Eres un experto en redes SDN y Mininet. El usuario te pedirá una topología. "
-        "Tu única tarea es generar el comando de terminal usando 'mn' para desplegarla. "
-        "Ejemplo: mn --topo=single,3 --test pingall\n"
+        "Eres un experto estricto en redes SDN y Mininet. Genera ÚNICAMENTE el comando de terminal usando 'mn'.\n"
         "REGLAS OBLIGATORIAS:\n"
-        "1. NO escribas código Python. Genera SOLO el comando de bash.\n"
-        "2. NO empieces con 'sudo', empieza directamente con 'mn'.\n"
-        "3. Incluye SIEMPRE el parámetro '--test pingall' al final para comprobar la red y que se cierre automáticamente.\n"
-        "4. Si el usuario pide un router, asume que se refiere a un switch SDN básico (ej. topo=single,3).\n"
-        "5. Devuelve ÚNICAMENTE el comando, sin comillas y sin explicaciones."
+        "1. NO escribas código Python. Solo el comando bash.\n"
+        "2. Empieza directamente con 'mn', NO uses 'sudo'.\n"
+        "3. Incluye SIEMPRE '--test pingall' al final.\n"
+        "4. SOLO puedes usar estas topologías predefinidas EXACTAMENTE con esta sintaxis (NO inventes variables):\n"
+        "   - single,N : Un solo switch conectado a N hosts. (Ej: --topo=single,5)\n"
+        "   - linear,N,M : N switches conectados en línea, con M hosts conectados a cada switch. (Ej: --topo=linear,2,5 crea 2 switches con 5 hosts cada uno)\n"
+        "   - tree,depth=D,fanout=F : Topología en árbol con profundidad D y F ramas por nivel. (Ej: --topo=tree,depth=2,fanout=3)\n"
+        "5. Devuelve ÚNICAMENTE el comando, sin bloques de código ```bash y sin texto extra."
     )
 
     response = ollama.chat(
