@@ -57,25 +57,27 @@ def desplegar_en_vm(comando_mn):
         ssh.connect(hostname=ip_real, username=usuario, password=VM_PASSWORD)
 
         # 1. Limpiar el entorno y ESPERAR a que termine obligatoriamente
-        print(
-            "Limpiando sesiones anteriores de Mininet (esto puede tardar un par de segundos)..."
-        )
+        print("Limpiando sesiones anteriores de Mininet...")
+        # Aquí sí usamos el pipe porque mn -c no es interactivo y no nos importa que se cierre
         stdin, stdout, stderr = ssh.exec_command(f"echo {VM_PASSWORD} | sudo -S mn -c")
-        stdout.channel.recv_exit_status()  # Bloquea la ejecución hasta que mn -c termine de verdad
+        stdout.channel.recv_exit_status()
 
-        # Matamos el tmux viejo (como usuario normal)
+        # Matamos el tmux viejo
         ssh.exec_command("tmux kill-session -t sesion_mininet")
         time.sleep(1)
 
-        # 2. Iniciar tmux vacío en segundo plano (como usuario normal)
+        # 2. Iniciar tmux vacío en segundo plano
         print("Creando sesión de terminal persistente...")
         ssh.exec_command("tmux new-session -d -s sesion_mininet")
         time.sleep(1)
 
-        # 3. Escribir el comando de Mininet dentro de la sesión
-        print(f"Lanzando red: {comando_mn}")
-        comando_lanzar = f"tmux send-keys -t sesion_mininet 'echo {VM_PASSWORD} | sudo -S {comando_mn}' C-m"
-        ssh.exec_command(comando_lanzar)
+        # 3. Escribir el comando de Mininet SIMULANDO TECLADO REAL (sin pipes)
+        print(f"Lanzando red: sudo {comando_mn}")
+        ssh.exec_command(f"tmux send-keys -t sesion_mininet 'sudo {comando_mn}' C-m")
+        time.sleep(1)  # Esperamos 1 segundo a que sudo pida la contraseña
+
+        # Enviamos la contraseña simulando que la tecleamos
+        ssh.exec_command(f"tmux send-keys -t sesion_mininet '{VM_PASSWORD}' C-m")
 
         # Le damos tiempo a Mininet para que levante los nodos
         print("Esperando a que Mininet construya la red (5 segundos)...")
@@ -99,10 +101,7 @@ def desplegar_en_vm(comando_mn):
             print("\n".join(lineas[-15:]))
         print("-----------------------------------------")
 
-        print("\nRed creada. La sesión ESTÁ ABIERTA.")
-        print(
-            "Para ver la sesión en la máquina virtual, ejecuta: tmux attach -t sesion_mininet"
-        )
+        print("\nRed creada. La sesión ESTÁ ABIERTA en el prompt mininet>.")
 
     except Exception as e:
         print(f"Error en la conexión o ejecución: {e}")
