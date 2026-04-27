@@ -1,6 +1,7 @@
 import ollama
 import paramiko
 import os
+import time
 
 VM_MOTE = "mininet"
 VM_PASSWORD = "mininet"
@@ -15,7 +16,7 @@ def generar_comando_mininet(user_prompt):
         "REGLAS OBLIGATORIAS:\n"
         "1. NO escribas código Python. Solo el comando bash.\n"
         "2. Empieza directamente con 'mn', NO uses 'sudo'.\n"
-        "3. Incluye SIEMPRE '--test pingall' al final.\n"
+        "3. NO uses el flag '--test'. Necesitamos que la red se quede abierta interactiva.\n"
         "4. SOLO puedes usar estas topologías predefinidas EXACTAMENTE con esta sintaxis (NO inventes variables):\n"
         "   - single,N : Un solo switch conectado a N hosts. (Ej: --topo=single,5)\n"
         "   - linear,N,M : N switches conectados en línea, con M hosts conectados a cada switch. (Ej: --topo=linear,2,5 crea 2 switches con 5 hosts cada uno)\n"
@@ -55,30 +56,62 @@ def desplegar_en_vm(comando_mn):
     try:
         ssh.connect(hostname=ip_real, username=usuario, password=VM_PASSWORD)
 
-        comando_final = f"echo {VM_PASSWORD} | sudo -S {comando_mn}"
-        print(f"Ejecutando remotamente: sudo {comando_mn}\n")
+        # 1. Limpiar el entorno y ESPERAR a que termine obligatoriamente
+        print(
+            "Limpiando sesiones anteriores de Mininet (esto puede tardar un par de segundos)..."
+        )
+        stdin, stdout, stderr = ssh.exec_command(f"echo {VM_PASSWORD} | sudo -S mn -c")
+        stdout.channel.recv_exit_status()  # Bloquea la ejecución hasta que mn -c termine de verdad
 
-        stdin, stdout, stderr = ssh.exec_command(comando_final)
+        # Matamos el tmux viejo (como usuario normal)
+        ssh.exec_command("tmux kill-session -t sesion_mininet")
+        time.sleep(1)
 
+        # 2. Iniciar tmux vacío en segundo plano (como usuario normal)
+        print("Creando sesión de terminal persistente...")
+        ssh.exec_command("tmux new-session -d -s sesion_mininet")
+        time.sleep(1)
+
+        # 3. Escribir el comando de Mininet dentro de la sesión
+        print(f"Lanzando red: {comando_mn}")
+        comando_lanzar = f"tmux send-keys -t sesion_mininet 'echo {VM_PASSWORD} | sudo -S {comando_mn}' C-m"
+        ssh.exec_command(comando_lanzar)
+
+        # Le damos tiempo a Mininet para que levante los nodos
+        print("Esperando a que Mininet construya la red (5 segundos)...")
+        time.sleep(5)
+
+        # 4. Enviar el comando pingall a la consola de Mininet
+        print("Enviando comando 'pingall'...")
+        ssh.exec_command("tmux send-keys -t sesion_mininet 'pingall' C-m")
+
+        # Esperamos a que termine el pingall
+        time.sleep(5)
+
+        # 5. Capturar la salida de la pantalla de tmux
+        print("Capturando salida de la terminal...")
+        stdin, stdout, stderr = ssh.exec_command("tmux capture-pane -pt sesion_mininet")
         salida = stdout.read().decode()
-        error = stderr.read().decode()
 
-        print("--- RESULTADOS DEL PING ---")
+        print("\n--- RESULTADOS EN LA TERMINAL VIRTUAL ---")
         if salida:
-            print(salida.strip())
-        if error and "[sudo]" not in error:
-            print(f"Alertas de Mininet:\n{error.strip()}")
-        print("---------------------------")
-        print("Red creada, probada y cerrada con éxito.")
+            lineas = [linea for linea in salida.split("\n") if linea.strip()]
+            print("\n".join(lineas[-15:]))
+        print("-----------------------------------------")
+
+        print("\nRed creada. La sesión ESTÁ ABIERTA.")
+        print(
+            "Para ver la sesión en la máquina virtual, ejecuta: tmux attach -t sesion_mininet"
+        )
 
     except Exception as e:
-        print(f"Error al conectar: {e}")
+        print(f"Error en la conexión o ejecución: {e}")
     finally:
         ssh.close()
 
 
 if __name__ == "__main__":
-    print("=== AGENTE IA PARA MININET (VERSIÓN COMANDOS) ===")
+    print("=== AGENTE IA PARA MININET (VERSIÓN SESIÓN PERSISTENTE) ===")
     peticion = input("Describe la red que quieres crear:\n> ")
 
     comando_generado = generar_comando_mininet(peticion)
@@ -87,7 +120,9 @@ if __name__ == "__main__":
     print(f"sudo {comando_generado}")
     print("------------------------\n")
 
-    confirmacion = input("¿Quieres lanzar este comando en la VM? (s/n): ")
+    confirmacion = input(
+        "¿Quieres desplegar esta red de forma persistente en la VM? (s/n): "
+    )
     if confirmacion.lower() == "s":
         desplegar_en_vm(comando_generado)
     else:
