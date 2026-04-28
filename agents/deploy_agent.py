@@ -1,14 +1,19 @@
-import ollama
-import paramiko
+import sys
 import os
+import re
 import time
+import ollama
 
-VM_MOTE = "mininet"
+# Parche para que VS Code encuentre la carpeta utils al darle al Play
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from utils.ssh_client import get_ssh_connection, send_tmux_command, capture_tmux_output
+
 VM_PASSWORD = "mininet"
 MODEL_NAME = "qwen2.5:3b"
 
 
-def generar_comando_mininet(user_prompt):
+def generate_mininet_command(user_prompt):
     print("\nPensando el comando de Mininet...")
 
     system_prompt = (
@@ -32,33 +37,19 @@ def generar_comando_mininet(user_prompt):
         ],
     )
 
-    comando_ia = response["message"]["content"].strip()
-    comando_ia = comando_ia.replace("```bash", "").replace("```", "").strip()
-    return comando_ia
+    ai_command = response["message"]["content"].strip()
+    ai_command = ai_command.replace("```bash", "").replace("```", "").strip()
+    return ai_command
 
 
-def desplegar_en_vm(comando_mn):
-    ssh = paramiko.SSHClient()
-    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-
-    ssh_config = paramiko.SSHConfig()
-    config_path = os.path.expanduser("~/.ssh/config")
-    if os.path.exists(config_path):
-        with open(config_path) as f:
-            ssh_config.parse(f)
-
-    host_conf = ssh_config.lookup(VM_MOTE)
-    ip_real = host_conf.get("hostname", VM_MOTE)
-    usuario = host_conf.get("user", "mininet")
-
-    print(f"\nConectando a '{VM_MOTE}' ({usuario}@{ip_real})...")
+def deploy_in_vm(mininet_command):
+    print("\nConectando a la máquina virtual...")
 
     try:
-        ssh.connect(hostname=ip_real, username=usuario, password=VM_PASSWORD)
+        ssh = get_ssh_connection()
 
         # 1. Limpiar el entorno y ESPERAR a que termine obligatoriamente
         print("Limpiando sesiones anteriores de Mininet...")
-        # Aquí sí usamos el pipe porque mn -c no es interactivo y no nos importa que se cierre
         stdin, stdout, stderr = ssh.exec_command(f"echo {VM_PASSWORD} | sudo -S mn -c")
         stdout.channel.recv_exit_status()
 
@@ -71,13 +62,13 @@ def desplegar_en_vm(comando_mn):
         ssh.exec_command("tmux new-session -d -s sesion_mininet")
         time.sleep(1)
 
-        # 3. Escribir el comando de Mininet SIMULANDO TECLADO REAL (sin pipes)
-        print(f"Lanzando red: sudo {comando_mn}")
-        ssh.exec_command(f"tmux send-keys -t sesion_mininet 'sudo {comando_mn}' C-m")
+        # 3. Escribir el comando de Mininet SIMULANDO TECLADO REAL
+        print(f"Lanzando red: sudo {mininet_command}")
+        send_tmux_command(ssh, f"sudo {mininet_command}")
         time.sleep(1)  # Esperamos 1 segundo a que sudo pida la contraseña
 
         # Enviamos la contraseña simulando que la tecleamos
-        ssh.exec_command(f"tmux send-keys -t sesion_mininet '{VM_PASSWORD}' C-m")
+        send_tmux_command(ssh, VM_PASSWORD)
 
         # Le damos tiempo a Mininet para que levante los nodos
         print("Esperando a que Mininet construya la red (5 segundos)...")
@@ -85,44 +76,58 @@ def desplegar_en_vm(comando_mn):
 
         # 4. Enviar el comando pingall a la consola de Mininet
         print("Enviando comando 'pingall'...")
-        ssh.exec_command("tmux send-keys -t sesion_mininet 'pingall' C-m")
-
-        # Esperamos a que termine el pingall
+        send_tmux_command(ssh, "pingall")
         time.sleep(5)
 
-        # 5. Capturar la salida de la pantalla de tmux
-        print("Capturando salida de la terminal...")
-        stdin, stdout, stderr = ssh.exec_command("tmux capture-pane -pt sesion_mininet")
-        salida = stdout.read().decode()
+        # 4.5. ACTIVACIÓN DE SERVIDORES IPERF (NUEVO)
+        print("Activando servidores iperf en todos los nodos...")
+        # Capturamos nodos para saber a quién activar
+        output_nodes = capture_tmux_output(ssh)
+        active_hosts = re.findall(r"\bh\d+\b", output_nodes)
+
+        for host in sorted(list(set(active_hosts))):
+            print(f" -> Levantando iperf en {host}")
+            send_tmux_command(ssh, f"{host} iperf -s -D")
+            time.sleep(0.2)
+
+        # 5. Capturar la salida final
+        print("\nCapturando estado final de la terminal...")
+        output = capture_tmux_output(ssh)
 
         print("\n--- RESULTADOS EN LA TERMINAL VIRTUAL ---")
-        if salida:
-            lineas = [linea for linea in salida.split("\n") if linea.strip()]
-            print("\n".join(lineas[-15:]))
+        if output:
+            lines = [line for line in output.split("\n") if line.strip()]
+            # Mostramos un resumen de las últimas líneas
+            print("\n".join(lines[-15:]))
         print("-----------------------------------------")
 
-        print("\nRed creada. La sesión ESTÁ ABIERTA en el prompt mininet>.")
+        print("\nRed desplegada correctamente.")
+        print("Todos los hosts tienen el servidor iperf escuchando.")
+        print("La sesión está abierta. Puedes verla con: tmux attach -t sesion_mininet")
 
     except Exception as e:
         print(f"Error en la conexión o ejecución: {e}")
     finally:
-        ssh.close()
+        if "ssh" in locals():
+            ssh.close()
 
 
 if __name__ == "__main__":
-    print("=== AGENTE IA PARA MININET (VERSIÓN SESIÓN PERSISTENTE) ===")
-    peticion = input("Describe la red que quieres crear:\n> ")
+    print("=== AGENTE IA DE DESPLIEGUE (Mininet AIOps) ===")
+    user_request = input(
+        "Describe la red que quieres crear (Ej: 'una red en árbol con profundidad 2 y fanout 3'):\n> "
+    )
 
-    comando_generado = generar_comando_mininet(peticion)
+    generated_command = generate_mininet_command(user_request)
 
     print("\n--- COMANDO GENERADO ---")
-    print(f"sudo {comando_generado}")
+    print(f"sudo {generated_command}")
     print("------------------------\n")
 
-    confirmacion = input(
+    confirmation = input(
         "¿Quieres desplegar esta red de forma persistente en la VM? (s/n): "
     )
-    if confirmacion.lower() == "s":
-        desplegar_en_vm(comando_generado)
+    if confirmation.lower() == "s":
+        deploy_in_vm(generated_command)
     else:
         print("Operación cancelada.")
