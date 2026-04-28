@@ -115,6 +115,9 @@ def run_monitor_agent():
 
     report = generate_network_report(telemetry)
 
+    with open("ultimo_informe.txt", "w", encoding="utf-8") as f:
+        f.write(report)
+
     print("\n================ INFORME DE LA IA ================")
     print(report)
     print("==================================================")
