@@ -30,7 +30,7 @@ def get_active_hosts():
 
 
 def generate_bulk_traffic(hosts):
-    print(f"\n[IA] Planificando ataque de tráfico masivo para {len(hosts)} hosts...")
+    print(f"\n[IA] Planificando ráfaga de tráfico masivo para {len(hosts)} hosts...")
 
     hosts_list = ", ".join(hosts)
 
@@ -76,12 +76,25 @@ def generate_bulk_traffic(hosts):
 def run_bulk_traffic():
     print("=== AGENTE GENERADOR DE TRÁFICO MASIVO ===")
 
-    hosts = get_active_hosts()
-    if not hosts:
-        print("Error: No se detectan hosts. ¿Está la red levantada?")
-        return
+    repetir = input(
+        "\n¿Quieres REPETIR la última ráfaga de tráfico para verificar la QoS? (s/n): "
+    )
 
-    commands = generate_bulk_traffic(hosts)
+    if repetir.lower() == "s" and os.path.exists("ultima_rafaga.txt"):
+        print("[SISTEMA] Cargando comandos de la ráfaga anterior...")
+        with open("ultima_rafaga.txt", "r") as f:
+            commands = [line.strip() for line in f.readlines() if line.strip()]
+    else:
+        # Modo normal (Nuevo ráfaga)
+        hosts = get_active_hosts()
+        if not hosts:
+            print("Error: No se detectan hosts. ¿Está la red levantada?")
+            return
+        commands = generate_bulk_traffic(hosts)
+
+        # Guardamos el nuevo ráfaga para el futuro
+        with open("ultima_rafaga.txt", "w") as f:
+            f.write("\n".join(commands))
 
     print(f"\n[PLAN DE EJECUCIÓN] Se lanzarán {len(commands)} flujos:")
     for c in commands:
@@ -92,7 +105,9 @@ def run_bulk_traffic():
 
         # 1. Lanzamos todos los flujos
         for cmd in commands:
-            send_tmux_command(ssh, cmd)
+            # Quitamos el '&' si lo tiene, le añadimos la redirección al agujero negro y volvemos a poner '&'
+            cmd_silenciado = cmd.replace("&", "").strip() + " > /dev/null 2>&1 &"
+            send_tmux_command(ssh, cmd_silenciado)
             time.sleep(0.1)
 
         # 2. Calculamos el tiempo de espera
@@ -105,7 +120,7 @@ def run_bulk_traffic():
 
         # 3. DISPARAMOS EL AGENTE MONITOR AUTOMÁTICAMENTE
         print(
-            "\n[ORQUESTACIÓN] Despertando al Agente Monitor para que analice este ataque..."
+            "\n[ORQUESTACIÓN] Despertando al Agente Monitor para que analice esta ráfaga..."
         )
         ruta_monitor = os.path.join(os.path.dirname(__file__), "monitor_agent.py")
 
@@ -114,7 +129,7 @@ def run_bulk_traffic():
 
         # 4. Esperamos a que el tráfico termine (nuestra cuenta atrás de iperf)
         time.sleep(max_wait)
-        print("\n[TRÁFICO] El ataque de tráfico físico ha finalizado en la red.")
+        print("\n[TRÁFICO] El ráfaga de tráfico físico ha finalizado en la red.")
 
         # 5. SINCRONIZACIÓN (La magia para que no se corte)
         # Comprobamos si el Monitor sigue trabajando. Si es así, le esperamos.
