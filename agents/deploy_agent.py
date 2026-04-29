@@ -13,6 +13,29 @@ VM_PASSWORD = "mininet"
 MODEL_NAME = "qwen2.5:3b"
 
 
+def clear_agent_memory():
+    """Borra los archivos de estado de los agentes para empezar con la memoria en blanco."""
+    print("Limpiando memoria de los agentes (JSON/TXT)...")
+    files_to_delete = [
+        "network_history.json",
+        "ultimo_informe.txt",
+        "ultima_rafaga.txt",
+    ]
+
+    # Buscamos tanto en la carpeta actual donde se ejecuta como en la carpeta agents
+    search_paths = [os.getcwd(), os.path.dirname(os.path.abspath(__file__))]
+
+    for base_path in search_paths:
+        for filename in files_to_delete:
+            file_path = os.path.join(base_path, filename)
+            if os.path.exists(file_path):
+                try:
+                    os.remove(file_path)
+                    print(f" -> Archivo borrado: {filename}")
+                except Exception as e:
+                    pass
+
+
 def generate_mininet_command(user_prompt):
     print("\nPensando el comando de Mininet...")
 
@@ -48,8 +71,11 @@ def deploy_in_vm(mininet_command):
     try:
         ssh = get_ssh_connection()
 
+        # 0. Limpiar la memoria de los archivos locales (NUEVO)
+        clear_agent_memory()
+
         # 1. Limpiar el entorno y ESPERAR a que termine obligatoriamente
-        print("Limpiando sesiones anteriores de Mininet...")
+        print("Limpiando sesiones anteriores de Mininet en la VM...")
         stdin, stdout, stderr = ssh.exec_command(f"echo {VM_PASSWORD} | sudo -S mn -c")
         stdout.channel.recv_exit_status()
 
@@ -79,7 +105,7 @@ def deploy_in_vm(mininet_command):
         send_tmux_command(ssh, "pingall")
         time.sleep(5)
 
-        # 4.5. ACTIVACIÓN DE SERVIDORES IPERF (NUEVO)
+        # 4.5. ACTIVACIÓN DE SERVIDORES IPERF
         print("Activando servidores iperf en todos los nodos...")
         # Capturamos nodos para saber a quién activar
         output_nodes = capture_tmux_output(ssh)

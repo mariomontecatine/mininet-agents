@@ -2,6 +2,7 @@ import sys
 import os
 import json
 import ollama
+import time
 
 # Parche de rutas para VS Code
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -56,7 +57,7 @@ def execute_resolution(decision):
 
     accion = decision.get("action", "none")
     puerto = decision.get("target_port")
-    limite = decision.get("rate_limit", "10mbit")
+    limite = decision.get("rate_limit", "20mbit")
     motivo = decision.get("reason", "Mantenimiento preventivo")
 
     print(f"\n--- DECISIÓN DEL NOC AUTOMATIZADO ---")
@@ -67,25 +68,30 @@ def execute_resolution(decision):
     print("-------------------------------------")
 
     if accion == "apply_qos" and puerto and puerto != "null":
-        print(f"\n[EJECUCIÓN] Inyectando reglas de Traffic Control (tc) en {puerto}...")
+        print(f"\n[EJECUCIÓN] Inyectando reglas Open vSwitch (OVS) en {puerto}...")
         try:
             ssh = get_ssh_connection()
 
-            # Comando de Linux/Mininet para aplicar QoS (Rate Limiting)
-            # Primero borramos cualquier regla previa por si acaso, y luego aplicamos la nueva
-            cmd_clear = f"sh tc qdisc del dev {puerto} root 2>/dev/null"
-            cmd_qos = f"sh tc qdisc add dev {puerto} root tbf rate {limite} burst 32kbit latency 400ms"
+            # En Open vSwitch, 20mbit se escriben como 20000 kbps.
+            # Ingress policing corta de raíz el tráfico que ENTRA por ese puerto.
+            cmd_qos_rate = (
+                f"sh ovs-vsctl set interface {puerto} ingress_policing_rate=20000"
+            )
+            cmd_qos_burst = (
+                f"sh ovs-vsctl set interface {puerto} ingress_policing_burst=2000"
+            )
 
-            send_tmux_command(ssh, cmd_clear)
-            send_tmux_command(ssh, cmd_qos)
+            send_tmux_command(ssh, cmd_qos_rate)
+            time.sleep(0.5)
+            send_tmux_command(ssh, cmd_qos_burst)
 
-            print(f"[COMANDO] {cmd_qos}")
+            print(f"[COMANDO] {cmd_qos_rate}")
             print(
-                f"[OK] Límite de ancho de banda ({limite}) aplicado con éxito en {puerto}. Tráfico estabilizado."
+                f"[OK] Límite de hardware OVS (20mbit) aplicado con éxito en {puerto}."
             )
             ssh.close()
         except Exception as e:
-            print(f"Error al aplicar la regla QoS: {e}")
+            print(f"Error al aplicar la regla OVS: {e}")
     else:
         print("\n[EJECUCIÓN] No se requiere modificación en la infraestructura.")
 
