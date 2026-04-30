@@ -38,3 +38,9 @@ dist/
 
 # Configuración sensible
 *.env
+
+# Archivos de estado de la IA
+network_history.json
+ultimo_informe.txt
+ultima_rafaga.txt
+topologia_red.png

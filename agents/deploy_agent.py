@@ -8,6 +8,7 @@ import ollama
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from utils.ssh_client import get_ssh_connection, send_tmux_command, capture_tmux_output
+from agents.topology import run_visualizer
 
 VM_PASSWORD = "mininet"
 MODEL_NAME = "qwen2.5:3b"
@@ -20,6 +21,7 @@ def clear_agent_memory():
         "network_history.json",
         "ultimo_informe.txt",
         "ultima_rafaga.txt",
+        "ultimo_ataque.txt",
     ]
 
     # Buscamos tanto en la carpeta actual donde se ejecuta como en la carpeta agents
@@ -129,6 +131,21 @@ def deploy_in_vm(mininet_command):
 
         print("\nRed desplegada correctamente.")
         print("Todos los hosts tienen el servidor iperf escuchando.")
+        print("La sesión está abierta. Puedes verla con: tmux attach -t sesion_mininet")
+        print("\n--- RESULTADOS EN LA TERMINAL VIRTUAL ---")
+        if output:
+            lines = [line for line in output.split("\n") if line.strip()]
+            # Mostramos un resumen de las últimas líneas
+            print("\n".join(lines[-15:]))
+        print("-----------------------------------------")
+
+        print("\nRed desplegada correctamente.")
+        print("Todos los hosts tienen el servidor iperf escuchando.")
+
+        # --- NUEVA LLAMADA AL VISUALIZADOR ---
+        run_visualizer()
+        # -------------------------------------
+
         print("La sesión está abierta. Puedes verla con: tmux attach -t sesion_mininet")
 
     except Exception as e:

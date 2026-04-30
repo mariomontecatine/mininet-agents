@@ -146,5 +146,28 @@ def run_bulk_traffic():
         print(f"Error en ejecución: {e}")
 
 
+def run_bulk_traffic_logic(commands):
+    """Ejecuta una lista de comandos iperf silenciosamente."""
+    try:
+        ssh = get_ssh_connection()
+        for cmd in commands:
+            cmd_silenciado = cmd.replace("&", "").strip() + " > /dev/null 2>&1 &"
+            send_tmux_command(ssh, cmd_silenciado)
+            time.sleep(0.1)
+
+        # Encontramos el tiempo máximo (el -t más grande)
+        max_wait = 10
+        for cmd in commands:
+            match = re.search(r"-t\s+(\d+)", cmd)
+            if match:
+                max_wait = max(max_wait, int(match.group(1)))
+
+        print(f" -> Esperando {max_wait} segundos a que la ráfaga termine...")
+        time.sleep(max_wait)
+        ssh.close()
+    except Exception as e:
+        print(f"Error inyectando tráfico: {e}")
+
+
 if __name__ == "__main__":
     run_bulk_traffic()
