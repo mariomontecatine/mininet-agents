@@ -9,6 +9,7 @@ env/
 *.pyd
 __pycache__/
 *.so
+lib/
 
 # Distribución
 build/
