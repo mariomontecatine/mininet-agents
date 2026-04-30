@@ -56,7 +56,7 @@ def run_aiops_pipeline():
     comandos_trafico = generate_bulk_traffic(hosts)
 
     # Guardamos los comandos en memoria temporal para el re-test
-    with open("ultimo_ataque.txt", "w") as f:
+    with open("ultima_rafaga.txt", "w") as f:
         f.write("\n".join(comandos_trafico))
 
     print(f"[SUPERVISOR] Lanzando {len(comandos_trafico)} flujos en background...")

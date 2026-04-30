@@ -7,7 +7,12 @@ import ollama
 # Parche para que VS Code encuentre la carpeta utils al darle al Play
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from utils.ssh_client import get_ssh_connection, send_tmux_command, capture_tmux_output
+from utils.ssh_client import (
+    get_ssh_connection,
+    send_tmux_command,
+    capture_tmux_output,
+    wait_for_mininet_prompt,
+)
 from agents.topology import run_visualizer
 
 VM_PASSWORD = "mininet"
@@ -103,9 +108,9 @@ def deploy_in_vm(mininet_command):
         time.sleep(5)
 
         # 4. Enviar el comando pingall a la consola de Mininet
-        print("Enviando comando 'pingall'...")
+        print("Enviando comando 'pingall' (puede tardar en redes grandes)...")
         send_tmux_command(ssh, "pingall")
-        time.sleep(5)
+        wait_for_mininet_prompt(ssh, timeout=90)
 
         # 4.5. ACTIVACIÓN DE SERVIDORES IPERF
         print("Activando servidores iperf en todos los nodos...")
@@ -132,15 +137,6 @@ def deploy_in_vm(mininet_command):
         print("\nRed desplegada correctamente.")
         print("Todos los hosts tienen el servidor iperf escuchando.")
         print("La sesión está abierta. Puedes verla con: tmux attach -t sesion_mininet")
-        print("\n--- RESULTADOS EN LA TERMINAL VIRTUAL ---")
-        if output:
-            lines = [line for line in output.split("\n") if line.strip()]
-            # Mostramos un resumen de las últimas líneas
-            print("\n".join(lines[-15:]))
-        print("-----------------------------------------")
-
-        print("\nRed desplegada correctamente.")
-        print("Todos los hosts tienen el servidor iperf escuchando.")
 
         # --- NUEVA LLAMADA AL VISUALIZADOR ---
         run_visualizer()
@@ -158,7 +154,7 @@ def deploy_in_vm(mininet_command):
 if __name__ == "__main__":
     print("=== AGENTE IA DE DESPLIEGUE (Mininet AIOps) ===")
     user_request = input(
-        "Describe la red que quieres crear (Ej: 'una red en árbol con profundidad 2 y fanout 3'):\n> "
+        "Describe la red que quieres crear (Ej: 'una red en árbol con profundidad 3 y fanout 3'):\n> "
     )
 
     generated_command = generate_mininet_command(user_request)

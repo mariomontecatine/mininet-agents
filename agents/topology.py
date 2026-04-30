@@ -1,8 +1,6 @@
 import sys
 import os
-import time
-import networkx as nx
-import matplotlib.pyplot as plt
+from pyvis.network import Network
 
 # Parche de rutas para VS Code
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -16,38 +14,42 @@ from utils.ssh_client import (
 
 
 def get_topology_links():
-    """Se conecta a Mininet y extrae los enlaces físicos activos."""
+    """Se conecta a Mininet, lanza 'links' y lee el historial completo de Tmux."""
     print("\n[VISUALIZADOR] Extrayendo topología física de Mininet...")
     try:
         ssh = get_ssh_connection()
 
-        # Limpiamos buffer y lanzamos el comando 'links'
+        # 1. Aseguramos que la consola está limpia y lista
         send_tmux_command(ssh, "")
-        wait_for_mininet_prompt(ssh, timeout=2)
-
-        send_tmux_command(ssh, "links")
         wait_for_mininet_prompt(ssh, timeout=5)
 
-        raw_output = capture_tmux_output(ssh)
+        # 2. Lanzamos el comando normal de links
+        send_tmux_command(ssh, "links")
+        wait_for_mininet_prompt(ssh, timeout=10)
+
+        # 3. EL TRUCO MAESTRO (Versión Definitiva):
+        # Le pedimos a Tmux que nos escupa las últimas 1000 líneas de historial (scrollback).
+        # Así no importa si la pantalla visible es pequeña, capturaremos el árbol entero.
+        stdin, stdout, stderr = ssh.exec_command(
+            "tmux capture-pane -p -t sesion_mininet -S -1000"
+        )
+        raw_output = stdout.read().decode("utf-8")
+
         ssh.close()
 
-        # Parsear la salida. Las líneas de enlaces suelen ser: h1-eth0<->s1-eth1 (OK OK)
         links = []
-        for line in raw_output.split("\n"):
-            if "<->" in line:
-                try:
-                    # Separamos por la flecha doble
-                    parts = line.split("<->")
-                    # El nodo 1 es lo que hay antes de "-eth" en la parte izquierda
-                    node1 = parts[0].split("-eth")[0].strip()
-                    # El nodo 2 es lo que hay antes de "-eth" en la parte derecha (quitando lo de OK OK)
-                    node2 = parts[1].split()[0].split("-eth")[0].strip()
+        import re
 
-                    # Evitamos meter basura
-                    if node1 and node2:
-                        links.append((node1, node2))
-                except Exception:
-                    continue
+        # Buscamos coincidencias tipo s1-eth1<->h1-eth0
+        matches = re.findall(
+            r"([a-zA-Z0-9_]+)-eth\d+<->([a-zA-Z0-9_]+)-eth\d+", raw_output
+        )
+
+        for node1, node2 in matches:
+            links.append((node1, node2))
+
+        # Eliminar duplicados
+        links = list(set(links))
 
         return links
     except Exception as e:
@@ -55,55 +57,69 @@ def get_topology_links():
         return []
 
 
-def draw_topology(links, output_file="topologia_red.png"):
-    """Dibuja el grafo de la red y lo guarda como imagen."""
+def draw_topology(links, output_file="topologia_interactiva.html"):
+    """Dibuja el grafo de la red con físicas e iconos locales y lo guarda como HTML."""
     if not links:
         print("[VISUALIZADOR] No hay enlaces para dibujar.")
         return
 
-    print("[VISUALIZADOR] Dibujando mapa de la red...")
+    print("[VISUALIZADOR] Generando Gemelo Digital interactivo...")
 
-    # Crear el grafo
-    G = nx.Graph()
-    G.add_edges_from(links)
+    # Crear la red con fondo blanco
+    net = Network(height="800px", width="100%", bgcolor="#ffffff", font_color="black")
 
-    # Colorear nodos (Hosts en verde, Switches en azul)
-    color_map = []
-    for node in G:
-        if node.startswith("h"):
-            color_map.append("lightgreen")
-        else:
-            color_map.append("lightblue")
-
-    # Configurar el lienzo
-    plt.figure(figsize=(12, 8))
-
-    # Algoritmo de posicionamiento (spring_layout simula muelles, queda muy natural)
-    pos = nx.spring_layout(G, k=0.5, iterations=50)
-
-    # Dibujar
-    nx.draw(
-        G,
-        pos,
-        node_color=color_map,
-        with_labels=True,
-        node_size=1500,
-        font_weight="bold",
-        font_size=10,
-        edge_color="gray",
-        width=2,
+    # Motor de física Force Atlas (fíjate en el nombre exacto de la función)
+    net.force_atlas_2based(
+        gravity=-60, central_gravity=0.01, spring_length=120, spring_strength=0.05
     )
 
-    plt.title("Topología de Mininet", size=15)
+    # Rutas relativas a la carpeta 'iconos' que acabas de crear
+    ICON_PC = "icons/pc.png"
+    ICON_SWITCH = "icons/switch.png"
+
+    nodes_added = set()
+
+    for node1, node2 in links:
+        # Añadir nodos con sus iconos locales
+        for node in (node1, node2):
+            if node not in nodes_added:
+                if node.startswith("h"):
+                    # Nodos Host: más pequeños, fuente ajustada abajo
+                    net.add_node(
+                        node,
+                        label=node,
+                        shape="image",
+                        image=ICON_PC,
+                        size=25,
+                        font={"size": 14, "color": "#333333", "vadjust": 35},
+                    )
+                else:
+                    # Nodos Switch/Router: más grandes, fuente en negrita
+                    net.add_node(
+                        node,
+                        label=node,
+                        shape="image",
+                        image=ICON_SWITCH,
+                        size=35,
+                        font={
+                            "size": 16,
+                            "color": "black",
+                            "vadjust": 45,
+                            "face": "bold",
+                        },
+                    )
+                nodes_added.add(node)
+
+        # Añadir el cable (arista) un poco más sutil
+        net.add_edge(node1, node2, color="#A0A0A0", width=1.5)
 
     # Guardar en la raíz del proyecto
     ruta_guardado = os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))), output_file
     )
-    plt.savefig(ruta_guardado, format="PNG")
-    plt.close()
+    net.write_html(ruta_guardado)
 
-    print(f"[VISUALIZADOR] ✅ Topología guardada con éxito en: {ruta_guardado}")
+    print(f"[VISUALIZADOR] ✅ Mapa interactivo guardado en: {ruta_guardado}")
 
 
 def run_visualizer():
