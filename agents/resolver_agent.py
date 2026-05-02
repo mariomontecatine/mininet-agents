@@ -1,6 +1,5 @@
 import sys
 import os
-import json
 import ollama
 import time
 
@@ -9,45 +8,88 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from utils.ssh_client import get_ssh_connection, send_tmux_command
 
-MODEL_NAME = "qwen2.5:3b"
+# Cambiamos al modelo recomendado por tu tutor.
+# Recuerda hacer 'ollama pull gemma2' en tu terminal.
+MODEL_NAME = "gemma2"
 
 
 def analyze_and_decide(report_text):
-    print(
-        "\n[IA] Evaluando el informe para aplicar políticas de Calidad de Servicio (QoS)..."
-    )
+    print("\n[IA] Evaluando el informe con Tool Calling para aplicar QoS...")
 
     system_prompt = (
         "Eres un Orquestador Automático de Redes (SDN/QoS).\n"
-        "Tu trabajo es leer el informe del Monitor y aplicar control de tráfico (Rate Limiting) en el puerto FÍSICO más saturado.\n\n"
-        "REGLAS CRÍTICAS (¡OBLIGATORIAS!):\n"
-        "1. IGNORA EL PUERTO 'LOCAL'. Nunca apliques QoS al puerto LOCAL. Es una interfaz interna.\n"
-        "2. Identifica el puerto físico (ej. s3-eth2, s4-eth4) con peor congestión o más [TRÁFICO EXTREMO].\n"
-        "3. Si hay congestión, el 'rate_limit' DEBE ser exactamente '20mbit'. NUNCA uses 'null' o 'None' si aplicas QoS.\n"
-        "4. DEBES devolver ÚNICAMENTE un JSON válido, sin texto extra.\n\n"
-        "FORMATO DE SALIDA (ESTRICTO JSON):\n"
-        "{\n"
-        '  "action": "apply_qos" o "none",\n'
-        '  "target_port": "nombre del puerto FÍSICO o null",\n'
-        '  "rate_limit": "20mbit",\n'
-        '  "reason": "Explicación técnica de la decisión"\n'
-        "}"
+        "Tu trabajo es leer el informe del Monitor y decidir si es necesario aplicar "
+        "control de tráfico (Rate Limiting) en el puerto FÍSICO más saturado.\n"
+        "REGLAS CRÍTICAS:\n"
+        "1. IGNORA EL PUERTO 'LOCAL'. Nunca apliques QoS al puerto LOCAL.\n"
+        "2. Identifica el puerto físico (ej. s3-eth2, s4-eth4) con peor congestión (mayor rx_delta).\n"
+        "3. Si hay congestión, DEBES usar la herramienta 'apply_qos'. Si la red está sana, no hagas nada."
     )
 
-    response = ollama.chat(
-        model=MODEL_NAME,
-        format="json",  # Obligamos a la IA a no divagar
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"INFORME DEL MONITOR:\n{report_text}"},
-        ],
-    )
+    # AQUÍ ESTÁ LA MAGIA: Definimos la "Herramienta" (Tool)
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "apply_qos",
+                "description": "Aplica límite de ancho de banda (QoS) a un puerto físico congestionado.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "target_port": {
+                            "type": "string",
+                            "description": "El identificador exacto del puerto FÍSICO a limitar (ej. s5-eth3). NUNCA usar LOCAL.",
+                        },
+                        "rate_limit": {
+                            "type": "string",
+                            "description": 'El límite de ancho de banda a aplicar. DEBE ser siempre "20mbit".',
+                            "enum": ["20mbit"],
+                        },
+                        "reason": {
+                            "type": "string",
+                            "description": "Breve explicación técnica de por qué se eligió este puerto exacto.",
+                        },
+                    },
+                    "required": ["target_port", "rate_limit", "reason"],
+                },
+            },
+        }
+    ]
 
     try:
-        decision = json.loads(response["message"]["content"])
-        return decision
-    except json.JSONDecodeError:
-        print("[ERROR CRÍTICO] La IA no devolvió un JSON válido.")
+        # Llamada a la IA pasándole nuestras herramientas
+        response = ollama.chat(
+            model=MODEL_NAME,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"INFORME DEL MONITOR:\n{report_text}"},
+            ],
+            tools=tools,  # <--- Activamos el Tool Calling
+        )
+
+        # Comprobamos si la IA ha decidido usar la herramienta
+        if response.get("message", {}).get("tool_calls"):
+            # Cogemos la primera herramienta que ha decidido usar
+            tool_call = response["message"]["tool_calls"][0]
+
+            if tool_call["function"]["name"] == "apply_qos":
+                argumentos = tool_call["function"]["arguments"]
+
+                # Construimos el diccionario que espera nuestra función de ejecución
+                decision = {
+                    "action": "apply_qos",
+                    "target_port": argumentos.get("target_port"),
+                    "rate_limit": argumentos.get("rate_limit", "20mbit"),
+                    "reason": argumentos.get("reason"),
+                }
+                return decision
+
+        # Si no usó la herramienta, es que decidió que no hace falta QoS
+        print("[IA] La red parece estable. No se invocaron herramientas de mitigación.")
+        return {"action": "none"}
+
+    except Exception as e:
+        print(f"[ERROR CRÍTICO] Fallo en la comunicación con Ollama: {e}")
         return None
 
 
@@ -67,13 +109,12 @@ def execute_resolution(decision):
     print(f" > Motivo:  {motivo}")
     print("-------------------------------------")
 
-    if accion == "apply_qos" and puerto and puerto != "null":
+    if accion == "apply_qos" and puerto and puerto.lower() != "null":
         print(f"\n[EJECUCIÓN] Inyectando reglas Open vSwitch (OVS) en {puerto}...")
         try:
             ssh = get_ssh_connection()
 
             # En Open vSwitch, 20mbit se escriben como 20000 kbps.
-            # Ingress policing corta de raíz el tráfico que ENTRA por ese puerto.
             cmd_qos_rate = (
                 f"sh ovs-vsctl set interface {puerto} ingress_policing_rate=20000"
             )
@@ -103,7 +144,7 @@ def run_resolver_agent():
 
     if not os.path.exists(archivo_informe):
         print(
-            f"[ERROR] No se encontró '{archivo_informe}'. Debes ejecutar el Agente Monitor (o Tráfico) primero."
+            f"[ERROR] No se encontró '{archivo_informe}'. Ejecuta el Agente Monitor primero."
         )
         return
 
