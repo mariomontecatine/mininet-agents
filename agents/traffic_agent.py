@@ -30,7 +30,7 @@ def get_active_hosts():
 
 
 def generate_bulk_traffic(hosts):
-    print(f"\n[IA] Planificando ráfaga de tráfico masivo para {len(hosts)} hosts...")
+    print(f"\n[IA] Planificando ráfaga de tráfico para {len(hosts)} hosts...")
 
     hosts_list = ", ".join(hosts)
 
@@ -74,7 +74,7 @@ def generate_bulk_traffic(hosts):
 
 
 def run_bulk_traffic():
-    print("=== AGENTE GENERADOR DE TRÁFICO MASIVO ===")
+    print("=== AGENTE GENERADOR DE TRÁFICO ===")
 
     repetir = input(
         "\n¿Quieres REPETIR la última ráfaga de tráfico para verificar la QoS? (s/n): "

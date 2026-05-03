@@ -8,9 +8,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from utils.ssh_client import get_ssh_connection, send_tmux_command
 
-# Cambiamos al modelo recomendado por tu tutor.
-# Recuerda hacer 'ollama pull gemma2' en tu terminal.
-MODEL_NAME = "gemma2"
+MODEL_NAME = "qwen2.5:3b"
 
 
 def analyze_and_decide(report_text):
