@@ -1,0 +1,8 @@
+ -> h7 se conecta a h15 | Perfil: Netflix_4K
+ -> h16 se conecta a h6 | Perfil: Descarga_P2P
+ -> h10 se conecta a h12 | Perfil: IoT_Sensor
+ -> h14 se conecta a h9 | Perfil: Descarga_P2P
+ -> h2 se conecta a h3 | Perfil: Navegacion_Web
+ -> h8 se conecta a h13 | Perfil: IoT_Sensor
+ -> h4 se conecta a h1 | Perfil: Navegacion_Web
+ -> h5 se conecta a h11 | Perfil: Navegacion_Web

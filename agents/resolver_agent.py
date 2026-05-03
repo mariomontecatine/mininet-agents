@@ -30,25 +30,16 @@ def analyze_and_decide(report_text):
             "type": "function",
             "function": {
                 "name": "apply_qos",
-                "description": "Aplica límite de ancho de banda (QoS) a un puerto físico congestionado.",
+                "description": "Aplica QoS (20mbit) a un puerto físico para mitigar congestión.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "target_port": {
                             "type": "string",
-                            "description": "El identificador exacto del puerto FÍSICO a limitar (ej. s5-eth3). NUNCA usar LOCAL.",
-                        },
-                        "rate_limit": {
-                            "type": "string",
-                            "description": 'El límite de ancho de banda a aplicar. DEBE ser siempre "20mbit".',
-                            "enum": ["20mbit"],
-                        },
-                        "reason": {
-                            "type": "string",
-                            "description": "Breve explicación técnica de por qué se eligió este puerto exacto.",
-                        },
+                            "description": "El puerto físico congestionado (ej. s5-eth3). NUNCA LOCAL.",
+                        }
                     },
-                    "required": ["target_port", "rate_limit", "reason"],
+                    "required": ["target_port"],
                 },
             },
         }
@@ -73,12 +64,12 @@ def analyze_and_decide(report_text):
             if tool_call["function"]["name"] == "apply_qos":
                 argumentos = tool_call["function"]["arguments"]
 
-                # Construimos el diccionario que espera nuestra función de ejecución
+                # Construimos la decisión con valores predeterminados seguros
                 decision = {
                     "action": "apply_qos",
                     "target_port": argumentos.get("target_port"),
-                    "rate_limit": argumentos.get("rate_limit", "20mbit"),
-                    "reason": argumentos.get("reason"),
+                    "rate_limit": "20mbit",
+                    "reason": "Mitigación automática aplicada por el NOC.",
                 }
                 return decision
 
