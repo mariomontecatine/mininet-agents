@@ -9,5 +9,6 @@ __pycache__/
 network_history.json
 ultimo_informe.txt
 ultima_rafaga.txt
+ultima_rafaga_realista.txt
 
 topologia_interactiva.html
