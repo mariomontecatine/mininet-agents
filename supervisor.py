@@ -5,36 +5,32 @@ import time
 # Nos aseguramos de que Python encuentre la carpeta agents
 sys.path.append(os.path.join(os.path.dirname(__file__), "agents"))
 
-# Importamos las funciones principales de nuestros agentes
-try:
-    from agents.deploy_agent import (
-        clear_agent_memory,
-        generate_mininet_command,
-        deploy_in_vm,
-    )
-    from agents.traffic_agent import (
-        get_active_hosts,
-        generate_bulk_traffic,
-        run_bulk_traffic_logic,
-    )
-    from agents.monitor_agent import collect_telemetry, generate_network_report
-    from agents.resolver_agent import analyze_and_decide, execute_resolution
-except ImportError as e:
-    print(f"Error importando módulos: {e}")
-    sys.exit(1)
+from agents.deploy_agent import (
+    clear_agent_memory,
+    generate_mininet_command,
+    deploy_in_vm,
+)
+from agents.traffic_agent import (
+    get_active_hosts,
+    generate_bulk_traffic,
+    run_bulk_traffic_logic,
+)
+from agents.monitor_agent import collect_telemetry, generate_network_report
+from agents.resolver_agent import analyze_and_decide, execute_resolution
 
 
 def print_header(texto):
-    print("\n" + "=" * 50)
-    print(f" {texto.upper()} ".center(50, "="))
-    print("=" * 50 + "\n")
+    print("\n" + "=" * 60)
+    print(f" {texto.upper()} ".center(60, "="))
+    print("=" * 60 + "\n")
 
 
 def run_aiops_pipeline():
-    print_header("INICIANDO SUPERVISOR AIOPS")
+    print_header("INICIANDO SUPERVISOR AIOPS (MODO NOC CONTINUO)")
 
-    # --- FASE 1: DESPLIEGUE ---
-    print_header("FASE 1: DESPLIEGUE DE INFRAESTRUCTURA")
+    # =======================================================
+    # === FASE 1: SETUP DE INFRAESTRUCTURA (Solo 1 vez) =====
+    # =======================================================
     clear_agent_memory()
     user_request = input(
         "Describe la topología de red (Ej: 'una red en árbol con profundidad 2 y fanout 4'):\n> "
@@ -43,52 +39,52 @@ def run_aiops_pipeline():
     print(f"\n[IA] Comando sugerido: sudo {cmd}")
 
     if input("\n¿Desplegar? (s/n): ").lower() != "s":
+        print("Operación cancelada.")
         return
+
     deploy_in_vm(cmd)
 
-    # --- FASE 2: INYECCIÓN DE TRÁFICO (ATAQUE 1) ---
-    print_header("FASE 2: TRÁFICO DE RED (SIN QoS)")
+    # Obtenemos los hosts activos una sola vez
     hosts = get_active_hosts()
     if not hosts:
         print("[ERROR] No se detectan hosts. Saliendo...")
         return
 
-    comandos_trafico = generate_bulk_traffic(hosts)
+    # =======================================================
+    # === BUCLE INFINITO DE MONITORIZACIÓN Y RESOLUCIÓN =====
+    # =======================================================
+    ciclo = 1
+    try:
+        while True:
+            print_header(f"INICIANDO CICLO DE SUPERVISIÓN #{ciclo}")
 
-    # Guardamos los comandos en memoria temporal para el re-test
-    with open("ultima_rafaga.txt", "w") as f:
-        f.write("\n".join(comandos_trafico))
+            # --- A. INYECCIÓN DE TRÁFICO (Simulación de usuarios) ---
+            print("[SUPERVISOR] Simulando nueva época de tráfico en la red...")
+            comandos_trafico = generate_bulk_traffic(hosts)
+            run_bulk_traffic_logic(comandos_trafico)
 
-    print(f"[SUPERVISOR] Lanzando {len(comandos_trafico)} flujos en background...")
-    run_bulk_traffic_logic(
-        comandos_trafico
-    )  # ¡OJO! Tendrás que refactorizar esto levemente (lee abajo)
+            # --- B. SENSOR Y DIAGNÓSTICO ---
+            print("\n[SUPERVISOR] Analizando el estado de la red...")
+            telemetry = collect_telemetry()
+            informe = generate_network_report(telemetry)
+            print(f"\n[INFORME IA]\n{informe}")
 
-    # --- FASE 3: MONITORIZACIÓN ---
-    print_header("FASE 3: MONITORIZACIÓN Y ANÁLISIS")
-    telemetry = collect_telemetry()
-    print(telemetry)
-    informe = generate_network_report(telemetry)
-    print(f"\n[INFORME IA]\n{informe}")
+            # --- C. RESOLUCIÓN AUTOMÁTICA ---
+            print("\n[SUPERVISOR] Evaluando intervenciones (QoS)...")
+            decision = analyze_and_decide(informe)
+            execute_resolution(decision)
 
-    # --- FASE 4: RESOLUCIÓN ---
-    print_header("FASE 4: MITIGACIÓN (QoS)")
-    decision = analyze_and_decide(informe)
-    execute_resolution(decision)
+            print_header(f"FIN DEL CICLO #{ciclo}")
+            print("El sistema entrará en reposo 10 segundos antes del siguiente ciclo.")
+            print(">>> Pulsa Ctrl+C para detener el Supervisor NOC <<<")
 
-    # --- FASE 5: RE-TEST (VERIFICACIÓN DE BUCLE CERRADO) ---
-    print_header("FASE 5: RE-EVALUACIÓN (CON QoS)")
-    print(
-        "[SUPERVISOR] Relanzando la misma ráfaga de estrés para comprobar la mitigación..."
-    )
-    run_bulk_traffic_logic(comandos_trafico)
+            time.sleep(10)
+            ciclo += 1
 
-    telemetry_post = collect_telemetry()
-    print(telemetry_post)
-    informe_post = generate_network_report(telemetry_post)
-    print(f"\n[INFORME FINAL IA]\n{informe_post}")
-
-    print_header("CICLO AIOps COMPLETADO CON ÉXITO")
+    except KeyboardInterrupt:
+        # Esto captura cuando el usuario pulsa Ctrl+C en la terminal
+        print_header("SUPERVISOR DETENIDO POR EL USUARIO")
+        print("Saliendo del Modo NOC de forma segura. ¡Hasta pronto!")
 
 
 if __name__ == "__main__":
