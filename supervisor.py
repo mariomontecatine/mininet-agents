@@ -1,6 +1,7 @@
 import sys
 import os
 import time
+from datetime import datetime
 
 # Nos aseguramos de que Python encuentre la carpeta agents
 sys.path.append(os.path.join(os.path.dirname(__file__), "agents"))
@@ -25,8 +26,22 @@ def print_header(texto):
     print("=" * 60 + "\n")
 
 
+def registrar_log(mensaje):
+    """Guarda un registro con fecha y hora en el archivo de bitácora."""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    linea_log = f"[{timestamp}] {mensaje}\n"
+
+    with open("noc_audit.log", "a", encoding="utf-8") as f:
+        f.write(linea_log)
+
+
 def run_aiops_pipeline():
     print_header("INICIANDO SUPERVISOR AIOPS (MODO NOC CONTINUO)")
+
+    # Limpiamos el log anterior al iniciar
+    if os.path.exists("noc_audit.log"):
+        os.remove("noc_audit.log")
+    registrar_log("INICIO DEL SISTEMA AIOPS")
 
     # =======================================================
     # === FASE 1: SETUP DE INFRAESTRUCTURA (Solo 1 vez) =====
@@ -42,12 +57,14 @@ def run_aiops_pipeline():
         print("Operación cancelada.")
         return
 
+    registrar_log(f"Desplegando topología con comando: {cmd}")
     deploy_in_vm(cmd)
 
     # Obtenemos los hosts activos una sola vez
     hosts = get_active_hosts()
     if not hosts:
         print("[ERROR] No se detectan hosts. Saliendo...")
+        registrar_log("ERROR CRÍTICO: No se detectaron hosts.")
         return
 
     # =======================================================
@@ -57,8 +74,9 @@ def run_aiops_pipeline():
     try:
         while True:
             print_header(f"INICIANDO CICLO DE SUPERVISIÓN #{ciclo}")
+            registrar_log(f"--- Iniciando Ciclo #{ciclo} ---")
 
-            # --- A. INYECCIÓN DE TRÁFICO (Simulación de usuarios) ---
+            # --- A. INYECCIÓN DE TRÁFICO ---
             print("[SUPERVISOR] Simulando nueva época de tráfico en la red...")
             comandos_trafico = generate_bulk_traffic(hosts)
             run_bulk_traffic_logic(comandos_trafico)
@@ -72,6 +90,18 @@ def run_aiops_pipeline():
             # --- C. RESOLUCIÓN AUTOMÁTICA ---
             print("\n[SUPERVISOR] Evaluando intervenciones (QoS)...")
             decision = analyze_and_decide(informe)
+
+            # Guardamos la decisión de la IA en el Log
+            if decision and decision.get("action") != "none":
+                accion = decision.get("action")
+                puerto = decision.get("target_port")
+                motivo = decision.get("reason", "Sin motivo")
+                registrar_log(
+                    f"ALERTA RESUELTA: Se aplicó {accion} en {puerto}. Motivo: {motivo}"
+                )
+            else:
+                registrar_log("ESTADO: Red estable, sin intervenciones requeridas.")
+
             execute_resolution(decision)
 
             print_header(f"FIN DEL CICLO #{ciclo}")
@@ -82,9 +112,9 @@ def run_aiops_pipeline():
             ciclo += 1
 
     except KeyboardInterrupt:
-        # Esto captura cuando el usuario pulsa Ctrl+C en la terminal
         print_header("SUPERVISOR DETENIDO POR EL USUARIO")
         print("Saliendo del Modo NOC de forma segura. ¡Hasta pronto!")
+        registrar_log("APAGADO DEL SISTEMA (Intervención manual)")
 
 
 if __name__ == "__main__":
