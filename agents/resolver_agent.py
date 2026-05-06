@@ -8,7 +8,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from utils.ssh_client import get_ssh_connection, send_tmux_command
 
-MODEL_NAME = "qwen2.5:3b"
+MODEL_NAME = "qwen2.5:7b"
 
 
 def analyze_and_decide(report_text):

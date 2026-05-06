@@ -39,25 +39,34 @@ def capture_tmux_output(ssh, session="sesion_mininet"):
     return stdout.read().decode()
 
 
-def wait_for_mininet_prompt(ssh, timeout=60):
+def wait_for_mininet_prompt(ssh, timeout=90):
     """
-    Lee la pantalla continuamente hasta que detecta que Mininet ha terminado
-    y vuelve a mostrar el prompt 'mininet>'.
+    Espera Activa Blindada: Busca el prompt en la última línea de texto.
     """
+    import time
+
     start_time = time.time()
 
     while time.time() - start_time < timeout:
-        output = capture_tmux_output(ssh)
+        stdin, stdout, stderr = ssh.exec_command(
+            "tmux capture-pane -p -t sesion_mininet"
+        )
+        salida = stdout.read().decode("utf-8").strip()
 
-        if output:
-            # Separamos en líneas y miramos la última con texto
-            lines = [l.strip() for l in output.split("\n") if l.strip()]
-            if lines and lines[-1].endswith("mininet>"):
-                return True  # ¡El comando ha terminado!
+        # Cogemos la última línea que tenga texto
+        lineas = [linea for linea in salida.split("\n") if linea.strip()]
 
-        time.sleep(0.5)  # Hacemos una pausa muy corta antes de volver a mirar
+        if lineas:
+            ultima_linea = lineas[-1]
+            # Descomenta la siguiente línea si quieres ver en vivo lo que lee el script
+            # print(f"[DEBUG POLLING] Viendo: '{ultima_linea}'")
+
+            if "mininet>" in ultima_linea:
+                return True
+
+        time.sleep(0.5)
 
     print(
-        f"[WARNING] Tiempo de espera ({timeout}s) agotado. Continuando por seguridad."
+        f"[WARNING] Tiempo máximo de seguridad ({timeout}s) agotado. ¿Se colgó Mininet?"
     )
     return False

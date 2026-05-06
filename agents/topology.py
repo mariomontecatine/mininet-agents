@@ -1,5 +1,6 @@
 import sys
 import os
+import re
 from pyvis.network import Network
 
 # Parche de rutas para VS Code
@@ -19,28 +20,36 @@ def get_topology_links():
     try:
         ssh = get_ssh_connection()
 
-        # 1. Aseguramos que la consola está limpia y lista
+        # 1. Aseguramos que la consola está limpia
         send_tmux_command(ssh, "")
-        wait_for_mininet_prompt(ssh, timeout=5)
+        wait_for_mininet_prompt(ssh, timeout=20)
 
-        # 2. Lanzamos el comando normal de links
+        # 2. Lanzamos el comando de links
         send_tmux_command(ssh, "links")
-        wait_for_mininet_prompt(ssh, timeout=10)
 
-        # 3. EL TRUCO MAESTRO (Versión Definitiva):
-        # Le pedimos a Tmux que nos escupa las últimas 1000 líneas de historial (scrollback).
-        # Así no importa si la pantalla visible es pequeña, capturaremos el árbol entero.
+        # --- PARCHE DE SINCRONIZACIÓN ---
+        # Obligamos a Python a esperar 2 segundos reales para que Mininet
+        # tenga tiempo de volcar todos los enlaces en la pantalla de Tmux.
+        import time
+
+        time.sleep(2)
+        # --------------------------------
+
+        wait_for_mininet_prompt(ssh, timeout=20)
+
+        # 3. Capturamos el historial del panel (ampliado a 5000 líneas para redes masivas)
         stdin, stdout, stderr = ssh.exec_command(
-            "tmux capture-pane -p -t sesion_mininet -S -1000"
+            "tmux capture-pane -p -t sesion_mininet -S -5000"
         )
         raw_output = stdout.read().decode("utf-8")
 
         ssh.close()
 
         links = []
-        import re
 
         # Buscamos coincidencias tipo s1-eth1<->h1-eth0
+        import re
+
         matches = re.findall(
             r"([a-zA-Z0-9_]+)-eth\d+<->([a-zA-Z0-9_]+)-eth\d+", raw_output
         )
@@ -68,14 +77,16 @@ def draw_topology(links, output_file="topologia_interactiva.html"):
     # Crear la red con fondo blanco
     net = Network(height="800px", width="100%", bgcolor="#ffffff", font_color="black")
 
-    # Motor de física Force Atlas (fíjate en el nombre exacto de la función)
+    # Motor de física Force Atlas
     net.force_atlas_2based(
         gravity=-60, central_gravity=0.01, spring_length=120, spring_strength=0.05
     )
 
-    # Rutas relativas a la carpeta 'iconos' que acabas de crear
+    # Rutas relativas a la carpeta 'icons'
     ICON_PC = "icons/pc.png"
     ICON_SWITCH = "icons/switch.png"
+    ICON_ROUTER = "icons/router.png"
+    ICON_SERVER = "icons/server.png"
 
     nodes_added = set()
 
@@ -83,23 +94,28 @@ def draw_topology(links, output_file="topologia_interactiva.html"):
         # Añadir nodos con sus iconos locales
         for node in (node1, node2):
             if node not in nodes_added:
-                if node.startswith("h"):
-                    # Nodos Host: más pequeños, fuente ajustada abajo
+                # 1. Es un ROUTER
+                if node.startswith("r"):
                     net.add_node(
                         node,
                         label=node,
                         shape="image",
-                        image=ICON_PC,
-                        size=25,
-                        font={"size": 14, "color": "#333333", "vadjust": 35},
+                        image=ICON_ROUTER,
+                        size=45,  # Más grande para que destaque
+                        font={
+                            "size": 18,
+                            "color": "black",
+                            "vadjust": 50,
+                            "face": "bold",
+                        },
                     )
-                else:
-                    # Nodos Switch/Router: más grandes, fuente en negrita
+                # 2. Es un SERVIDOR
+                elif node.startswith("srv"):
                     net.add_node(
                         node,
                         label=node,
                         shape="image",
-                        image=ICON_SWITCH,
+                        image=ICON_SERVER,
                         size=35,
                         font={
                             "size": 16,
@@ -107,6 +123,31 @@ def draw_topology(links, output_file="topologia_interactiva.html"):
                             "vadjust": 45,
                             "face": "bold",
                         },
+                    )
+                # 3. Es un SWITCH
+                elif node.startswith("s"):
+                    net.add_node(
+                        node,
+                        label=node,
+                        shape="image",
+                        image=ICON_SWITCH,
+                        size=30,
+                        font={
+                            "size": 14,
+                            "color": "#333333",
+                            "vadjust": 40,
+                            "face": "bold",
+                        },
+                    )
+                # 4. Es un PC/HOST normal
+                else:
+                    net.add_node(
+                        node,
+                        label=node,
+                        shape="image",
+                        image=ICON_PC,
+                        size=25,
+                        font={"size": 14, "color": "#555555", "vadjust": 35},
                     )
                 nodes_added.add(node)
 

@@ -15,7 +15,7 @@ from utils.ssh_client import (
     wait_for_mininet_prompt,
 )
 
-MODEL_NAME = "qwen2.5:3b"
+MODEL_NAME = "qwen2.5:7b"
 HISTORY_FILE = "network_history.json"
 
 
