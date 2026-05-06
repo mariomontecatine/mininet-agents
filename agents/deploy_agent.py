@@ -87,13 +87,13 @@ def generate_network_intent(user_prompt):
 
 
 def build_python_script(intent_json):
-    """Fábrica de Scripts Unificada: Crea Python nativo para cualquier tipo de red."""
+    """Fábrica de Scripts Unificada: Patrón LinuxRouter con Asignación de IP Blindada."""
     tipo_red = intent_json.get("tipo", "custom")
 
-    # Cabecera común obligatoria
     script = [
+        "from mininet.topo import Topo",
         "from mininet.net import Mininet",
-        "from mininet.node import Controller",
+        "from mininet.node import Controller, Node",
         "from mininet.cli import CLI",
         "from mininet.log import setLogLevel",
         "from mininet.clean import cleanup",
@@ -112,27 +112,20 @@ def build_python_script(intent_json):
                 f"    topo = TreeTopo(depth={depth}, fanout={fanout})",
                 "    net = Mininet(topo=topo, controller=Controller)",
                 "    net.start()",
-                "    print('\\n*** Red estándar nativa iniciada ***')",
-                "    print('\\n*** Entrando en CLI ***')",
                 "    CLI(net)",
                 "    net.stop()",
             ]
         )
     else:
-        # Modo Custom (El código de tu DMZ empresarial que ya funcionaba)
-        script.insert(0, "from mininet.topo import Topo")
-        script.extend(["class SmartTopo(Topo):", "    def build(self):"])
-
         routers = [x for x in intent_json.get("routers", []) if x.strip()]
         servers = [x for x in intent_json.get("servers", []) if x.strip()]
         switches = [x for x in intent_json.get("switches", []) if x.strip()]
         hosts = [x for x in intent_json.get("hosts", []) if x.strip()]
         links = [l for l in intent_json.get("links", []) if len(l) == 2]
 
-        # 1. PARCHE ANTI-DUPLICADOS (Si la IA mete los servidores/routers en hosts, los quitamos)
         hosts = [h for h in hosts if h not in servers and h not in routers]
 
-        # 2. AUTO-REPARACIÓN CORREGIDA (Miramos el prefijo PRIMERO, luego si falta)
+        # AUTO-REPARACIÓN BLINDADA (Lógica anidada para evitar fall-through)
         nodos_en_enlaces = set([n for e in links for n in e])
         for nodo in nodos_en_enlaces:
             if nodo.startswith("srv"):
@@ -141,26 +134,78 @@ def build_python_script(intent_json):
             elif nodo.startswith("s"):
                 if nodo not in switches:
                     switches.append(nodo)
-            elif nodo.startswith("h"):
-                if nodo not in hosts:
-                    hosts.append(nodo)
             elif nodo.startswith("r"):
                 if nodo not in routers:
                     routers.append(nodo)
+            elif nodo.startswith("h"):
+                if nodo not in hosts:
+                    hosts.append(nodo)
 
+        # 1. MOTOR IPAM
+        host_ips = {}
+        host_gws = {}
+        router_ips = {}
+
+        for i, sw in enumerate(switches):
+            prefix = f"192.168.{i+1}"
+            host_counter = 1
+            router_gw = f"{prefix}.254"
+            for link in links:
+                n1, n2 = link[0], link[1]
+                target = n2 if n1 == sw else (n1 if n2 == sw else None)
+                if target:
+                    if target.startswith("h") or target.startswith("srv"):
+                        host_ips[target] = f"{prefix}.{host_counter}"
+                        host_gws[target] = router_gw
+                        host_counter += 1
+                    elif target.startswith("r"):
+                        if target not in router_ips:
+                            router_ips[target] = []
+                        router_ips[target].append((sw, router_gw))
+
+        # 2. CLASE LINUXROUTER
+        script.extend(
+            [
+                "class LinuxRouter(Node):",
+                '    """Nodo configurado para actuar como router en Capa 3."""',
+                "    def config(self, **params):",
+                "        super(LinuxRouter, self).config(**params)",
+                "        self.cmd('sysctl net.ipv4.ip_forward=1')",
+                "",
+                "    def terminate(self):",
+                "        self.cmd('sysctl net.ipv4.ip_forward=0')",
+                "        super(LinuxRouter, self).terminate()",
+                "",
+            ]
+        )
+
+        # 3. GENERACIÓN DE TOPOLOGÍA FÍSICA
+        script.extend(["class SmartTopo(Topo):", "    def build(self):"])
         for s in switches:
             script.append(f"        self.addSwitch('{s}')")
         for r in routers:
-            script.append(
-                f"        self.addHost('{r}', sysctls={{'net.ipv4.ip_forward': 1}})"
-            )
+            script.append(f"        self.addNode('{r}', cls=LinuxRouter)")
+
         for srv in servers:
-            script.append(f"        self.addHost('{srv}')")
+            ip, gw = host_ips.get(srv), host_gws.get(srv)
+            script.append(
+                f"        self.addHost('{srv}', ip='{ip}/24', defaultRoute='via {gw}')"
+                if ip
+                else f"        self.addHost('{srv}')"
+            )
+
         for h in hosts:
-            script.append(f"        self.addHost('{h}')")
+            ip, gw = host_ips.get(h), host_gws.get(h)
+            script.append(
+                f"        self.addHost('{h}', ip='{ip}/24', defaultRoute='via {gw}')"
+                if ip
+                else f"        self.addHost('{h}')"
+            )
+
         for l in links:
             script.append(f"        self.addLink('{l[0]}', '{l[1]}')")
 
+        # 4. INICIALIZACIÓN
         script.extend(
             [
                 "",
@@ -173,20 +218,21 @@ def build_python_script(intent_json):
             ]
         )
 
+        # 5. ASIGNACIÓN BLINDADA DE IPs A LOS ROUTERS
+        if router_ips:
+            for r, connections in router_ips.items():
+                for sw, ip in connections:
+                    script.append(
+                        f"    net.get('{r}').setIP('{ip}/24', intf=net.get('{r}').connectionsTo(net.get('{sw}'))[0][0])"
+                    )
+
         if servers:
-            script.append("    print('\\n*** Iniciando Servidores Web ***')")
             for srv in servers:
                 script.append(
                     f"    net.get('{srv}').cmd('python3 -m http.server 80 > /dev/null 2>&1 &')"
                 )
 
-        script.extend(
-            [
-                "    print('\\n*** Entrando en CLI ***')",
-                "    CLI(net)",
-                "    net.stop()",
-            ]
-        )
+        script.extend(["    CLI(net)", "    net.stop()"])
 
     return "\n".join(script)
 
