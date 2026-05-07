@@ -15,7 +15,7 @@ from agents.deploy_agent import (
     deploy_unified_in_vm,
 )
 from agents.traffic_agent import (
-    get_active_hosts,
+    get_active_endpoints,
     generate_bulk_traffic,
     run_bulk_traffic_logic,
 )
@@ -69,12 +69,13 @@ def run_aiops_pipeline():
     registrar_log(f"Desplegando topología: tipo={intent.get('tipo')} intent={intent}")
     deploy_unified_in_vm(code)
 
-    # Obtenemos los hosts activos una sola vez
-    hosts = get_active_hosts()
-    if not hosts:
-        print("[ERROR] No se detectan hosts. Saliendo...")
-        registrar_log("ERROR CRÍTICO: No se detectaron hosts.")
+    # Obtenemos los endpoints (hosts + servidores) con sus IPs reales
+    endpoints = get_active_endpoints()
+    if not endpoints:
+        print("[ERROR] No se detectan endpoints. Saliendo...")
+        registrar_log("ERROR CRÍTICO: No se detectaron endpoints.")
         return
+    print(f"[INFO] Endpoints detectados: {endpoints}")
 
     # =======================================================
     # === BUCLE INFINITO DE MONITORIZACIÓN Y RESOLUCIÓN =====
@@ -87,12 +88,14 @@ def run_aiops_pipeline():
 
             # --- A. INYECCIÓN DE TRÁFICO ---
             print("[SUPERVISOR] Simulando nueva época de tráfico en la red...")
-            comandos_trafico = generate_bulk_traffic(hosts)
-            run_bulk_traffic_logic(comandos_trafico)
+            server_cmds, client_cmds = generate_bulk_traffic(endpoints)
+            run_bulk_traffic_logic(server_cmds, client_cmds)
 
             # --- B. SENSOR Y DIAGNÓSTICO ---
             print("\n[SUPERVISOR] Analizando el estado de la red...")
             telemetry = collect_telemetry()
+            if telemetry and telemetry.strip():
+                print(f"\n[TELEMETRÍA DELTA]\n{telemetry}")
             informe = generate_network_report(telemetry)
             print(f"\n[INFORME IA]\n{informe}")
 

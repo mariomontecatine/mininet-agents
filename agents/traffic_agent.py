@@ -4,98 +4,101 @@ import re
 import time
 import random
 
-# Parche de rutas para VS Code
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from utils.ssh_client import get_ssh_connection, send_tmux_command, capture_tmux_output
+from utils.ssh_client import (
+    get_ssh_connection,
+    send_tmux_command,
+    capture_tmux_output,
+    wait_for_mininet_prompt,
+)
 
 TMP_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tmp")
 os.makedirs(TMP_DIR, exist_ok=True)
 
 
-def get_active_hosts():
+def get_active_endpoints():
+    """Consulta a Mininet los nombres e IPs reales de todos los hosts (incluidos servidores)."""
     try:
         ssh = get_ssh_connection()
-        output = capture_tmux_output(ssh)
+        send_tmux_command(ssh, "py [(h.name, h.IP()) for h in net.hosts]")
+        wait_for_mininet_prompt(ssh, timeout=10)
+        raw_output = capture_tmux_output(ssh)
         ssh.close()
 
-        # Buscar todo lo que empiece por h y un número (ej: h1, h14)
-        active_hosts = re.findall(r"\bh\d+\b", output)
-        hosts_unicos = sorted(list(set(active_hosts)))
-        return hosts_unicos
+        # Parsea líneas como: [('h1', '10.0.0.1'), ('srv1', '192.168.1.2'), ...]
+        matches = re.findall(r"\('([^']+)',\s*'([^']*)'\)", raw_output)
+        endpoints = {name: ip for name, ip in matches if ip.strip()}
+        return endpoints
     except Exception as e:
-        print(f"[ERROR] No se pudieron obtener los hosts: {e}")
-        return []
+        print(f"[ERROR] No se pudieron obtener los endpoints: {e}")
+        return {}
 
 
-def generate_bulk_traffic(hosts, duration=35):
-    """Genera comandos iperf simulando perfiles de usuarios reales."""
-    comandos = []
-    if len(hosts) < 2:
-        return comandos
+def generate_bulk_traffic(endpoints, duration=35):
+    """Genera comandos iperf usando los nombres e IPs reales de la red activa."""
+    if len(endpoints) < 2:
+        return [], []
 
-    # Barajamos los hosts y los dividimos en clientes y servidores
-    random.shuffle(hosts)
-    mitad = len(hosts) // 2
-    clientes = hosts[:mitad]
-    servidores = hosts[mitad:]
+    nombres = list(endpoints.keys())
+    random.shuffle(nombres)
+    mitad = len(nombres) // 2
+    clientes = nombres[:mitad]
+    servidores = nombres[mitad:]
 
-    # PERFILES DE TRÁFICO REALISTA
     perfiles = [
-        ("Netflix_4K", f"-t {duration} -b 25M"),  # Streaming constante a 25 Mbps
-        (
-            "Descarga_P2P",
-            f"-t {duration} -b 80M -P 2",
-        ),  # Descarga agresiva a 80 Mbps con 2 hilos
-        ("Navegacion_Web", "-t 10 -b 5M"),  # Ráfaga corta de 5 Mbps
-        ("IoT_Sensor", f"-t {duration} -b 500K"),  # Ruido de fondo muy bajo (0.5 Mbps)
+        ("Netflix_4K",     f"-t {duration} -b 25M"),
+        ("Descarga_P2P",   f"-t {duration} -b 80M -P 2"),
+        ("Navegacion_Web", "-t 10 -b 5M"),
+        ("IoT_Sensor",     f"-t {duration} -b 500K"),
     ]
 
+    server_cmds = [f"{srv} iperf -s &" for srv in servidores]
+    client_cmds = []
     reporte_perfiles = []
 
     for i, cliente in enumerate(clientes):
-        # Asignamos un servidor
         servidor = servidores[i % len(servidores)]
-
-        # En Mininet (topo=tree), la IP por defecto de hX es 10.0.0.X
-        num_servidor = servidor.replace("h", "")
-        ip_servidor = f"10.0.0.{num_servidor}"
-
-        # Elegimos un comportamiento al azar para este usuario
+        ip_servidor = endpoints[servidor]
         perfil_nombre, perfil_args = random.choice(perfiles)
-
-        # Montamos el comando (ej: h1 iperf -c 10.0.0.2 -t 35 -b 25M &)
-        cmd_string = f"{cliente} iperf -c {ip_servidor} {perfil_args} &"
-        comandos.append(cmd_string)
-
+        client_cmds.append(f"{cliente} iperf -c {ip_servidor} {perfil_args} &")
         reporte_perfiles.append(
-            f" -> {cliente} se conecta a {servidor} | Perfil: {perfil_nombre}"
+            f" -> {cliente} → {servidor} ({ip_servidor}) | Perfil: {perfil_nombre}"
         )
 
-    # Guardamos el mapeo en un txt para que el supervisor lo pueda imprimir bonito
     with open(os.path.join(TMP_DIR, "ultima_rafaga_realista.txt"), "w") as f:
         f.write("\n".join(reporte_perfiles))
 
-    return comandos
+    return server_cmds, client_cmds
 
 
-def run_bulk_traffic_logic(comandos):
-    """Ejecuta los comandos en la VM de forma silenciosa."""
+def run_bulk_traffic_logic(server_cmds, client_cmds):
+    """Arranca servidores iperf, luego lanza clientes con perfil realista."""
     print("\n[SIMULADOR] Inyectando comportamientos de red realistas...")
 
-    # Imprimimos quién está haciendo qué
     if os.path.exists(os.path.join(TMP_DIR, "ultima_rafaga_realista.txt")):
         with open(os.path.join(TMP_DIR, "ultima_rafaga_realista.txt"), "r") as f:
             print(f.read())
 
     try:
         ssh = get_ssh_connection()
-        for cmd in comandos:
+
+        # Matar iperfs residuales de ciclos anteriores
+        send_tmux_command(ssh, "sh pkill -f iperf; true")
+        time.sleep(0.5)
+
+        # Arrancar servidores y esperar a que estén escuchando
+        for cmd in server_cmds:
             send_tmux_command(ssh, cmd)
-            time.sleep(0.1)  # Pequeña pausa para no saturar Tmux
+            time.sleep(0.1)
+        time.sleep(1)
+
+        # Arrancar clientes
+        for cmd in client_cmds:
+            send_tmux_command(ssh, cmd)
+            time.sleep(0.1)
 
         ssh.close()
 
-        # Esperamos a que los flujos terminen (margen sobre el perfil más largo: 25 s)
         tiempo_espera = 25
         print(
             f"\n[SIMULADOR] Esperando {tiempo_espera} segundos a que los usuarios terminen sus tareas..."
@@ -107,6 +110,7 @@ def run_bulk_traffic_logic(comandos):
 
 
 if __name__ == "__main__":
-    hosts = get_active_hosts()
-    cmds = generate_bulk_traffic(hosts)
-    run_bulk_traffic_logic(cmds)
+    endpoints = get_active_endpoints()
+    print(f"[INFO] Endpoints detectados: {endpoints}")
+    server_cmds, client_cmds = generate_bulk_traffic(endpoints)
+    run_bulk_traffic_logic(server_cmds, client_cmds)
