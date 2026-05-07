@@ -16,7 +16,9 @@ from utils.ssh_client import (
 )
 
 MODEL_NAME = "qwen2.5:7b"
-HISTORY_FILE = "network_history.json"
+TMP_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tmp")
+os.makedirs(TMP_DIR, exist_ok=True)
+HISTORY_FILE = os.path.join(TMP_DIR, "network_history.json")
 
 
 def format_bytes(size):
@@ -111,10 +113,8 @@ def collect_telemetry():
     print("\n[SENSOR] Recolectando telemetría en tiempo real (Modo Delta)...")
     try:
         ssh = get_ssh_connection()
-        send_tmux_command(ssh, "pingall")
-        wait_for_mininet_prompt(ssh, timeout=60)
         send_tmux_command(ssh, "dpctl dump-ports")
-        wait_for_mininet_prompt(ssh, timeout=10)
+        wait_for_mininet_prompt(ssh, timeout=15)
         raw_output = capture_tmux_output(ssh)
         ssh.close()
 
@@ -158,25 +158,27 @@ def collect_telemetry():
 def generate_network_report(filtered_telemetry):
     print("\n[IA] Analizando deltas de tráfico...")
 
+    if not filtered_telemetry or not filtered_telemetry.strip():
+        return "Red estable. No se detectó tráfico significativo ni pérdidas de paquetes en este ciclo."
+
     system_prompt = (
-        "Eres un Analista Senior de Redes (NOC).\n"
-        "Se te entrega la telemetría en formato DELTA (tráfico real de los últimos segundos).\n\n"
+        "Eres un Analista Senior de Redes (NOC). Responde SOLO con el diagnóstico, "
+        "sin repetir instrucciones ni usar markdown.\n"
+        "Se te dan estadísticas DELTA de los últimos segundos.\n"
         "REGLAS:\n"
-        "1. Prioriza las alertas visuales ([ALERTA ROJA] o [TRÁFICO INTENSO]).\n"
-        "2. Si no hay alertas y los deltas son bajos, indica que la red está estable.\n"
-        "3. Sé muy específico con los nombres de los puertos.\n"
-        "4. NO repitas mis reglas y no uses bloques de código markdown."
+        "1. Identifica los puertos con [ALERTA ROJA] (pérdidas) o [TRÁFICO INTENSO] (>10 MB).\n"
+        "2. Nombra cada puerto exactamente como aparece en los datos (ej: s1-eth2).\n"
+        "3. Si todo está dentro de lo normal, escribe exactamente: 'Red estable.'\n"
+        "4. Máximo 5 líneas."
     )
 
     response = ollama.chat(
         model=MODEL_NAME,
         messages=[
             {"role": "system", "content": system_prompt},
-            {
-                "role": "user",
-                "content": f"ESTADÍSTICAS DELTA ACTUALES:\n{filtered_telemetry}",
-            },
+            {"role": "user", "content": f"ESTADÍSTICAS DELTA:\n{filtered_telemetry}"},
         ],
+        options={"temperature": 0},
     )
     return response["message"]["content"].strip()
 
@@ -194,7 +196,7 @@ def run_monitor_agent():
 
     report = generate_network_report(telemetry)
 
-    with open("ultimo_informe.txt", "w", encoding="utf-8") as f:
+    with open(os.path.join(TMP_DIR, "ultimo_informe.txt"), "w", encoding="utf-8") as f:
         f.write(report)
 
     print("\n================ INFORME DE LA IA ================")

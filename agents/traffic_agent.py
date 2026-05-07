@@ -8,6 +8,9 @@ import random
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from utils.ssh_client import get_ssh_connection, send_tmux_command, capture_tmux_output
 
+TMP_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tmp")
+os.makedirs(TMP_DIR, exist_ok=True)
+
 
 def get_active_hosts():
     try:
@@ -69,7 +72,7 @@ def generate_bulk_traffic(hosts, duration=35):
         )
 
     # Guardamos el mapeo en un txt para que el supervisor lo pueda imprimir bonito
-    with open("ultima_rafaga_realista.txt", "w") as f:
+    with open(os.path.join(TMP_DIR, "ultima_rafaga_realista.txt"), "w") as f:
         f.write("\n".join(reporte_perfiles))
 
     return comandos
@@ -80,8 +83,8 @@ def run_bulk_traffic_logic(comandos):
     print("\n[SIMULADOR] Inyectando comportamientos de red realistas...")
 
     # Imprimimos quién está haciendo qué
-    if os.path.exists("ultima_rafaga_realista.txt"):
-        with open("ultima_rafaga_realista.txt", "r") as f:
+    if os.path.exists(os.path.join(TMP_DIR, "ultima_rafaga_realista.txt")):
+        with open(os.path.join(TMP_DIR, "ultima_rafaga_realista.txt"), "r") as f:
             print(f.read())
 
     try:
@@ -92,8 +95,8 @@ def run_bulk_traffic_logic(comandos):
 
         ssh.close()
 
-        # Esperamos a que los flujos terminen (con un pequeño margen de seguridad)
-        tiempo_espera = 40
+        # Esperamos a que los flujos terminen (margen sobre el perfil más largo: 25 s)
+        tiempo_espera = 25
         print(
             f"\n[SIMULADOR] Esperando {tiempo_espera} segundos a que los usuarios terminen sus tareas..."
         )

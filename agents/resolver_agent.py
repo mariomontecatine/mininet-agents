@@ -9,19 +9,21 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from utils.ssh_client import get_ssh_connection, send_tmux_command
 
 MODEL_NAME = "qwen2.5:7b"
+TMP_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tmp")
+os.makedirs(TMP_DIR, exist_ok=True)
 
 
 def analyze_and_decide(report_text):
     print("\n[IA] Evaluando el informe con Tool Calling para aplicar QoS...")
 
     system_prompt = (
-        "Eres un Orquestador Automático de Redes (SDN/QoS).\n"
-        "Tu trabajo es leer el informe del Monitor y decidir si es necesario aplicar "
-        "control de tráfico (Rate Limiting) en el puerto FÍSICO más saturado.\n"
-        "REGLAS CRÍTICAS:\n"
-        "1. IGNORA EL PUERTO 'LOCAL'. Nunca apliques QoS al puerto LOCAL.\n"
-        "2. Identifica el puerto físico (ej. s3-eth2, s4-eth4) con peor congestión (mayor rx_delta).\n"
-        "3. Si hay congestión, DEBES usar la herramienta 'apply_qos'. Si la red está sana, no hagas nada."
+        "Eres un Orquestador Automático de Redes (SDN/QoS). "
+        "Lee el informe y decide si aplicar Rate Limiting.\n"
+        "REGLAS:\n"
+        "1. NUNCA uses la herramienta sobre el puerto 'LOCAL'.\n"
+        "2. Si el informe dice 'Red estable' o no menciona alertas, NO uses la herramienta.\n"
+        "3. Solo usa 'apply_qos' si hay un puerto concreto con [ALERTA ROJA] o [TRÁFICO INTENSO].\n"
+        "4. El puerto debe tener formato exacto: sX-ethY (ej: s1-eth2)."
     )
 
     # AQUÍ ESTÁ LA MAGIA: Definimos la "Herramienta" (Tool)
@@ -53,7 +55,8 @@ def analyze_and_decide(report_text):
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": f"INFORME DEL MONITOR:\n{report_text}"},
             ],
-            tools=tools,  # <--- Activamos el Tool Calling
+            tools=tools,
+            options={"temperature": 0},
         )
 
         # Comprobamos si la IA ha decidido usar la herramienta
@@ -129,7 +132,7 @@ def execute_resolution(decision):
 def run_resolver_agent():
     print("=== AGENTE RESOLUTOR (Gestión de QoS) ===")
 
-    archivo_informe = "ultimo_informe.txt"
+    archivo_informe = os.path.join(TMP_DIR, "ultimo_informe.txt")
 
     if not os.path.exists(archivo_informe):
         print(

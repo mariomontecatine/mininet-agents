@@ -247,21 +247,29 @@ def deploy_unified_in_vm(python_code):
         print("Limpiando entorno anterior...")
         stdout = ssh.exec_command(f"echo {VM_PASSWORD} | sudo -S mn -c")[1]
         stdout.channel.recv_exit_status()
-        ssh.exec_command("tmux kill-session -t sesion_mininet")
-        time.sleep(1)
+        kill_out = ssh.exec_command("tmux kill-session -t sesion_mininet")[1]
+        kill_out.channel.recv_exit_status()
 
-        # Inyectar código
-        ssh.exec_command(f"cat << 'EOF' > /tmp/smart_topo.py\n{python_code}\nEOF")
+        # Escribir script vía SFTP (síncrono, sin race condition)
+        sftp = ssh.open_sftp()
+        with sftp.file("/tmp/smart_topo.py", "w") as f:
+            f.write(python_code)
+        sftp.close()
 
-        # Ejecutar Python (No volvemos a usar 'mn' directo nunca más)
+        # Crear sesión tmux y esperar a que exista antes de enviar comandos
         print("Lanzando red a través de Python...")
-        ssh.exec_command("tmux new-session -d -s sesion_mininet")
+        new_sess = ssh.exec_command("tmux new-session -d -s sesion_mininet")[1]
+        new_sess.channel.recv_exit_status()
+
         send_tmux_command(ssh, "sudo python3 /tmp/smart_topo.py")
-        time.sleep(1)
+        time.sleep(2)
         send_tmux_command(ssh, VM_PASSWORD)
 
         print("Esperando inicialización de la red...")
-        wait_for_mininet_prompt(ssh, timeout=90)
+        if not wait_for_mininet_prompt(ssh, timeout=120):
+            tail = capture_tmux_output(ssh).strip().split("\n")
+            print("[DEBUG] Últimas líneas del panel tmux:")
+            print("\n".join(tail[-10:]))
 
         print("Activando Pings de prueba (puede tardar minutos en redes masivas)...")
         send_tmux_command(ssh, "pingall")

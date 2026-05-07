@@ -158,7 +158,27 @@ _HTML = """\
       }
     });
 
+    // Clave única por topología (nodos + aristas) para no mezclar layouts distintos
+    var _key = 'cyto-' + cy.nodes().length + 'n-' + cy.edges().length + 'e';
+    var _saved = JSON.parse(localStorage.getItem(_key) || 'null');
+
+    if (_saved) {
+      // Restaurar posiciones guardadas (evita que el usuario pierda su organización)
+      cy.startBatch();
+      cy.nodes().forEach(function(n) {
+        if (_saved[n.id()]) n.position(_saved[n.id()]);
+      });
+      cy.endBatch();
+    }
+
     cy.fit(undefined, 60);
+
+    // Guardar posiciones cada vez que se mueve un nodo
+    cy.on('dragfree', 'node', function() {
+      var pos = {};
+      cy.nodes().forEach(function(n) { pos[n.id()] = n.position(); });
+      localStorage.setItem(_key, JSON.stringify(pos));
+    });
   </script>
 </body>
 </html>
@@ -196,6 +216,10 @@ def get_topology_links():
     except Exception as e:
         print(f"[ERROR] No se pudo extraer la topología: {e}")
         return []
+
+
+TMP_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tmp")
+os.makedirs(TMP_DIR, exist_ok=True)
 
 
 def draw_topology(links, output_file="topologia_interactiva.html"):
@@ -257,9 +281,7 @@ def draw_topology(links, output_file="topologia_interactiva.html"):
         .replace("__ICON_HOST__",   icons["host"])
     )
 
-    ruta_guardado = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), output_file
-    )
+    ruta_guardado = os.path.join(TMP_DIR, output_file)
     with open(ruta_guardado, "w", encoding="utf-8") as f:
         f.write(html)
 

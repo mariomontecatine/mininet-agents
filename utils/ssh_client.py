@@ -34,8 +34,10 @@ def send_tmux_command(ssh, command, session="sesion_mininet"):
 
 
 def capture_tmux_output(ssh, session="sesion_mininet"):
-    """Captura y devuelve el texto actual de la pantalla de tmux."""
-    stdin, stdout, stderr = ssh.exec_command(f"tmux capture-pane -pt {session}")
+    """Captura el historial completo del panel tmux (hasta 5000 líneas)."""
+    stdin, stdout, stderr = ssh.exec_command(
+        f"tmux capture-pane -p -t {session} -S -5000"
+    )
     return stdout.read().decode()
 
 

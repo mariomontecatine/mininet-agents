@@ -1,15 +1,18 @@
 import sys
 import os
 import time
+import json
 from datetime import datetime
 
-# Nos aseguramos de que Python encuentre la carpeta agents
+TMP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tmp")
+os.makedirs(TMP_DIR, exist_ok=True)
+
 sys.path.append(os.path.join(os.path.dirname(__file__), "agents"))
 
 from agents.deploy_agent import (
-    clear_agent_memory,
-    generate_mininet_command,
-    deploy_in_vm,
+    generate_network_intent,
+    build_python_script,
+    deploy_unified_in_vm,
 )
 from agents.traffic_agent import (
     get_active_hosts,
@@ -31,7 +34,7 @@ def registrar_log(mensaje):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     linea_log = f"[{timestamp}] {mensaje}\n"
 
-    with open("noc_audit.log", "a", encoding="utf-8") as f:
+    with open(os.path.join(TMP_DIR, "noc_audit.log"), "a", encoding="utf-8") as f:
         f.write(linea_log)
 
 
@@ -39,26 +42,32 @@ def run_aiops_pipeline():
     print_header("INICIANDO SUPERVISOR AIOPS (MODO NOC CONTINUO)")
 
     # Limpiamos el log anterior al iniciar
-    if os.path.exists("noc_audit.log"):
-        os.remove("noc_audit.log")
+    if os.path.exists(os.path.join(TMP_DIR, "noc_audit.log")):
+        os.remove(os.path.join(TMP_DIR, "noc_audit.log"))
     registrar_log("INICIO DEL SISTEMA AIOPS")
 
     # =======================================================
     # === FASE 1: SETUP DE INFRAESTRUCTURA (Solo 1 vez) =====
     # =======================================================
-    clear_agent_memory()
     user_request = input(
         "Describe la topología de red (Ej: 'una red en árbol con profundidad 2 y fanout 4'):\n> "
     )
-    cmd = generate_mininet_command(user_request)
-    print(f"\n[IA] Comando sugerido: sudo {cmd}")
 
-    if input("\n¿Desplegar? (s/n): ").lower() != "s":
+    intent = generate_network_intent(user_request)
+    if not intent:
+        print("[ERROR] No se pudo interpretar la solicitud. Saliendo...")
+        registrar_log("ERROR CRÍTICO: La IA no pudo generar un intent de red.")
+        return
+
+    print(f"\n[IA] Intención extraída:\n{json.dumps(intent, indent=2)}")
+    code = build_python_script(intent)
+
+    if input("\n¿Desplegar este script? (s/n): ").lower() != "s":
         print("Operación cancelada.")
         return
 
-    registrar_log(f"Desplegando topología con comando: {cmd}")
-    deploy_in_vm(cmd)
+    registrar_log(f"Desplegando topología: tipo={intent.get('tipo')} intent={intent}")
+    deploy_unified_in_vm(code)
 
     # Obtenemos los hosts activos una sola vez
     hosts = get_active_hosts()
