@@ -122,8 +122,8 @@ _HTML = """\
             /* Etiquetas nativas en los extremos del cable */
             'source-label': 'data(sourceLabel)',
             'target-label': 'data(targetLabel)',
-            'source-text-offset': 32,
-            'target-text-offset': 32,
+            'source-text-offset': 12,
+            'target-text-offset': 12,
             'font-size': '10px',
             'font-family': 'monospace, Courier New',
             'color': '#2c3e50',
