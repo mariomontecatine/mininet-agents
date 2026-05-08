@@ -20,7 +20,7 @@ from agents.traffic_agent import (
     stop_background_traffic,
 )
 from agents.monitor_agent import collect_telemetry, generate_network_report
-from agents.resolver_agent import analyze_and_decide, execute_resolution
+from agents.resolver_agent import analyze_and_decide, resolve_multiple
 
 
 def print_header(texto):
@@ -88,6 +88,9 @@ def run_aiops_pipeline():
     print_header("NOC ACTIVO — TRÁFICO CORRIENDO EN BACKGROUND")
     print(">>> Pulsa Ctrl+C en cualquier momento para detener el sistema NOC <<<\n")
 
+    # Estado persistente entre ciclos: {puerto → {"action": str, "ciclo": int}}
+    reglas_activas = {}
+
     try:
         while True:
             print_header(f"CICLO DE SUPERVISIÓN #{ciclo}")
@@ -105,20 +108,28 @@ def run_aiops_pipeline():
 
             # --- C. DECISIÓN: Evaluación de QoS ---
             print("\n[SUPERVISOR] Evaluando intervenciones (QoS)...")
-            decision = analyze_and_decide(informe)
+            decision = analyze_and_decide(informe, telemetry, reglas_activas)
 
-            if decision and decision.get("action") != "none":
-                accion = decision.get("action")
-                puerto = decision.get("target_port")
-                motivo = decision.get("reason", "Sin motivo")
-                registrar_log(
-                    f"ALERTA RESUELTA: Se aplicó {accion} en {puerto}. Motivo: {motivo}"
-                )
+            acciones_reales = [a for a in (decision or []) if a.get("action") != "NO_ACTION"]
+            if acciones_reales:
+                for a in acciones_reales:
+                    registrar_log(
+                        f"ALERTA RESUELTA: {a.get('action')} en {a.get('target_port')}. "
+                        f"Motivo: {a.get('reason', 'Automático')}"
+                    )
             else:
                 registrar_log("ESTADO: Red estable, sin intervenciones requeridas.")
 
-            # --- D. EJECUCIÓN: Aplicar QoS si corresponde ---
-            execute_resolution(decision)
+            # --- D. EJECUCIÓN: Aplicar todas las acciones de QoS ---
+            resolve_multiple(decision)
+
+            # Actualizar estado persistente con las acciones ejecutadas en este ciclo
+            for a in (decision or []):
+                if a.get("action") not in ("NO_ACTION", None) and a.get("target_port"):
+                    reglas_activas[a["target_port"]] = {
+                        "action": a["action"],
+                        "ciclo": ciclo,
+                    }
 
             print(f"\n[NOC] Ciclo #{ciclo} completado. Próximo análisis en {INTERVALO_CICLO}s...")
             time.sleep(INTERVALO_CICLO)
