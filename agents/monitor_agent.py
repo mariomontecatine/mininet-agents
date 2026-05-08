@@ -15,8 +15,10 @@ from utils.ssh_client import (
     wait_for_mininet_prompt,
 )
 
-MODEL_NAME = "qwen2.5:7b"
-TMP_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tmp")
+MODEL_NAME = "qwen2.5:3b"
+TMP_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tmp"
+)
 os.makedirs(TMP_DIR, exist_ok=True)
 HISTORY_FILE = os.path.join(TMP_DIR, "network_history.json")
 

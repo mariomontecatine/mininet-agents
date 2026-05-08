@@ -16,6 +16,99 @@ TMP_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 os.makedirs(TMP_DIR, exist_ok=True)
 
 
+def launch_background_traffic(endpoints):
+    """
+    Lanza tráfico continuo en background en Mininet.
+    Clasifica endpoints por prefijo: srv* → servidores HTTP, h* → clientes.
+    Devuelve control inmediatamente tras enviar los comandos a tmux.
+    """
+    servers = {n: ip for n, ip in endpoints.items() if n.startswith("srv")}
+    hosts = {n: ip for n, ip in endpoints.items() if n.startswith("h")}
+
+    if not hosts and not servers:
+        print("[TRAFFIC] No se detectaron hosts (h* o srv*). No se lanza tráfico.")
+        return
+
+    print("\n[TRAFFIC] Iniciando tráfico continuo en background...")
+    print(f"  Servidores web (srv*): {list(servers.keys()) or 'ninguno'}")
+    print(f"  Clientes/hosts  (h*):  {list(hosts.keys()) or 'ninguno'}")
+
+    try:
+        ssh = get_ssh_connection()
+
+        # Limpiar residuos de sesiones anteriores.
+        # Tres send_tmux_command separados para evitar conflictos de quoting en el wrapper.
+        send_tmux_command(ssh, "sh pkill -f iperf; true")
+        time.sleep(0.2)
+        send_tmux_command(ssh, "sh pkill -f wget; true")
+        time.sleep(0.2)
+        send_tmux_command(ssh, "sh pkill -f http.server; true")
+        time.sleep(0.5)
+
+        # --- Tráfico Base: bucle wget de h* hacia srv* ---
+        if servers and hosts:
+            srv_ips = list(servers.values())
+
+            for srv_name in servers:
+                # Servidor HTTP ligero en cada nodo srv*
+                send_tmux_command(ssh, f"{srv_name} python3 -m http.server 8080 >/dev/null 2>&1 &")
+                time.sleep(0.1)
+            time.sleep(0.5)
+
+            host_names = list(hosts.keys())
+            for i, host_name in enumerate(host_names):
+                target_ip = srv_ips[i % len(srv_ips)]
+                # Dobles comillas internas: safe con el wrapper de single quotes de send_tmux_command
+                cmd = (
+                    f'{host_name} bash -c '
+                    f'"while true; do wget -q -O /dev/null http://{target_ip}:8080/ 2>/dev/null; sleep 2; done" &'
+                )
+                send_tmux_command(ssh, cmd)
+                time.sleep(0.05)
+
+            print(f"[TRAFFIC] Base: {len(hosts)} cliente(s) en bucle wget → {len(servers)} servidor(es) HTTP")
+
+        # --- Tráfico Anómalo: iperf UDP pesado entre h* para provocar cuello de botella ---
+        host_list = list(hosts.keys())
+        if len(host_list) >= 2:
+            victim_name = host_list[-1]
+            victim_ip = hosts[victim_name]
+            attackers = host_list[:min(2, len(host_list) - 1)]
+
+            send_tmux_command(ssh, f"{victim_name} iperf -s -u >/dev/null 2>&1 &")
+            time.sleep(0.3)
+
+            for attacker in attackers:
+                cmd = f"{attacker} iperf -c {victim_ip} -u -b 100M -t 3600 >/dev/null 2>&1 &"
+                send_tmux_command(ssh, cmd)
+                time.sleep(0.05)
+
+            print(f"[TRAFFIC] Anómalo: {len(attackers)} atacante(s) UDP → {victim_name} ({victim_ip}) @ 100Mbps")
+
+        ssh.close()
+        print("[TRAFFIC] Control devuelto al supervisor. El tráfico corre en background.")
+
+    except Exception as e:
+        print(f"[ERROR] Fallo al lanzar tráfico en background: {e}")
+
+
+def stop_background_traffic():
+    """Mata todos los procesos de tráfico lanzados por launch_background_traffic."""
+    print("\n[TRAFFIC] Deteniendo procesos de tráfico en background...")
+    try:
+        ssh = get_ssh_connection()
+        send_tmux_command(ssh, "sh pkill -f iperf; true")
+        time.sleep(0.2)
+        send_tmux_command(ssh, "sh pkill -f wget; true")
+        time.sleep(0.2)
+        send_tmux_command(ssh, "sh pkill -f http.server; true")
+        time.sleep(0.3)
+        ssh.close()
+        print("[TRAFFIC] Procesos de background terminados.")
+    except Exception as e:
+        print(f"[ERROR] Fallo al detener el tráfico: {e}")
+
+
 def get_active_endpoints():
     """Consulta a Mininet los nombres e IPs reales de todos los hosts (incluidos servidores)."""
     try:
