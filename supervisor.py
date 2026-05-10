@@ -2,6 +2,7 @@ import sys
 import os
 import time
 import json
+import threading
 from datetime import datetime
 
 TMP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tmp")
@@ -18,6 +19,8 @@ from agents.traffic_agent import (
     get_active_endpoints,
     launch_background_traffic,
     stop_background_traffic,
+    generate_bulk_traffic,
+    run_bulk_traffic_logic,
 )
 from agents.monitor_agent import collect_telemetry, generate_network_report
 from agents.resolver_agent import analyze_and_decide, resolve_multiple
@@ -82,7 +85,8 @@ def run_aiops_pipeline():
     # =======================================================
     # === BUCLE INFINITO DE MONITORIZACIÓN Y RESOLUCIÓN =====
     # =======================================================
-    INTERVALO_CICLO = 10  # segundos entre ciclos de observación
+    INTERVALO_CICLO = 10       # segundos entre ciclos de observación
+    CICLOS_ENTRE_RAFAGAS = 4   # inyectar tráfico realista cada N ciclos
     ciclo = 1
 
     print_header("NOC ACTIVO — TRÁFICO CORRIENDO EN BACKGROUND")
@@ -96,7 +100,18 @@ def run_aiops_pipeline():
             print_header(f"CICLO DE SUPERVISIÓN #{ciclo}")
             registrar_log(f"--- Iniciando Ciclo #{ciclo} ---")
 
-            # --- A. SENSOR: Recolectar telemetría (delta) ---
+            # --- A. TRÁFICO REALISTA: inyectar ráfaga periódica en background ---
+            if ciclo % CICLOS_ENTRE_RAFAGAS == 0:
+                server_cmds, client_cmds = generate_bulk_traffic(endpoints)
+                if server_cmds or client_cmds:
+                    threading.Thread(
+                        target=run_bulk_traffic_logic,
+                        args=(server_cmds, client_cmds),
+                        daemon=True,
+                    ).start()
+                    registrar_log(f"Ráfaga de tráfico realista inyectada (ciclo {ciclo})")
+
+            # --- B. SENSOR: Recolectar telemetría (delta) ---
             telemetry = collect_telemetry()
             if telemetry and telemetry.strip():
                 print(f"\n[TELEMETRÍA DELTA]\n{telemetry}")
@@ -109,6 +124,19 @@ def run_aiops_pipeline():
             # --- C. DECISIÓN: Evaluación de QoS ---
             print("\n[SUPERVISOR] Evaluando intervenciones (QoS)...")
             decision = analyze_and_decide(informe, telemetry, reglas_activas)
+
+            # Escalado forzado: si el LLM repite una acción ya aplicada, Python la sube de nivel
+            _esc = {"POLICING": "SHAPING", "SHAPING": "BLOCK", "BLOCK": "BLOCK"}
+            for a in (decision or []):
+                port = a.get("target_port")
+                action = a.get("action")
+                if port and action not in ("NO_ACTION", None) and port in reglas_activas:
+                    previa = reglas_activas[port]["action"]
+                    if action == previa:
+                        nueva = _esc.get(previa, "BLOCK")
+                        print(f"  [ESCALADO FORZADO] {port}: {previa} → {nueva}")
+                        a["action"] = nueva
+                        a["reason"] = f"Forzado: {previa} ya aplicado en ciclo {reglas_activas[port]['ciclo']} sin efecto."
 
             acciones_reales = [a for a in (decision or []) if a.get("action") != "NO_ACTION"]
             if acciones_reales:
