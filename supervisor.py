@@ -24,6 +24,7 @@ from agents.deploy_agent import (
 )
 from agents.traffic_agent import (
     get_active_endpoints,
+    get_topology,
     launch_background_traffic,
     stop_background_traffic,
     generate_bulk_traffic,
@@ -76,7 +77,7 @@ def run_aiops_pipeline():
     registrar_log("=== INICIO DE SESIÓN NOC ===")
 
     # Limpiar datos de sesiones anteriores para que la gráfica empiece en blanco
-    for _stale in ("metrics_history.json", "state.json"):
+    for _stale in ("metrics_history.json", "state.json", "topology.json"):
         _p = os.path.join(TMP_DIR, _stale)
         try:
             os.remove(_p)
@@ -112,6 +113,15 @@ def run_aiops_pipeline():
         registrar_log("ERROR CRÍTICO: No se detectaron endpoints.")
         return
     print(f"[INFO] Endpoints detectados: {endpoints}")
+
+    # Guardar topología para el dashboard
+    try:
+        topo = get_topology(endpoints)
+        with open(os.path.join(TMP_DIR, "topology.json"), "w", encoding="utf-8") as _f:
+            json.dump(topo, _f, ensure_ascii=False)
+        print(f"[INFO] Topología guardada: {len(topo['nodes'])} nodos, {len(topo['links'])} enlaces")
+    except Exception as _e:
+        print(f"[WARN] No se pudo guardar la topología: {_e}")
 
     # =======================================================
     # === FASE 2: ARRANCAR TRÁFICO CONTINUO EN BACKGROUND ===

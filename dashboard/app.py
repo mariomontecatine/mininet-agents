@@ -77,6 +77,18 @@ def api_metrics():
     return jsonify({"labels": labels, "ports": ports})
 
 
+@app.route("/api/topology")
+def api_topology():
+    topo_path = os.path.join(_TMP_DIR, "topology.json")
+    if not os.path.exists(topo_path):
+        return jsonify({"nodes": [], "links": [], "endpoints": {}})
+    try:
+        with open(topo_path, encoding="utf-8") as f:
+            return jsonify(json.load(f))
+    except (json.JSONDecodeError, IOError):
+        return jsonify({"nodes": [], "links": [], "endpoints": {}})
+
+
 def start_dashboard(port: int = 5000) -> threading.Thread:
     """Lanza el servidor Flask en un hilo daemon y devuelve el hilo."""
     def _run():

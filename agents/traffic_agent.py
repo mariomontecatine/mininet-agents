@@ -112,6 +112,27 @@ def get_active_endpoints():
         return {}
 
 
+def get_topology(endpoints=None):
+    """Devuelve los nodos y enlaces de la topología Mininet activa."""
+    try:
+        ssh = get_ssh_connection()
+        send_tmux_command(
+            ssh,
+            "py [(l.intf1.node.name, l.intf2.node.name) for l in net.links]",
+        )
+        wait_for_mininet_prompt(ssh, timeout=10)
+        raw = capture_tmux_output(ssh)
+        ssh.close()
+
+        pairs = re.findall(r"\('([^']+)',\s*'([^']+)'\)", raw.replace("\n", ""))
+        nodes = list(dict.fromkeys(n for pair in pairs for n in pair))
+        links = [{"from": a, "to": b} for a, b in pairs]
+        return {"nodes": nodes, "links": links, "endpoints": endpoints or {}}
+    except Exception as e:
+        print(f"[ERROR] No se pudo obtener la topología: {e}")
+        return {"nodes": [], "links": [], "endpoints": {}}
+
+
 def generate_bulk_traffic(endpoints, duration=config.DURACION_BULK):
     """Genera comandos iperf usando los nombres e IPs reales de la red activa."""
     if len(endpoints) < 2:
