@@ -77,6 +77,12 @@ def api_metrics():
     return jsonify({"labels": labels, "ports": ports})
 
 
+@app.route("/api/topology-ready")
+def api_topology_ready():
+    ready = os.path.exists(os.path.join(_TMP_DIR, "topologia_interactiva.html"))
+    return jsonify({"ready": ready})
+
+
 @app.route("/topology")
 def topology_page():
     topo_path = os.path.join(_TMP_DIR, "topologia_interactiva.html")

@@ -4,7 +4,7 @@
 
 # --- Modelos LLM (Ollama) ---
 MODEL_MONITOR  = "qwen2.5:3b"   # análisis de telemetría (ciclo rápido, modelo ligero)
-MODEL_DEPLOY   = "qwen2.5:7b"   # diseño de topología (solo al arrancar)
+MODEL_DEPLOY   = "qwen2.5:3b"   # diseño de topología (solo al arrancar)
 MODEL_RESOLVER = "qwen2.5:3b"   # decisiones de QoS/seguridad
 
 # --- Ciclo NOC (segundos) ---

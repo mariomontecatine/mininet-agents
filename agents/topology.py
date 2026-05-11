@@ -78,7 +78,7 @@ _HTML = """\
       elements: __ELEMENTS__,
       minZoom: 0.15,
       maxZoom: 3,
-      wheelSensitivity: 0.15,
+      wheelSensitivity: 0,
       style: [
         /* ── Nodos base ── */
         {
@@ -172,6 +172,17 @@ _HTML = """\
     }
 
     cy.fit(undefined, 60);
+
+    // Ctrl+rueda = zoom; rueda sola = scroll de la página padre
+    document.getElementById('cy').addEventListener('wheel', function(e) {
+      if (e.ctrlKey) {
+        e.preventDefault();
+        var factor = e.deltaY < 0 ? 1.15 : 0.87;
+        cy.zoom({ level: cy.zoom() * factor, renderedPosition: { x: e.offsetX, y: e.offsetY } });
+      } else {
+        window.parent.postMessage({ noc_scroll: e.deltaY }, '*');
+      }
+    }, { passive: false });
 
     // Guardar posiciones cada vez que se mueve un nodo
     cy.on('dragfree', 'node', function() {
