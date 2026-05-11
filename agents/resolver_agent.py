@@ -7,19 +7,53 @@ import time
 # Parche de rutas para VS Code
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from utils import config
 from utils.ssh_client import get_ssh_connection, send_tmux_command
 
-MODEL_NAME = "qwen2.5:7b"
+MODEL_NAME = config.MODEL_RESOLVER
 TMP_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tmp")
 os.makedirs(TMP_DIR, exist_ok=True)
 
 # Escala de severidad: cada nivel sólo puede subir, nunca bajar
 ESCALATION = {"POLICING": "SHAPING", "SHAPING": "BLOCK", "BLOCK": "BLOCK"}
 
+# Relajación: camino inverso cuando el tráfico vuelve a la normalidad
+RELAXATION = {"BLOCK": "SHAPING", "SHAPING": "POLICING", "POLICING": None}
+
 
 # =============================================================
 # === PRIMITIVAS DE EJECUCIÓN (operan sobre una SSH abierta) ==
 # =============================================================
+
+def remove_policing(ssh, port):
+    """Elimina el policing de ingress, devolviendo el puerto a estado libre."""
+    send_tmux_command(ssh, f"sh tc qdisc del dev {port} ingress 2>/dev/null; true")
+    time.sleep(0.2)
+    print(f"  [OK] RELAJACIÓN POLICING → {port}: restricción de ingress eliminada")
+
+
+def remove_shaping(ssh, port):
+    """Elimina el shaping de egress, devolviendo el puerto a estado libre."""
+    send_tmux_command(ssh, f"sh tc qdisc del dev {port} root 2>/dev/null; true")
+    time.sleep(0.2)
+    print(f"  [OK] RELAJACIÓN SHAPING → {port}: restricción de egress eliminada")
+
+
+def remove_block(ssh, port):
+    """
+    Elimina el bloqueo OpenFlow de alta prioridad y el tc ingress block.
+    Permite que el controlador re-instale las reglas de reenvío normales.
+    """
+    bridge = port.split("-")[0]
+    send_tmux_command(
+        ssh,
+        f"sh ovs-ofctl del-flows {bridge} in_port={port} 2>/dev/null; true",
+    )
+    time.sleep(0.2)
+    send_tmux_command(ssh, f"sh tc qdisc del dev {port} ingress 2>/dev/null; true")
+    time.sleep(0.2)
+    print(f"  [OK] RELAJACIÓN BLOCK → {port}: flujo OpenFlow DROP eliminado + tc block eliminado")
+
 
 def apply_policing(ssh, port, rate_mbps=20):
     """
@@ -75,6 +109,59 @@ def block_port(ssh, port):
         f"police rate 1kbit burst 1k drop flowid :1",
     )
     print(f"  [OK] BLOCK → {port}: OpenFlow DROP (prio=200) + tc total block en {bridge}")
+
+
+# =============================================================
+# === RELAJACIÓN DE REGLAS ====================================
+# =============================================================
+
+def run_relaxation(ports_to_relax):
+    """
+    Relaja las restricciones de los puertos cuyo tráfico ha vuelto a la normalidad.
+
+    ports_to_relax: dict {port → current_action_str}
+    Devuelve: dict {port → new_action_or_None}
+      None  → sin restricción activa
+      str   → nuevo nivel aplicado (SHAPING o POLICING)
+    """
+    if not ports_to_relax:
+        return {}
+
+    print(f"\n[RELAJACIÓN] Reduciendo restricciones en {len(ports_to_relax)} puerto(s)...")
+    resultado = {}
+
+    try:
+        ssh = get_ssh_connection()
+
+        for port, current_action in ports_to_relax.items():
+            nuevo_nivel = RELAXATION.get(current_action)
+            print(
+                f"\n  --- RELAJAR {port}: {current_action} → "
+                f"{nuevo_nivel if nuevo_nivel else 'SIN RESTRICCIÓN'} ---"
+            )
+
+            # Eliminar la restricción actual
+            if current_action == "BLOCK":
+                remove_block(ssh, port)
+            elif current_action == "SHAPING":
+                remove_shaping(ssh, port)
+            elif current_action == "POLICING":
+                remove_policing(ssh, port)
+
+            # Aplicar el nivel inferior si corresponde
+            if nuevo_nivel == "SHAPING":
+                apply_shaping(ssh, port, rate_mbps=config.TASA_POLICING_MBPS)
+            elif nuevo_nivel == "POLICING":
+                apply_policing(ssh, port, rate_mbps=config.TASA_POLICING_MBPS)
+
+            resultado[port] = nuevo_nivel
+
+        ssh.close()
+
+    except Exception as e:
+        print(f"[ERROR] Fallo en run_relaxation: {e}")
+
+    return resultado
 
 
 # =============================================================
@@ -146,6 +233,11 @@ def analyze_and_decide(report_text, raw_telemetry=None, reglas_activas=None):
             raw_telemetry,
         )
         alerted_ports = list(dict.fromkeys(found))  # deduplicar, preservar orden
+
+    # Fast-path: sin alertas → NO_ACTION inmediato sin llamar al LLM
+    if not alerted_ports and not reglas_activas:
+        print("[IA] Red limpia. Sin acción necesaria.")
+        return [{"action": "NO_ACTION"}]
 
     # --- 2. Bloque de enumeración 1:1 para el LLM ---
     if alerted_ports:

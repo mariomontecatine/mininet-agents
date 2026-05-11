@@ -1,9 +1,16 @@
 import sys
 import os
+import re
 import time
 import json
+import logging
 import threading
 from datetime import datetime
+from logging.handlers import RotatingFileHandler
+
+from utils import config
+from utils.ssh_client import close_persistent_connection
+from dashboard.app import start_dashboard
 
 TMP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tmp")
 os.makedirs(TMP_DIR, exist_ok=True)
@@ -23,7 +30,37 @@ from agents.traffic_agent import (
     run_bulk_traffic_logic,
 )
 from agents.monitor_agent import collect_telemetry, generate_network_report
-from agents.resolver_agent import analyze_and_decide, resolve_multiple
+from agents.resolver_agent import analyze_and_decide, resolve_multiple, run_relaxation
+
+# -------------------------------------------------------
+# Auditoría con rotación automática
+# -------------------------------------------------------
+_audit_logger: logging.Logger | None = None
+
+
+def setup_audit_log():
+    global _audit_logger
+    log_path = os.path.join(TMP_DIR, "noc_audit.log")
+    handler = RotatingFileHandler(
+        log_path,
+        maxBytes=config.LOG_MAX_BYTES,
+        backupCount=config.LOG_BACKUP_COUNT,
+        encoding="utf-8",
+    )
+    handler.setFormatter(
+        logging.Formatter("[%(asctime)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    )
+    logger = logging.getLogger("noc_audit")
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+    logger.addHandler(handler)
+    logger.propagate = False
+    _audit_logger = logger
+
+
+def registrar_log(mensaje):
+    if _audit_logger:
+        _audit_logger.info(mensaje)
 
 
 def print_header(texto):
@@ -32,22 +69,22 @@ def print_header(texto):
     print("=" * 60 + "\n")
 
 
-def registrar_log(mensaje):
-    """Guarda un registro con fecha y hora en el archivo de bitácora."""
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    linea_log = f"[{timestamp}] {mensaje}\n"
-
-    with open(os.path.join(TMP_DIR, "noc_audit.log"), "a", encoding="utf-8") as f:
-        f.write(linea_log)
-
-
 def run_aiops_pipeline():
     print_header("INICIANDO SUPERVISOR AIOPS (MODO NOC CONTINUO)")
 
-    # Limpiamos el log anterior al iniciar
-    if os.path.exists(os.path.join(TMP_DIR, "noc_audit.log")):
-        os.remove(os.path.join(TMP_DIR, "noc_audit.log"))
-    registrar_log("INICIO DEL SISTEMA AIOPS")
+    setup_audit_log()
+    registrar_log("=== INICIO DE SESIÓN NOC ===")
+
+    # Limpiar datos de sesiones anteriores para que la gráfica empiece en blanco
+    for _stale in ("metrics_history.json", "state.json"):
+        _p = os.path.join(TMP_DIR, _stale)
+        try:
+            os.remove(_p)
+        except FileNotFoundError:
+            pass
+
+    start_dashboard(port=config.DASHBOARD_PORT)
+    print(f"[DASHBOARD] Disponible en http://0.0.0.0:{config.DASHBOARD_PORT}")
 
     # =======================================================
     # === FASE 1: SETUP DE INFRAESTRUCTURA (Solo 1 vez) =====
@@ -85,23 +122,24 @@ def run_aiops_pipeline():
     # =======================================================
     # === BUCLE INFINITO DE MONITORIZACIÓN Y RESOLUCIÓN =====
     # =======================================================
-    INTERVALO_CICLO = 10       # segundos entre ciclos de observación
-    CICLOS_ENTRE_RAFAGAS = 4   # inyectar tráfico realista cada N ciclos
     ciclo = 1
+    intervalo_actual = config.INTERVALO_BASE
 
     print_header("NOC ACTIVO — TRÁFICO CORRIENDO EN BACKGROUND")
     print(">>> Pulsa Ctrl+C en cualquier momento para detener el sistema NOC <<<\n")
 
     # Estado persistente entre ciclos: {puerto → {"action": str, "ciclo": int}}
     reglas_activas = {}
+    # Contadores de ciclos limpios por puerto (sin alerta activa)
+    ciclos_limpios = {}
 
     try:
         while True:
             print_header(f"CICLO DE SUPERVISIÓN #{ciclo}")
-            registrar_log(f"--- Iniciando Ciclo #{ciclo} ---")
+            registrar_log(f"--- Iniciando Ciclo #{ciclo} (intervalo={intervalo_actual}s) ---")
 
             # --- A. TRÁFICO REALISTA: inyectar ráfaga periódica en background ---
-            if ciclo % CICLOS_ENTRE_RAFAGAS == 0:
+            if ciclo % config.CICLOS_ENTRE_RAFAGAS == 0:
                 server_cmds, client_cmds = generate_bulk_traffic(endpoints)
                 if server_cmds or client_cmds:
                     threading.Thread(
@@ -158,15 +196,87 @@ def run_aiops_pipeline():
                         "action": a["action"],
                         "ciclo": ciclo,
                     }
+                    ciclos_limpios[a["target_port"]] = 0  # reset contador al escalar
 
-            print(f"\n[NOC] Ciclo #{ciclo} completado. Próximo análisis en {INTERVALO_CICLO}s...")
-            time.sleep(INTERVALO_CICLO)
+            # --- E. RELAJACIÓN: revertir restricciones si el tráfico se normalizó ---
+            alerted_this_cycle = set(
+                re.findall(
+                    r"(?:\[ALERTA ROJA\]|\[TRÁFICO INTENSO\]).*?Port\s+(s\d+-eth\d+):",
+                    telemetry or "",
+                )
+            )
+
+            puertos_a_relajar = {}
+            for port, info in list(reglas_activas.items()):
+                if port not in alerted_this_cycle:
+                    ciclos_limpios[port] = ciclos_limpios.get(port, 0) + 1
+                    if ciclos_limpios[port] >= config.CICLOS_PARA_RELAJAR:
+                        puertos_a_relajar[port] = info["action"]
+                else:
+                    ciclos_limpios[port] = 0
+
+            if puertos_a_relajar:
+                registrar_log(
+                    f"RELAJACIÓN INICIADA: {list(puertos_a_relajar.keys())} "
+                    f"tras {config.CICLOS_PARA_RELAJAR} ciclos limpios"
+                )
+                nuevas = run_relaxation(puertos_a_relajar)
+                for port, nuevo_nivel in nuevas.items():
+                    if nuevo_nivel is None:
+                        del reglas_activas[port]
+                        registrar_log(f"RELAJACIÓN COMPLETA: {port} sin restricciones activas")
+                    else:
+                        reglas_activas[port] = {"action": nuevo_nivel, "ciclo": ciclo}
+                        registrar_log(f"RELAJACIÓN PARCIAL: {port} reducido a {nuevo_nivel}")
+                    ciclos_limpios.pop(port, None)
+
+            # --- F. INTERVALO ADAPTATIVO ---
+            if alerted_this_cycle:
+                intervalo_actual = config.INTERVALO_MIN
+                estado_red = "ALERTA"
+            elif reglas_activas:
+                intervalo_actual = config.INTERVALO_BASE
+                estado_red = "MITIGACIÓN ACTIVA"
+            else:
+                intervalo_actual = min(
+                    config.INTERVALO_MAX,
+                    intervalo_actual + config.PASO_AMPLIACION,
+                )
+                estado_red = "ESTABLE"
+
+            # --- G. ESTADO: persistir snapshot para el dashboard ---
+            try:
+                state_path = os.path.join(TMP_DIR, "state.json")
+                with open(state_path, "w", encoding="utf-8") as _f:
+                    json.dump(
+                        {
+                            "ciclo": ciclo,
+                            "timestamp": datetime.now().isoformat(timespec="seconds"),
+                            "estado_red": estado_red,
+                            "intervalo_actual": intervalo_actual,
+                            "reglas_activas": reglas_activas,
+                            "ultimo_informe": informe,
+                        },
+                        _f,
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+            except IOError:
+                pass
+
+            print(
+                f"\n[NOC] Ciclo #{ciclo} completado [{estado_red}]. "
+                f"Próximo análisis en {intervalo_actual}s..."
+            )
+            registrar_log(f"Ciclo #{ciclo} finalizado — estado={estado_red}, next={intervalo_actual}s")
+            time.sleep(intervalo_actual)
             ciclo += 1
 
     except KeyboardInterrupt:
         print_header("SUPERVISOR DETENIDO POR EL USUARIO")
-        registrar_log("APAGADO DEL SISTEMA (Intervención manual)")
+        registrar_log("=== APAGADO DEL SISTEMA (Intervención manual) ===")
         stop_background_traffic()
+        close_persistent_connection()
         print("Sistema NOC detenido. ¡Hasta pronto!")
 
 

@@ -4,10 +4,12 @@ import time
 import re
 import json
 import ollama
+from datetime import datetime
 
 # Parche de rutas para VS Code
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from utils import config
 from utils.ssh_client import (
     get_ssh_connection,
     send_tmux_command,
@@ -15,12 +17,35 @@ from utils.ssh_client import (
     wait_for_mininet_prompt,
 )
 
-MODEL_NAME = "qwen2.5:3b"
+MODEL_NAME = config.MODEL_MONITOR
 TMP_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tmp"
 )
 os.makedirs(TMP_DIR, exist_ok=True)
-HISTORY_FILE = os.path.join(TMP_DIR, "network_history.json")
+HISTORY_FILE  = os.path.join(TMP_DIR, "network_history.json")
+METRICS_FILE  = os.path.join(TMP_DIR, "metrics_history.json")
+
+
+def _append_metrics(delta_stats):
+    """Añade un snapshot de deltas a la serie temporal, limitando a METRICS_MAX_ENTRIES."""
+    entry = {
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "ports": delta_stats,
+    }
+    history = []
+    if os.path.exists(METRICS_FILE):
+        try:
+            with open(METRICS_FILE) as f:
+                history = json.load(f)
+        except (json.JSONDecodeError, IOError):
+            history = []
+
+    history.append(entry)
+    if len(history) > config.METRICS_MAX_ENTRIES:
+        history = history[-config.METRICS_MAX_ENTRIES:]
+
+    with open(METRICS_FILE, "w") as f:
+        json.dump(history, f)
 
 
 def format_bytes(size):
@@ -126,6 +151,11 @@ def collect_telemetry():
         # 2. Calcular cuánto ha cambiado
         deltas = calculate_delta(current_data)
 
+        # 2b. Persistir serie temporal (solo puertos con actividad)
+        active = {p: v for p, v in deltas.items() if v["rx"] or v["tx"] or v["drop"]}
+        if active:
+            _append_metrics(active)
+
         # 3. Formatear para la IA
         important_lines = []
         if "Results:" in raw_output:
@@ -145,7 +175,7 @@ def collect_telemetry():
 
             if val["drop"] > 0:
                 line = f"🔴 [ALERTA ROJA] {line} <-- ¡PÉRDIDA ACTIVA!"
-            if val["rx"] > 10485760 or val["tx"] > 10485760:  # 10MB en bytes
+            if val["rx"] > config.UMBRAL_TRAFICO_BYTES or val["tx"] > config.UMBRAL_TRAFICO_BYTES:
                 line = f"⚠️ [TRÁFICO INTENSO] {line} <-- FLUJO ALTO DETECTADO"
 
             important_lines.append(line)
@@ -182,7 +212,16 @@ def generate_network_report(filtered_telemetry):
         ],
         options={"temperature": 0},
     )
-    return response["message"]["content"].strip()
+    result = response["message"]["content"].strip()
+
+    # Fallback: si el LLM ignora el prompt y devuelve texto genérico (markdown, listas, etc.),
+    # construimos el informe directamente desde la telemetría ya clasificada.
+    alerted = re.findall(r"(?:ALERTA ROJA|TRÁFICO INTENSO).*?(s\d+-eth\d+)", filtered_telemetry)
+    if alerted and not any(p in result for p in alerted):
+        ports_str = ", ".join(dict.fromkeys(alerted))
+        result = f"TRÁFICO INTENSO detectado en: {ports_str}"
+
+    return result
 
 
 def run_monitor_agent():

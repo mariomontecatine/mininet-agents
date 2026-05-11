@@ -7,6 +7,7 @@ import ollama
 # Parche para rutas
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from utils import config
 from utils.ssh_client import (
     get_ssh_connection,
     send_tmux_command,
@@ -16,7 +17,7 @@ from utils.ssh_client import (
 from agents.topology import run_visualizer
 
 VM_PASSWORD = "mininet"
-MODEL_NAME = "qwen2.5:7b"  # O el modelo que prefieras
+MODEL_NAME = config.MODEL_DEPLOY
 
 
 def generate_network_intent(user_prompt):
@@ -26,8 +27,17 @@ def generate_network_intent(user_prompt):
     system_prompt = (
         "Eres un arquitecto de red para Mininet. Devuelve un JSON válido.\n\n"
         "REGLA DE DECISIÓN:\n"
-        "1. MODO ESTÁNDAR: Si piden una red clásica de Mininet (árbol/tree). "
-        'Usa el formato exacto: {"tipo": "estandar", "topologia": "tree", "depth": 3, "fanout": 4}\n'
+        "1. MODO ESTÁNDAR: Si piden una red clásica de Mininet, elige la topología más adecuada:\n"
+        "   - 'tree'    → árbol jerárquico. Params: depth (profundidad), fanout (hijos por nodo).\n"
+        '     Ejemplo: {"tipo": "estandar", "topologia": "tree", "depth": 3, "fanout": 4}\n'
+        "   - 'linear'  → cadena de switches en línea. Params: k (nº switches), n (hosts/switch, defecto 1).\n"
+        '     Ejemplo: {"tipo": "estandar", "topologia": "linear", "k": 4, "n": 1}\n'
+        "   - 'single'  → un único switch con múltiples hosts. Params: k (nº hosts).\n"
+        '     Ejemplo: {"tipo": "estandar", "topologia": "single", "k": 6}\n'
+        "   - 'minimal' → topología mínima (1 switch, 2 hosts). Sin parámetros adicionales.\n"
+        '     Ejemplo: {"tipo": "estandar", "topologia": "minimal"}\n'
+        "   - 'torus'   → malla toroidal 2D. Params: x (ancho), y (alto).\n"
+        '     Ejemplo: {"tipo": "estandar", "topologia": "torus", "x": 3, "y": 3}\n'
         "2. MODO CUSTOM: Si piden servidores, routers, o diseños a medida. "
         'Rellena las listas: {"tipo": "custom", "routers": ["r1"], "switches": ["s1"], "servers": ["srv1"], "hosts": ["h1"], "links": [["r1", "s1"], ["s1", "srv1"]]}'
     )
@@ -47,10 +57,15 @@ def generate_network_intent(user_prompt):
                         },
                         "topologia": {
                             "type": "string",
-                            "description": "'tree' u otra estándar",
+                            "enum": ["tree", "linear", "single", "minimal", "torus"],
+                            "description": "Topología estándar de Mininet",
                         },
-                        "depth": {"type": "integer"},
-                        "fanout": {"type": "integer"},
+                        "depth": {"type": "integer", "description": "Profundidad del árbol (tree)"},
+                        "fanout": {"type": "integer", "description": "Hijos por nodo (tree)"},
+                        "k": {"type": "integer", "description": "Nº de switches (linear) o hosts (single)"},
+                        "n": {"type": "integer", "description": "Hosts por switch (linear, defecto 1)"},
+                        "x": {"type": "integer", "description": "Dimensión X de la malla (torus)"},
+                        "y": {"type": "integer", "description": "Dimensión Y de la malla (torus)"},
                         "routers": {"type": "array", "items": {"type": "string"}},
                         "servers": {"type": "array", "items": {"type": "string"}},
                         "switches": {"type": "array", "items": {"type": "string"}},
@@ -101,15 +116,48 @@ def build_python_script(intent_json):
     ]
 
     if tipo_red == "estandar":
-        depth = intent_json.get("depth", 2)
-        fanout = intent_json.get("fanout", 2)
-        script.insert(0, "from mininet.topolib import TreeTopo")
+        topologia = intent_json.get("topologia", "tree").lower()
+
+        if topologia == "tree":
+            depth = intent_json.get("depth", 2)
+            fanout = intent_json.get("fanout", 2)
+            script.insert(0, "from mininet.topolib import TreeTopo")
+            topo_init = f"    topo = TreeTopo(depth={depth}, fanout={fanout})"
+
+        elif topologia == "linear":
+            k = intent_json.get("k", 4)
+            n = intent_json.get("n", 1)
+            script.insert(0, "from mininet.topo import LinearTopo")
+            topo_init = f"    topo = LinearTopo(k={k}, n={n})"
+
+        elif topologia == "single":
+            k = intent_json.get("k", 4)
+            script.insert(0, "from mininet.topo import SingleSwitchTopo")
+            topo_init = f"    topo = SingleSwitchTopo(k={k})"
+
+        elif topologia == "minimal":
+            script.insert(0, "from mininet.topo import MinimalTopo")
+            topo_init = "    topo = MinimalTopo()"
+
+        elif topologia == "torus":
+            x = intent_json.get("x", 3)
+            y = intent_json.get("y", 3)
+            script.insert(0, "from mininet.topolib import Torus2D")
+            topo_init = f"    topo = Torus2D(x={x}, y={y})"
+
+        else:
+            # Fallback a tree si la IA devuelve una topología desconocida
+            depth = intent_json.get("depth", 2)
+            fanout = intent_json.get("fanout", 2)
+            script.insert(0, "from mininet.topolib import TreeTopo")
+            topo_init = f"    topo = TreeTopo(depth={depth}, fanout={fanout})"
+
         script.extend(
             [
                 "if __name__ == '__main__':",
                 "    setLogLevel('info')",
                 "    cleanup()",
-                f"    topo = TreeTopo(depth={depth}, fanout={fanout})",
+                topo_init,
                 "    net = Mininet(topo=topo, controller=Controller)",
                 "    net.start()",
                 "    CLI(net)",

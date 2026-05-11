@@ -5,6 +5,7 @@ import time
 import random
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from utils import config
 from utils.ssh_client import (
     get_ssh_connection,
     send_tmux_command,
@@ -68,23 +69,6 @@ def launch_background_traffic(endpoints):
 
             print(f"[TRAFFIC] Base: {len(hosts)} cliente(s) en bucle wget → {len(servers)} servidor(es) HTTP")
 
-        # --- Tráfico Anómalo: iperf UDP pesado entre h* para provocar cuello de botella ---
-        host_list = list(hosts.keys())
-        if len(host_list) >= 2:
-            victim_name = host_list[-1]
-            victim_ip = hosts[victim_name]
-            attackers = host_list[:min(2, len(host_list) - 1)]
-
-            send_tmux_command(ssh, f"{victim_name} iperf -s -u >/dev/null 2>&1 &")
-            time.sleep(0.3)
-
-            for attacker in attackers:
-                cmd = f"{attacker} iperf -c {victim_ip} -u -b 100M -t 3600 >/dev/null 2>&1 &"
-                send_tmux_command(ssh, cmd)
-                time.sleep(0.05)
-
-            print(f"[TRAFFIC] Anómalo: {len(attackers)} atacante(s) UDP → {victim_name} ({victim_ip}) @ 100Mbps")
-
         ssh.close()
         print("[TRAFFIC] Control devuelto al supervisor. El tráfico corre en background.")
 
@@ -119,15 +103,16 @@ def get_active_endpoints():
         ssh.close()
 
         # Parsea líneas como: [('h1', '10.0.0.1'), ('srv1', '192.168.1.2'), ...]
-        matches = re.findall(r"\('([^']+)',\s*'([^']*)'\)", raw_output)
-        endpoints = {name: ip for name, ip in matches if ip.strip()}
+        # Los \n se eliminan porque tmux puede partir líneas largas en mitad de un nombre/IP
+        matches = re.findall(r"\('([^']+)',\s*'([^']*)'\)", raw_output.replace('\n', ''))
+        endpoints = {name.strip(): ip.strip() for name, ip in matches if ip.strip()}
         return endpoints
     except Exception as e:
         print(f"[ERROR] No se pudieron obtener los endpoints: {e}")
         return {}
 
 
-def generate_bulk_traffic(endpoints, duration=35):
+def generate_bulk_traffic(endpoints, duration=config.DURACION_BULK):
     """Genera comandos iperf usando los nombres e IPs reales de la red activa."""
     if len(endpoints) < 2:
         return [], []
@@ -192,7 +177,7 @@ def run_bulk_traffic_logic(server_cmds, client_cmds):
 
         ssh.close()
 
-        tiempo_espera = 25
+        tiempo_espera = config.ESPERA_POST_BULK
         print(
             f"\n[SIMULADOR] Esperando {tiempo_espera} segundos a que los usuarios terminen sus tareas..."
         )
