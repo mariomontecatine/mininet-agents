@@ -77,16 +77,17 @@ def api_metrics():
     return jsonify({"labels": labels, "ports": ports})
 
 
-@app.route("/api/topology")
-def api_topology():
-    topo_path = os.path.join(_TMP_DIR, "topology.json")
+@app.route("/topology")
+def topology_page():
+    topo_path = os.path.join(_TMP_DIR, "topologia_interactiva.html")
     if not os.path.exists(topo_path):
-        return jsonify({"nodes": [], "links": [], "endpoints": {}})
-    try:
-        with open(topo_path, encoding="utf-8") as f:
-            return jsonify(json.load(f))
-    except (json.JSONDecodeError, IOError):
-        return jsonify({"nodes": [], "links": [], "endpoints": {}})
+        return (
+            "<body style='background:#0d1117;color:#8b949e;font-family:monospace;"
+            "display:flex;align-items:center;justify-content:center;height:100vh;margin:0'>"
+            "Topología no disponible aún — arranca el supervisor primero.</body>"
+        )
+    with open(topo_path, encoding="utf-8") as f:
+        return f.read()
 
 
 def start_dashboard(port: int = 5000) -> threading.Thread:

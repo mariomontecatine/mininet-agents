@@ -9,11 +9,6 @@
         crossorigin="anonymous">
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"
           crossorigin="anonymous"></script>
-  <link rel="stylesheet"
-        href="https://cdn.jsdelivr.net/npm/vis-network@9.1.9/dist/vis-network.min.css"
-        crossorigin="anonymous">
-  <script src="https://cdn.jsdelivr.net/npm/vis-network@9.1.9/dist/vis-network.min.js"
-          crossorigin="anonymous"></script>
   <style>
     body { background: #0d1117; }
     .card { border: 1px solid #30363d; background: #161b22; }
@@ -28,8 +23,7 @@
     .pulse { animation: pulse 2s infinite; }
     @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.5} }
     #chart-container { position: relative; height: 260px; }
-    #topology-network { height: 300px; background: #0d1117; border-radius: 0 0 .375rem .375rem; }
-    #topology-network canvas { border-radius: 0 0 .375rem .375rem; }
+    #topology-frame { width: 100%; height: 300px; border: none; border-radius: 0 0 .375rem .375rem; }
   </style>
 </head>
 <body>
@@ -128,7 +122,7 @@
           <span class="text-muted fw-normal" style="font-size:.8rem">Rueda = zoom · Arrastrar = mover</span>
         </div>
         <div class="card-body p-0">
-          <div id="topology-network"></div>
+          <iframe id="topology-frame" src="/topology"></iframe>
         </div>
       </div>
     </div>
@@ -175,61 +169,6 @@ function toggleScale() {
     if (raw) ds.data = raw.map(v => currentScale === 'logarithmic' ? (v > 0 ? v : null) : v);
   });
   trafficChart.update();
-}
-
-// ── Topología ────────────────────────────────────────────────────────────────
-let _topoNet = null;
-let _topoLoaded = false;
-
-const NODE_STYLE = {
-  s:   { shape: 'box',     color: { background: '#1f6feb', border: '#58a6ff' } },
-  srv: { shape: 'diamond', color: { background: '#7d4e00', border: '#ffa657' } },
-  h:   { shape: 'ellipse', color: { background: '#1a4731', border: '#3fb950' } },
-};
-
-function nodeStyle(name) {
-  if (name.startsWith('srv')) return NODE_STYLE.srv;
-  if (name.startsWith('s'))   return NODE_STYLE.s;
-  return NODE_STYLE.h;
-}
-
-async function updateTopology() {
-  if (_topoLoaded) return;
-  try {
-    const data = await fetch('/api/topology').then(r => r.json());
-    if (!data.nodes || data.nodes.length === 0) return;
-
-    const eps = data.endpoints || {};
-    const nodes = new vis.DataSet(data.nodes.map(name => {
-      const st = nodeStyle(name);
-      const ip = eps[name] ? `\n${eps[name]}` : '';
-      return {
-        id: name, label: name + ip,
-        shape: st.shape, color: st.color,
-        font: { color: '#c9d1d9', size: 11 },
-      };
-    }));
-    const edges = new vis.DataSet(
-      data.links.map((l, i) => ({ id: i, from: l.from, to: l.to, color: { color: '#444c56' } }))
-    );
-
-    const container = document.getElementById('topology-network');
-    if (!_topoNet) {
-      _topoNet = new vis.Network(container, { nodes, edges }, {
-        physics: {
-          stabilization: { iterations: 200 },
-          barnesHut: { gravitationalConstant: -8000, springLength: 90 },
-        },
-        interaction: { hover: true, zoomView: true, dragView: true, navigationButtons: false },
-        layout: { improvedLayout: true },
-      });
-    } else {
-      _topoNet.setData({ nodes, edges });
-    }
-    _topoLoaded = true;
-  } catch (e) {
-    console.warn('updateTopology error:', e);
-  }
 }
 
 // ── Paleta de colores para los puertos ──────────────────────────────────────
@@ -373,10 +312,8 @@ async function updateMetrics() {
 // ── Arranque ──────────────────────────────────────────────────────────────────
 updateStatus();
 updateMetrics();
-updateTopology();
 setInterval(updateStatus,  5000);
 setInterval(updateMetrics, 10000);
-setInterval(updateTopology, 15000);   // reintenta hasta que topology.json esté disponible
 </script>
 </body>
 </html>
