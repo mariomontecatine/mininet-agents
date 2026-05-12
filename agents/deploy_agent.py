@@ -285,7 +285,17 @@ def build_python_script(intent_json):
     return "\n".join(script)
 
 
-def deploy_unified_in_vm(python_code):
+def _wait_for_sudo_prompt(ssh, timeout=15):
+    """Espera a que tmux muestre el prompt de contraseña de sudo o desaparezca."""
+    start = time.time()
+    while time.time() - start < timeout:
+        out = capture_tmux_output(ssh).strip()
+        if "[sudo]" in out or "password" in out.lower() or "mininet>" in out:
+            return
+        time.sleep(0.2)
+
+
+def deploy_unified_in_vm(python_code, run_pingall=False):
     """Una única función blindada para desplegar cualquier red."""
     print("\nConectando a la VM para despliegue...")
     try:
@@ -310,7 +320,7 @@ def deploy_unified_in_vm(python_code):
         new_sess.channel.recv_exit_status()
 
         send_tmux_command(ssh, "sudo python3 /tmp/smart_topo.py")
-        time.sleep(2)
+        _wait_for_sudo_prompt(ssh, timeout=15)
         send_tmux_command(ssh, VM_PASSWORD)
 
         print("Esperando inicialización de la red...")
@@ -319,9 +329,10 @@ def deploy_unified_in_vm(python_code):
             print("[DEBUG] Últimas líneas del panel tmux:")
             print("\n".join(tail[-10:]))
 
-        print("Activando Pings de prueba (puede tardar minutos en redes masivas)...")
-        send_tmux_command(ssh, "pingall")
-        wait_for_mininet_prompt(ssh, timeout=300)
+        if run_pingall:
+            print("Activando Pings de prueba (puede tardar minutos en redes masivas)...")
+            send_tmux_command(ssh, "pingall")
+            wait_for_mininet_prompt(ssh, timeout=300)
 
         run_visualizer()
 

@@ -206,10 +206,6 @@ def get_topology_links():
         wait_for_mininet_prompt(ssh, timeout=20)
 
         send_tmux_command(ssh, "links")
-
-        # Espera real para que Mininet vuelque todos los enlaces en Tmux
-        time.sleep(2)
-
         wait_for_mininet_prompt(ssh, timeout=20)
 
         stdin, stdout, stderr = ssh.exec_command(
