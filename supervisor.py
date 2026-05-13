@@ -84,9 +84,6 @@ def run_aiops_pipeline():
         except FileNotFoundError:
             pass
 
-    start_dashboard(port=config.DASHBOARD_PORT)
-    print(f"[DASHBOARD] Disponible en http://0.0.0.0:{config.DASHBOARD_PORT}")
-
     # =======================================================
     # === FASE 1: SETUP DE INFRAESTRUCTURA (Solo 1 vez) =====
     # =======================================================
@@ -94,17 +91,38 @@ def run_aiops_pipeline():
         "Describe la topología de red (Ej: 'una red en árbol con profundidad 2 y fanout 4'):\n> "
     )
 
+    start_dashboard(port=config.DASHBOARD_PORT)
+    print(f"[DASHBOARD] Disponible en http://0.0.0.0:{config.DASHBOARD_PORT}")
+
     intent = generate_network_intent(user_request)
     if not intent:
         print("[ERROR] No se pudo interpretar la solicitud. Saliendo...")
         registrar_log("ERROR CRÍTICO: La IA no pudo generar un intent de red.")
         return
 
+    if intent.get("tipo") == "custom" and not intent.get("links"):
+        print("[ERROR] La topología custom no tiene enlaces definidos. Saliendo...")
+        registrar_log("ERROR CRÍTICO: intent custom sin links.")
+        return
+
+    if intent.get("tipo") == "custom":
+        from agents.deploy_agent import _find_isolated_nodes
+        isolated = _find_isolated_nodes(intent)
+        isolated_switches = {n for n in isolated if n.startswith("s")}
+        if isolated_switches:
+            print(f"[ERROR] Switches sin enlazar: {sorted(isolated_switches)}. Topología inviable. Saliendo...")
+            registrar_log(f"ERROR CRÍTICO: switches aislados {isolated_switches}.")
+            return
+        if isolated:
+            print(f"[AVISO] Nodos sin enlazar que se omitirán: {sorted(isolated)}. Continuando...")
+            registrar_log(f"AVISO: nodos aislados omitidos {isolated}.")
+
     print(f"\n[IA] Intención extraída:\n{json.dumps(intent, indent=2)}")
     code = build_python_script(intent)
 
     registrar_log(f"Desplegando topología: tipo={intent.get('tipo')} intent={intent}")
-    deploy_unified_in_vm(code)
+    run_ping = input("¿Ejecutar pingall tras el despliegue? (s/N): ").strip().lower() == "s"
+    deploy_unified_in_vm(code, run_pingall=run_ping)
 
     # Obtenemos los endpoints (hosts + servidores) con sus IPs reales
     endpoints = get_active_endpoints()

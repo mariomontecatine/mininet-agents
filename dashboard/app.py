@@ -96,13 +96,26 @@ def topology_page():
         return f.read()
 
 
+def _silence_werkzeug():
+    """Suprime el banner de arranque de Flask/werkzeug antes de lanzar el servidor."""
+    # El banner (Serving Flask app / Debug mode) viene de flask.cli.show_server_banner
+    # que usa click.echo() directo a stdout, sin pasar por el sistema de logging.
+    try:
+        import flask.cli as _fc
+        _fc.show_server_banner = lambda *a, **kw: None
+    except Exception:
+        pass
+    # Silenciar también el logger de werkzeug (accesos HTTP, etc.)
+    _wz = logging.getLogger("werkzeug")
+    _wz.setLevel(logging.ERROR)
+    _wz.disabled = True
+
+
 def start_dashboard(port: int = 5000) -> threading.Thread:
     """Lanza el servidor Flask en un hilo daemon y devuelve el hilo."""
+    _silence_werkzeug()
+
     def _run():
-        # Suppress werkzeug access logs inside the thread, after Flask sets up its own handlers
-        _wz = logging.getLogger("werkzeug")
-        _wz.setLevel(logging.ERROR)
-        _wz.disabled = True
         app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
     t = threading.Thread(target=_run, daemon=True, name="noc-dashboard")

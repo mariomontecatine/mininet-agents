@@ -38,8 +38,18 @@ def generate_network_intent(user_prompt):
         '     Ejemplo: {"tipo": "estandar", "topologia": "minimal"}\n'
         "   - 'torus'   → malla toroidal 2D. Params: x (ancho), y (alto).\n"
         '     Ejemplo: {"tipo": "estandar", "topologia": "torus", "x": 3, "y": 3}\n'
-        "2. MODO CUSTOM: Si piden servidores, routers, o diseños a medida. "
-        'Rellena las listas: {"tipo": "custom", "routers": ["r1"], "switches": ["s1"], "servers": ["srv1"], "hosts": ["h1"], "links": [["r1", "s1"], ["s1", "srv1"]]}'
+        "2. MODO CUSTOM: Si piden servidores, routers, o diseños a medida.\n"
+        "   REGLAS DE CABLEADO (estrictas):\n"
+        "   - Hosts (h*) y servidores (srv*) SIEMPRE se conectan a un SWITCH (s*). NUNCA entre sí.\n"
+        "   - Switches (s*) se conectan a routers (r*) u otros switches (s*).\n"
+        "   - Routers (r*) se conectan a switches (s*) u otros routers (r*).\n"
+        "   - PROHIBIDO: [h1,srv1], [h1,h2], [srv1,srv2]. CORRECTO: [s1,h1], [s1,srv1].\n"
+        "   OBLIGATORIO: el campo 'links' debe contener TODOS los enlaces. "
+        "Sin links los nodos quedan aislados.\n"
+        '   Ejemplo: {"tipo": "custom", "routers": ["r1"], "switches": ["s1", "s2"], '
+        '"servers": ["srv1"], "hosts": ["h1", "h2"], '
+        '"links": [["r1", "s1"], ["r1", "s2"], ["s1", "h1"], ["s1", "h2"], ["s2", "srv1"]]}\n'
+        "   Enumera TODOS los pares de conexión, uno por línea del array."
     )
 
     tools = [
@@ -72,6 +82,7 @@ def generate_network_intent(user_prompt):
                         "hosts": {"type": "array", "items": {"type": "string"}},
                         "links": {
                             "type": "array",
+                            "description": "OBLIGATORIO en modo custom. Lista de todos los enlaces [[nodo1, nodo2], ...].",
                             "items": {"type": "array", "items": {"type": "string"}},
                         },
                     },
@@ -81,24 +92,124 @@ def generate_network_intent(user_prompt):
         }
     ]
 
-    try:
-        response = ollama.chat(
-            model=MODEL_NAME,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            tools=tools,
-        )
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
 
-        if response.get("message", {}).get("tool_calls"):
-            tool_call = response["message"]["tool_calls"][0]
-            args = tool_call["function"]["arguments"]
-            return args
-        return None
-    except Exception as e:
-        print(f"[ERROR CRÍTICO] Ollama falló: {e}")
-        return None
+    for intento in range(1, 4):
+        try:
+            response = ollama.chat(model=MODEL_NAME, messages=messages, tools=tools)
+
+            if response.get("message", {}).get("tool_calls"):
+                args = response["message"]["tool_calls"][0]["function"]["arguments"]
+
+                if args.get("tipo") != "custom":
+                    return args
+
+                if not args.get("links"):
+                    print(f"[WARN] Intento {intento}: la IA no incluyó enlaces. Reintentando...")
+                    messages.append(response["message"])
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "INCOMPLETO: falta el campo 'links'. "
+                            "Llama de nuevo a build_network_json incluyendo TODOS los enlaces "
+                            "entre los nodos que ya definiste."
+                        ),
+                    })
+                    continue
+
+                args = _fix_invalid_links(args)
+                missing = _find_isolated_nodes(args)
+                if missing:
+                    print(f"[WARN] Intento {intento}: nodos sin enlazar: {sorted(missing)}. Reintentando...")
+                    messages.append(response["message"])
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            f"TOPOLOGÍA INCOMPLETA. Los siguientes nodos no tienen ningún enlace: "
+                            f"{sorted(missing)}. "
+                            "Llama de nuevo a build_network_json añadiendo los enlaces que faltan "
+                            "para esos nodos. No omitas ningún switch, host ni servidor."
+                        ),
+                    })
+                    continue
+
+                return args
+
+            print(f"[WARN] Intento {intento}: la IA no invocó la herramienta.")
+            return None
+
+        except Exception as e:
+            print(f"[ERROR CRÍTICO] Ollama falló: {e}")
+            return None
+
+    print("[ERROR] La IA no completó la topología tras 3 intentos.")
+    return None
+
+
+def _find_isolated_nodes(intent):
+    """Devuelve el conjunto de nodos declarados que no aparecen en ningún enlace."""
+    all_nodes = set()
+    for key in ("routers", "switches", "hosts", "servers"):
+        all_nodes.update(intent.get(key, []))
+    linked = {n for link in intent.get("links", []) for n in link}
+    return all_nodes - linked
+
+
+def _fix_invalid_links(intent):
+    """Repara enlaces endpoint↔endpoint generados erróneamente por la IA.
+
+    Heurística: si un servidor está enlazado a un host y ese host tiene un switch
+    conocido, reconecta el servidor a ese switch. Los enlaces host↔host se descartan.
+    """
+    if intent.get("tipo") != "custom":
+        return intent
+
+    links = intent.get("links", [])
+    switches = set(intent.get("switches", []))
+    routers = set(intent.get("routers", []))
+    infra = switches | routers
+
+    # Mapa nodo → switch/router a partir de los enlaces válidos
+    node_to_infra = {}
+    for link in links:
+        n1, n2 = link[0], link[1]
+        if n1 in infra:
+            node_to_infra[n2] = n1
+        elif n2 in infra:
+            node_to_infra[n1] = n2
+
+    fixed = []
+    seen = set()
+
+    for link in links:
+        n1, n2 = link[0], link[1]
+        ep1 = n1.startswith("h") or n1.startswith("srv")
+        ep2 = n2.startswith("h") or n2.startswith("srv")
+
+        if ep1 and ep2:
+            # Enlace inválido: intentar reparar reconectando el servidor al switch del host
+            srv = n1 if n1.startswith("srv") else (n2 if n2.startswith("srv") else None)
+            host = n2 if n1.startswith("srv") else (n1 if n2.startswith("srv") else None)
+            if srv and host and host in node_to_infra:
+                sw = node_to_infra[host]
+                key = tuple(sorted([sw, srv]))
+                if key not in seen:
+                    print(f"[AUTO-FIX] [{n1},{n2}] → [{sw},{srv}]")
+                    fixed.append([sw, srv])
+                    seen.add(key)
+            else:
+                print(f"[AUTO-FIX] Enlace inválido [{n1},{n2}] descartado (no reparable).")
+        else:
+            key = tuple(sorted([n1, n2]))
+            if key not in seen:
+                fixed.append(link)
+                seen.add(key)
+
+    intent["links"] = fixed
+    return intent
 
 
 def build_python_script(intent_json):
