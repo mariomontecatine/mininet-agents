@@ -86,14 +86,16 @@ def validate(name, prompt, intent):
     if isolated:
         errors.append(f"Nodos aislados: {sorted(isolated)}")
 
-    # Nodos esperados según el texto del prompt
+    # Nodos esperados según el texto del prompt que no aparecen NI declarados NI en enlaces
+    # (build_python_script auto-añade desde enlaces, así que basta con que estén en alguno)
     expected = _expand_nodes(prompt)
     declared = set()
     for key in ("routers", "switches", "hosts", "servers"):
         declared.update(intent.get(key, []))
-    missing_declared = expected - declared
-    if missing_declared:
-        errors.append(f"Nodos esperados no declarados: {sorted(missing_declared)}")
+    linked_nodes = {n for link in intent.get("links", []) for n in link}
+    missing_everywhere = expected - declared - linked_nodes
+    if missing_everywhere:
+        errors.append(f"Nodos ausentes en todo el intent: {sorted(missing_everywhere)}")
 
     # Verificar enlaces inválidos (endpoint↔endpoint)
     bad = []

@@ -1,5 +1,6 @@
 import sys
 import os
+import re
 import time
 import json
 import ollama
@@ -97,6 +98,8 @@ def generate_network_intent(user_prompt):
         {"role": "user", "content": user_prompt},
     ]
 
+    best_args = None  # mejor intento parcial guardado como fallback
+
     for intento in range(1, 4):
         try:
             response = ollama.chat(model=MODEL_NAME, messages=messages, tools=tools)
@@ -123,15 +126,15 @@ def generate_network_intent(user_prompt):
                 args = _fix_invalid_links(args)
                 missing = _find_isolated_nodes(args)
                 if missing:
+                    best_args = args  # guardar por si los reintentos fallan
                     print(f"[WARN] Intento {intento}: nodos sin enlazar: {sorted(missing)}. Reintentando...")
                     messages.append(response["message"])
                     messages.append({
                         "role": "user",
                         "content": (
-                            f"TOPOLOGÍA INCOMPLETA. Los siguientes nodos no tienen ningún enlace: "
-                            f"{sorted(missing)}. "
-                            "Llama de nuevo a build_network_json añadiendo los enlaces que faltan "
-                            "para esos nodos. No omitas ningún switch, host ni servidor."
+                            f"TOPOLOGÍA INCOMPLETA. Nodos sin ningún enlace: {sorted(missing)}. "
+                            "Llama de nuevo a build_network_json incluyendo TODOS los enlaces, "
+                            "especialmente los de esos nodos. No omitas ningún nodo de la descripción."
                         ),
                     })
                     continue
@@ -139,14 +142,75 @@ def generate_network_intent(user_prompt):
                 return args
 
             print(f"[WARN] Intento {intento}: la IA no invocó la herramienta.")
-            return None
+            # Si ya tenemos un intento parcial, no abandonar
+            if best_args is None:
+                return None
+            break
 
         except Exception as e:
             print(f"[ERROR CRÍTICO] Ollama falló: {e}")
             return None
 
+    # Último recurso: inferir enlaces faltantes desde el texto del prompt
+    if best_args is not None:
+        print("[INFER] Infiriendo enlaces faltantes desde el prompt...")
+        best_args = _infer_missing_links(best_args, user_prompt)
+        still_missing = _find_isolated_nodes(best_args)
+        if still_missing:
+            print(f"[WARN] Topología parcial: {sorted(still_missing)} siguen sin enlazar.")
+        else:
+            print("[INFER] Topología completada por inferencia del prompt.")
+        return best_args
+
     print("[ERROR] La IA no completó la topología tras 3 intentos.")
     return None
+
+
+def _infer_missing_links(intent, user_prompt):
+    """Infiere enlaces para nodos aislados buscando co-ocurrencias en el texto del prompt.
+
+    Para cada nodo sin enlace, extrae el contexto de ~200 caracteres a su alrededor
+    y busca otros nodos de infraestructura mencionados cerca. Solo genera enlaces
+    topológicamente válidos (router/switch ↔ router/switch, endpoint ↔ switch).
+    """
+    isolated = _find_isolated_nodes(intent)
+    if not isolated:
+        return intent
+
+    all_nodes = set()
+    for key in ("routers", "switches", "hosts", "servers"):
+        all_nodes.update(intent.get(key, []))
+    for link in intent.get("links", []):
+        all_nodes.update(link)
+
+    new_links = list(intent.get("links", []))
+    seen = {tuple(sorted(lnk)) for lnk in new_links}
+
+    is_infra = lambda n: n.startswith("r") or (n.startswith("s") and not n.startswith("srv"))
+
+    for node in isolated:
+        # Contexto amplio alrededor del nodo en el prompt
+        contexts = re.findall(
+            rf".{{0,200}}\b{re.escape(node)}\b.{{0,200}}", user_prompt, re.IGNORECASE
+        )
+        context = " ".join(contexts)
+
+        # Nodos con los que puede conectarse según topología
+        if is_infra(node):
+            candidates = {n for n in all_nodes if is_infra(n) and n != node}
+        else:  # host o servidor: solo conecta a switches
+            candidates = {n for n in all_nodes if n.startswith("s") and not n.startswith("srv")}
+
+        for other in candidates:
+            if re.search(rf"\b{re.escape(other)}\b", context, re.IGNORECASE):
+                key = tuple(sorted([node, other]))
+                if key not in seen:
+                    print(f"  [INFER] [{node}, {other}]")
+                    new_links.append([node, other])
+                    seen.add(key)
+
+    intent["links"] = new_links
+    return intent
 
 
 def _find_isolated_nodes(intent):
