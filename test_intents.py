@@ -9,7 +9,13 @@ import json
 
 sys.path.insert(0, "/home/mario/UGR/mininet-agents")
 
-from agents.deploy_agent import generate_network_intent, _find_isolated_nodes, _fix_invalid_links
+from agents.deploy_agent import (
+    generate_network_intent,
+    _find_isolated_nodes,
+    _find_disconnected_switches,
+    _find_empty_leaf_switches,
+    _fix_invalid_links,
+)
 
 PROMPTS = {
     "Campus universitario": (
@@ -85,6 +91,14 @@ def validate(name, prompt, intent):
     isolated = _find_isolated_nodes(intent)
     if isolated:
         errors.append(f"Nodos aislados: {sorted(isolated)}")
+
+    disconnected = _find_disconnected_switches(intent)
+    if disconnected:
+        errors.append(f"Switches sin ruta a router: {sorted(disconnected)}")
+
+    empty_leaves = _find_empty_leaf_switches(intent)
+    if empty_leaves:
+        errors.append(f"Switches hoja sin endpoints: {sorted(empty_leaves)}")
 
     # Nodos esperados según el texto del prompt que no aparecen NI declarados NI en enlaces
     # (build_python_script auto-añade desde enlaces, así que basta con que estén en alguno)

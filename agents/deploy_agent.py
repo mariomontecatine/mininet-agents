@@ -124,17 +124,31 @@ def generate_network_intent(user_prompt):
                     continue
 
                 args = _fix_invalid_links(args)
-                missing = _find_isolated_nodes(args)
-                if missing:
-                    best_args = args  # guardar por si los reintentos fallan
-                    print(f"[WARN] Intento {intento}: nodos sin enlazar: {sorted(missing)}. Reintentando...")
+                isolated = _find_isolated_nodes(args)
+                disconnected = _find_disconnected_switches(args)
+                empty_leaves = _find_empty_leaf_switches(args)
+                problems = isolated | disconnected | empty_leaves
+                if problems:
+                    best_args = args
+                    parts = []
+                    if isolated:
+                        parts.append(f"Nodos sin ningún enlace: {sorted(isolated)}.")
+                    if disconnected - isolated:
+                        parts.append(f"Switches sin ruta a router: {sorted(disconnected - isolated)}.")
+                    if empty_leaves:
+                        parts.append(
+                            f"Switches hoja sin endpoints directos: {sorted(empty_leaves)}. "
+                            "Cada switch hoja DEBE tener al menos un host (h*) o servidor (srv*) "
+                            "conectado directamente a él."
+                        )
+                    label = "; ".join(p.rstrip(".") for p in parts)
+                    print(f"[WARN] Intento {intento}: {label}. Reintentando...")
                     messages.append(response["message"])
                     messages.append({
                         "role": "user",
                         "content": (
-                            f"TOPOLOGÍA INCOMPLETA. Nodos sin ningún enlace: {sorted(missing)}. "
-                            "Llama de nuevo a build_network_json incluyendo TODOS los enlaces, "
-                            "especialmente los de esos nodos. No omitas ningún nodo de la descripción."
+                            f"TOPOLOGÍA INCOMPLETA. {'  '.join(parts)} "
+                            "Llama de nuevo a build_network_json corrigiendo todos estos problemas."
                         ),
                     })
                     continue
@@ -166,15 +180,76 @@ def generate_network_intent(user_prompt):
     return None
 
 
-def _infer_missing_links(intent, user_prompt):
-    """Infiere enlaces para nodos aislados buscando co-ocurrencias en el texto del prompt.
+def _find_empty_leaf_switches(intent):
+    """Devuelve switches hoja (1 solo vecino infra) sin ningún endpoint conectado.
 
-    Para cada nodo sin enlace, extrae el contexto de ~200 caracteres a su alrededor
-    y busca otros nodos de infraestructura mencionados cerca. Solo genera enlaces
-    topológicamente válidos (router/switch ↔ router/switch, endpoint ↔ switch).
+    Los switches de tránsito con múltiples uplinks son legítimamente vacíos de
+    endpoints (p.ej. s2 en una DMZ que conecta r1↔r2).  Solo los switches hoja
+    deben tener endpoints directos.
+    """
+    switches = set(intent.get("switches", []))
+    endpoints = set(intent.get("hosts", [])) | set(intent.get("servers", []))
+    infra = set(intent.get("routers", [])) | switches
+
+    sw_has_ep = {sw: False for sw in switches}
+    for link in intent.get("links", []):
+        n1, n2 = link[0], link[1]
+        if n1 in switches and n2 in endpoints:
+            sw_has_ep[n1] = True
+        elif n2 in switches and n1 in endpoints:
+            sw_has_ep[n2] = True
+
+    linked = {n for lnk in intent.get("links", []) for n in lnk}
+
+    def infra_neighbor_count(sw):
+        return sum(1 for lnk in intent.get("links", [])
+                   if sw in lnk and lnk[0] in infra and lnk[1] in infra)
+
+    return {sw for sw in switches
+            if sw in linked and not sw_has_ep[sw] and infra_neighbor_count(sw) == 1}
+
+
+def _find_disconnected_switches(intent):
+    """Devuelve switches que no tienen ningún camino (BFS) hacia ningún router."""
+    routers = set(intent.get("routers", []))
+    switches = set(intent.get("switches", []))
+    infra = routers | switches
+
+    # Grafo de adyacencia solo entre nodos de infraestructura
+    adj = {}
+    for link in intent.get("links", []):
+        n1, n2 = link[0], link[1]
+        if n1 in infra and n2 in infra:
+            adj.setdefault(n1, set()).add(n2)
+            adj.setdefault(n2, set()).add(n1)
+
+    def reaches_router(start):
+        visited, queue = set(), [start]
+        while queue:
+            node = queue.pop()
+            if node in routers:
+                return True
+            if node in visited:
+                continue
+            visited.add(node)
+            queue.extend(adj.get(node, set()))
+        return False
+
+    return {sw for sw in switches if not reaches_router(sw)}
+
+
+def _infer_missing_links(intent, user_prompt):
+    """Infiere enlaces para nodos aislados y switches desconectados del prompt.
+
+    1. Nodos sin ningún enlace (isolated).
+    2. Switches con enlaces a endpoints pero sin camino a ningún router (disconnected).
+    Busca co-ocurrencias en el texto del prompt (~200 chars de contexto por nodo).
+    Solo genera enlaces topológicamente válidos.
     """
     isolated = _find_isolated_nodes(intent)
-    if not isolated:
+    disconnected = _find_disconnected_switches(intent)
+    targets = isolated | disconnected
+    if not targets:
         return intent
 
     all_nodes = set()
@@ -188,7 +263,10 @@ def _infer_missing_links(intent, user_prompt):
 
     is_infra = lambda n: n.startswith("r") or (n.startswith("s") and not n.startswith("srv"))
 
-    for node in isolated:
+    if disconnected - isolated:
+        print(f"  [INFER] Switches sin ruta a router: {sorted(disconnected - isolated)}")
+
+    for node in targets:
         # Contexto amplio alrededor del nodo en el prompt
         contexts = re.findall(
             rf".{{0,200}}\b{re.escape(node)}\b.{{0,200}}", user_prompt, re.IGNORECASE
