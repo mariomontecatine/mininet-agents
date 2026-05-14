@@ -27,10 +27,23 @@ METRICS_FILE  = os.path.join(TMP_DIR, "metrics_history.json")
 
 
 def _append_metrics(delta_stats):
-    """Añade un snapshot de deltas a la serie temporal, limitando a METRICS_MAX_ENTRIES."""
+    """Añade un snapshot de deltas a la serie temporal con clasificación de severidad."""
+    severity = {}
+    for port, vals in delta_stats.items():
+        if vals.get("drop", 0) > 0:
+            severity[port] = "critical"
+        elif (vals.get("rx", 0) > config.UMBRAL_TRAFICO_BYTES
+              or vals.get("tx", 0) > config.UMBRAL_TRAFICO_BYTES):
+            severity[port] = "warn"
+        elif vals.get("rx", 0) > 0 or vals.get("tx", 0) > 0:
+            severity[port] = "normal"
+        else:
+            severity[port] = "idle"
+
     entry = {
         "ts": datetime.now().isoformat(timespec="seconds"),
         "ports": delta_stats,
+        "severity": severity,
     }
     history = []
     if os.path.exists(METRICS_FILE):

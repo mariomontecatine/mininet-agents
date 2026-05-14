@@ -102,7 +102,7 @@ def generate_network_intent(user_prompt):
 
     for intento in range(1, 4):
         try:
-            response = ollama.chat(model=MODEL_NAME, messages=messages, tools=tools)
+            response = ollama.chat(model=MODEL_NAME, messages=messages, tools=tools, options={"temperature": 0})
 
             if response.get("message", {}).get("tool_calls"):
                 args = response["message"]["tool_calls"][0]["function"]["arguments"]
