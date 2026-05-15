@@ -207,6 +207,9 @@ def get_topology_links():
 
         send_tmux_command(ssh, "links")
         wait_for_mininet_prompt(ssh, timeout=20)
+        # Pausa extra: wait_for_mininet_prompt puede volver al ver el prompt
+        # antes de que mininet termine de imprimir todas las líneas de 'links'.
+        time.sleep(1.5)
 
         stdin, stdout, stderr = ssh.exec_command(
             "tmux capture-pane -p -t sesion_mininet -S -5000"
@@ -293,6 +296,102 @@ def draw_topology(links, output_file="topologia_interactiva.html"):
         f.write(html)
 
     print(f"[VISUALIZADOR] ✅ Mapa interactivo guardado en: {ruta_guardado}")
+
+
+def dump_host_interfaces():
+    """
+    Devuelve dict {host_name: [ip1, ip2, ...]} con TODAS las IPs activas de
+    cada host/router de Mininet. Para hosts mono-homed devuelve [ip]; para
+    routers multi-subnet devuelve todas las interfaces no-loopback.
+
+    Implementación: ejecuta una sola línea 'py print(...)' en mininet> y
+    parsea la lista de tuplas que imprime, con marcas BEGIN/END para
+    aislarla del resto del buffer tmux.
+    """
+    import ast
+    BEGIN, END = "__HOSTIP_BEGIN__", "__HOSTIP_END__"
+    # OJO: send_tmux_command envuelve el comando en comillas simples, así que
+    # NO podemos usar comillas simples dentro de la expresión. Filtramos
+    # 127.0.0.1 en Python local tras parsear el output.
+    expr = ('py print("' + BEGIN + '" + str([(h.name, '
+            '[i.IP() for i in h.intfList() if i.IP()]'
+            ') for h in net.hosts]) + "' + END + '")')
+    try:
+        ssh = get_ssh_connection()
+        send_tmux_command(ssh, "")
+        wait_for_mininet_prompt(ssh, timeout=15)
+        send_tmux_command(ssh, expr)
+        wait_for_mininet_prompt(ssh, timeout=20)
+        time.sleep(1.0)  # margen anti-race (mismo motivo que en get_topology_links)
+        # -J: une líneas envueltas por ancho de terminal. Sin esto, las
+        # salidas largas se rompen a ~200 col y el regex no encuentra el END.
+        _, o, _ = ssh.exec_command("tmux capture-pane -J -p -t sesion_mininet -S -5000")
+        raw = o.read().decode("utf-8", errors="replace")
+        ssh.close()
+        m = re.search(re.escape(BEGIN) + r"(\[.*?\])" + re.escape(END), raw, re.DOTALL)
+        if not m:
+            return {}
+        pairs = ast.literal_eval(m.group(1))
+        # Filtramos loopback aquí (no en el comando enviado a tmux)
+        return {name: [ip for ip in ips if ip != "127.0.0.1"]
+                for name, ips in pairs if any(ip != "127.0.0.1" for ip in ips)}
+    except Exception as e:
+        print(f"[WARN] dump_host_interfaces falló: {e}")
+        return {}
+
+
+def persist_topology_json(host_ips, links, output_file="topology.json"):
+    """
+    Escribe tmp/topology.json con el formato que esperan los lectores
+    (dashboard._build_host_map y monitor_agent.detect_flow_anomalies):
+      {
+        "nodes":     [name | ip, ...],
+        "links":     [{"from": host, "to": ip}, ...],   # uno por (host, ip)
+        "endpoints": {host: ip_principal, ...}
+      }
+
+    Soporta hosts multi-homed: emite tantos pseudo-links como IPs tenga el
+    host. Eso permite resolver TODAS las IPs en el Sankey, incluidas las de
+    routers con varias interfaces.
+    """
+    nodes = []
+    nodes_seen = set()
+
+    def _add(n):
+        if n not in nodes_seen:
+            nodes.append(n)
+            nodes_seen.add(n)
+
+    pseudo_links = []
+    endpoints = {}
+    for host, ips in host_ips.items():
+        _add(host)
+        for ip in ips:
+            _add(ip)
+            pseudo_links.append({"from": host, "to": ip})
+        if ips:
+            endpoints[host] = ips[0]
+
+    # Enlaces físicos (host↔switch, switch↔switch) — sin la información de
+    # interfaz, solo el grafo lógico. Útil para el visualizador.
+    phys_links = []
+    for n1, _i1, n2, _i2 in links:
+        _add(n1); _add(n2)
+        phys_links.append({"from": n1, "to": n2})
+
+    payload = {
+        "nodes":     nodes,
+        "links":     pseudo_links + phys_links,
+        "endpoints": endpoints,
+    }
+    try:
+        path = os.path.join(TMP_DIR, output_file)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        return path
+    except IOError as e:
+        print(f"[WARN] No se pudo escribir topology.json: {e}")
+        return None
 
 
 def run_visualizer():
