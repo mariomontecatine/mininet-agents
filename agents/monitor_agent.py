@@ -22,8 +22,11 @@ TMP_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tmp"
 )
 os.makedirs(TMP_DIR, exist_ok=True)
-HISTORY_FILE  = os.path.join(TMP_DIR, "network_history.json")
-METRICS_FILE  = os.path.join(TMP_DIR, "metrics_history.json")
+HISTORY_FILE     = os.path.join(TMP_DIR, "network_history.json")
+METRICS_FILE     = os.path.join(TMP_DIR, "metrics_history.json")
+FLOWS_FILE       = os.path.join(TMP_DIR, "flows.json")
+FLOW_ALERTS_FILE = os.path.join(TMP_DIR, "flow_alerts.jsonl")
+HOST_PORT_FILE   = os.path.join(TMP_DIR, "host_port_map.json")
 
 
 def _append_metrics(delta_stats):
@@ -59,6 +62,148 @@ def _append_metrics(delta_stats):
 
     with open(METRICS_FILE, "w") as f:
         json.dump(history, f)
+
+
+def _load_flows():
+    if not os.path.exists(FLOWS_FILE):
+        return None
+    try:
+        with open(FLOWS_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, IOError):
+        return None
+
+
+def _load_host_port_map():
+    if not os.path.exists(HOST_PORT_FILE):
+        return {}
+    try:
+        with open(HOST_PORT_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, IOError):
+        return {}
+
+
+def _record_flow_alert(rec):
+    """Persiste cada anomalía detectada (fila JSONL) para el reporte posterior."""
+    try:
+        with open(FLOW_ALERTS_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except IOError:
+        pass
+
+
+def detect_flow_anomalies(flows, host_port):
+    """
+    Heurísticas sobre el snapshot live de flujos sFlow.
+    Devuelve lista de dicts con tipo, host involucrado y puerto OVS.
+
+    Tipos:
+      - port_scan      : fan_out ≥ FAN_OUT_THRESHOLD
+      - ddos_fanin     : fan_in  ≥ FAN_IN_THRESHOLD AND bytes ≥ FAN_IN_BYTES_THRESHOLD
+      - dos_volumetric : un flujo individual ≥ SURGE_BYTES_THRESHOLD
+    """
+    if not flows:
+        return []
+
+    # IP → host name (inverso del host_port_map). Para mapping legible.
+    ip_to_name = {}
+    # Reconstruimos IP→name a partir de tmp/topology.json (más fiable que host_port_map).
+    topo_path = os.path.join(TMP_DIR, "topology.json")
+    if os.path.exists(topo_path):
+        try:
+            with open(topo_path, encoding="utf-8") as f:
+                topo = json.load(f)
+            for link in topo.get("links", []):
+                a, b = str(link.get("from", "")), str(link.get("to", ""))
+                if re.match(r"^\d+\.\d+\.\d+\.\d+$", b) and not re.match(r"^\d+\.\d+\.\d+\.\d+$", a):
+                    ip_to_name[b] = a
+                elif re.match(r"^\d+\.\d+\.\d+\.\d+$", a) and not re.match(r"^\d+\.\d+\.\d+\.\d+$", b):
+                    ip_to_name[a] = b
+        except (json.JSONDecodeError, IOError):
+            pass
+
+    fan_out_dsts  = {}   # src_ip → set(dst_ip)
+    fan_in_srcs   = {}   # dst_ip → set(src_ip)
+    fan_in_bytes  = {}   # dst_ip → total bytes
+    surge_flows   = []   # [(src, dst, bytes, pkts), ...]
+
+    for f in flows:
+        src = f.get("src", "")
+        dst = f.get("dst", "")
+        b   = f.get("bytes", 0)
+        pkts= f.get("pkts", 0)
+        fan_out_dsts.setdefault(src, set()).add(dst)
+        fan_in_srcs.setdefault(dst, set()).add(src)
+        fan_in_bytes[dst] = fan_in_bytes.get(dst, 0) + b
+        if b >= config.SURGE_BYTES_THRESHOLD:
+            surge_flows.append((src, dst, b, pkts))
+
+    alerts = []
+    ts = datetime.now().isoformat(timespec="seconds")
+
+    for src_ip, dsts in fan_out_dsts.items():
+        if len(dsts) >= config.FAN_OUT_THRESHOLD:
+            host = ip_to_name.get(src_ip, src_ip)
+            alerts.append({
+                "type":    "port_scan",
+                "host":    host,
+                "host_ip": src_ip,
+                "port":    host_port.get(host),
+                "dsts":    len(dsts),
+                "ts":      ts,
+            })
+
+    for dst_ip, srcs in fan_in_srcs.items():
+        if (len(srcs) >= config.FAN_IN_THRESHOLD
+                and fan_in_bytes.get(dst_ip, 0) >= config.FAN_IN_BYTES_THRESHOLD):
+            host = ip_to_name.get(dst_ip, dst_ip)
+            alerts.append({
+                "type":    "ddos_fanin",
+                "host":    host,
+                "host_ip": dst_ip,
+                "port":    host_port.get(host),
+                "srcs":    len(srcs),
+                "bytes":   fan_in_bytes[dst_ip],
+                "ts":      ts,
+            })
+
+    for src_ip, dst_ip, b, pkts in surge_flows:
+        src_host = ip_to_name.get(src_ip, src_ip)
+        dst_host = ip_to_name.get(dst_ip, dst_ip)
+        alerts.append({
+            "type":     "dos_volumetric",
+            "host":     src_host,
+            "host_ip":  src_ip,
+            "port":     host_port.get(src_host),
+            "victim":   dst_host,
+            "victim_ip":dst_ip,
+            "bytes":    b,
+            "pkts":     pkts,
+            "ts":       ts,
+        })
+
+    return alerts
+
+
+def _format_anomaly_lines(alerts):
+    """Convierte alertas a líneas con formato 'Port sX-ethY: ...' para que el resolver las capture."""
+    lines = []
+    for a in alerts:
+        port = a.get("port") or "s?-eth?"
+        if a["type"] == "port_scan":
+            line = (f"🟠 [ESCANEO] Port {port}: origen={a['host']} ({a['host_ip']}), "
+                    f"{a['dsts']} destinos en ventana [posible port scan]")
+        elif a["type"] == "ddos_fanin":
+            line = (f"🟠 [FAN-IN] Port {port}: víctima={a['host']} ({a['host_ip']}) ← "
+                    f"{a['srcs']} orígenes, {format_bytes(a['bytes'])} combinados [posible DDoS]")
+        elif a["type"] == "dos_volumetric":
+            line = (f"🟠 [DoS] Port {port}: {a['host']}→{a['victim']} "
+                    f"({format_bytes(a['bytes'])}) [flujo volumétrico anómalo]")
+        else:
+            continue
+        lines.append(line)
+    return lines
 
 
 def format_bytes(size):
@@ -193,6 +338,17 @@ def collect_telemetry():
 
             important_lines.append(line)
 
+        # ── Capa de flujos sFlow: heurísticas de anomalía ────────────────────
+        snapshot = _load_flows()
+        if snapshot and snapshot.get("flows"):
+            host_port = _load_host_port_map()
+            anomaly_alerts = detect_flow_anomalies(snapshot["flows"], host_port)
+            for a in anomaly_alerts:
+                _record_flow_alert(a)
+            extra = _format_anomaly_lines(anomaly_alerts)
+            if extra:
+                important_lines.extend(extra)
+
         return "\n".join(important_lines)
 
     except Exception as e:
@@ -211,10 +367,13 @@ def generate_network_report(filtered_telemetry):
         "sin repetir instrucciones ni usar markdown.\n"
         "Se te dan estadísticas DELTA de los últimos segundos.\n"
         "REGLAS:\n"
-        "1. Identifica los puertos con [ALERTA ROJA] (pérdidas) o [TRÁFICO INTENSO] (>10 MB).\n"
+        "1. Identifica los puertos con [ALERTA ROJA] (pérdidas), [TRÁFICO INTENSO] (>10 MB), "
+        "[ESCANEO] (port scan: 1 origen→muchos destinos), [FAN-IN] (DDoS coordinado) "
+        "o [DoS] (flujo volumétrico anómalo).\n"
         "2. Nombra cada puerto exactamente como aparece en los datos (ej: s1-eth2).\n"
-        "3. Si todo está dentro de lo normal, escribe exactamente: 'Red estable.'\n"
-        "4. Máximo 5 líneas."
+        "3. Para [ESCANEO]/[FAN-IN]/[DoS] menciona también el host origen o víctima por su nombre.\n"
+        "4. Si todo está dentro de lo normal, escribe exactamente: 'Red estable.'\n"
+        "5. Máximo 5 líneas."
     )
 
     response = ollama.chat(
@@ -229,10 +388,13 @@ def generate_network_report(filtered_telemetry):
 
     # Fallback: si el LLM ignora el prompt y devuelve texto genérico (markdown, listas, etc.),
     # construimos el informe directamente desde la telemetría ya clasificada.
-    alerted = re.findall(r"(?:ALERTA ROJA|TRÁFICO INTENSO).*?(s\d+-eth\d+)", filtered_telemetry)
+    alerted = re.findall(
+        r"(?:ALERTA ROJA|TRÁFICO INTENSO|ESCANEO|FAN-IN|DoS).*?(s\d+-eth\d+)",
+        filtered_telemetry,
+    )
     if alerted and not any(p in result for p in alerted):
         ports_str = ", ".join(dict.fromkeys(alerted))
-        result = f"TRÁFICO INTENSO detectado en: {ports_str}"
+        result = f"ANOMALÍA detectada en: {ports_str}"
 
     return result
 

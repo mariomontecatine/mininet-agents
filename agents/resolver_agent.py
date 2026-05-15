@@ -229,7 +229,7 @@ def analyze_and_decide(report_text, raw_telemetry=None, reglas_activas=None):
     alerted_ports = []
     if raw_telemetry:
         found = re.findall(
-            r"(?:\[ALERTA ROJA\]|\[TRÁFICO INTENSO\]).*?Port\s+(s\d+-eth\d+):",
+            r"(?:\[ALERTA ROJA\]|\[TRÁFICO INTENSO\]|\[ESCANEO\]|\[FAN-IN\]|\[DoS\]).*?Port\s+(s\d+-eth\d+):",
             raw_telemetry,
         )
         alerted_ports = list(dict.fromkeys(found))  # deduplicar, preservar orden
@@ -272,9 +272,11 @@ def analyze_and_decide(report_text, raw_telemetry=None, reglas_activas=None):
         "Nunca repitas la misma acción que ya falló en un ciclo anterior.\n"
         "3. Usa POLICING para [TRÁFICO INTENSO] sin mitigación previa (limita ingress a 20 Mbps).\n"
         "4. Usa SHAPING para congestión de egress o como escalado tras POLICING fallido.\n"
-        "5. Usa BLOCK para drop_delta muy alto (DDoS) o como escalado tras SHAPING fallido.\n"
-        "6. Si no hay puertos en alerta, devuelve una única acción NO_ACTION.\n"
-        "7. NUNCA actúes sobre puertos 'LOCAL'. Formato obligatorio: sX-ethY (ej: s1-eth2).\n"
+        "5. Usa BLOCK para drop_delta muy alto, [ESCANEO] (port scan: bloquear origen) o "
+        "[FAN-IN] (DDoS coordinado: bloquear la víctima saturada). También como escalado tras SHAPING.\n"
+        "6. Usa SHAPING para [DoS] (flujo volumétrico anómalo) — mitiga sin cortar la conectividad.\n"
+        "7. Si no hay puertos en alerta, devuelve una única acción NO_ACTION.\n"
+        "8. NUNCA actúes sobre puertos 'LOCAL'. Formato obligatorio: sX-ethY (ej: s1-eth2).\n"
         "Siempre invoca la herramienta. Nunca respondas con texto plano."
     )
 
