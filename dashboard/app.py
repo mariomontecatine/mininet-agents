@@ -1,10 +1,15 @@
 import os
+import re
 import json
+import time
 import logging
 import threading
 from collections import defaultdict
+from datetime import datetime
 
-from flask import Flask, jsonify, render_template
+from flask import Flask, jsonify, render_template, request
+
+_IP_RE = re.compile(r"^\d+\.\d+\.\d+\.\d+$")
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _TMP_DIR = os.path.join(_PROJECT_ROOT, "tmp")
@@ -198,6 +203,332 @@ def api_alerts():
         matrix.append(row)
 
     return jsonify({"labels": labels, "ports": sorted_ports, "matrix": matrix})
+
+
+def _build_host_map():
+    """Devuelve dict {ip: nombre_host} a partir de tmp/topology.json.
+
+    topology.json se genera tras cada despliegue (agents/topology.py) y
+    contiene links {from, to} donde una de las puntas es un nombre de host
+    y la otra una IP. Aquí filtramos esos pares y construimos el reverso.
+    """
+    topo = _load_json("topology.json", {})
+    mapping = {}
+    for link in topo.get("links", []):
+        a = str(link.get("from", ""))
+        b = str(link.get("to", ""))
+        if _IP_RE.match(b) and not _IP_RE.match(a):
+            mapping[b] = a
+        elif _IP_RE.match(a) and not _IP_RE.match(b):
+            mapping[a] = b
+    return mapping
+
+
+def _enrich(flows, host_map):
+    if not host_map:
+        return flows
+    for f in flows:
+        f["src_name"] = host_map.get(f.get("src", ""), f.get("src", ""))
+        f["dst_name"] = host_map.get(f.get("dst", ""), f.get("dst", ""))
+    return flows
+
+
+@app.route("/api/flows/history")
+def api_flows_history():
+    """
+    Agrega los delta_flows persistidos por el supervisor sobre los últimos
+    `window` segundos. Sin doble conteo: los deltas son no solapados.
+
+    Query params:
+      window: tamaño de la ventana en segundos (default 300, máx 3600).
+
+    Respuesta (shape compatible con /api/flows):
+      {ts, window_sec, datagrams, samples, flows: [{src, dst, src_name,
+       dst_name, bytes, pkts}, ...]}
+    """
+    try:
+        window = int(request.args.get("window", 300))
+    except (TypeError, ValueError):
+        window = 300
+    window = max(30, min(window, 3600))
+
+    history = _load_json("flows_history.json", [])
+    if not history:
+        return jsonify({"ts": None, "window_sec": window, "datagrams": 0,
+                        "samples": 0, "flows": []})
+
+    # Las entradas tienen ts ISO; trabajamos por índice porque los samples
+    # son cada 5 s aprox. Tomamos los últimos ceil(window/5) entries.
+    estimated = max(1, window // 5)
+    window_entries = history[-estimated:]
+    if not window_entries:
+        return jsonify({"ts": None, "window_sec": window, "datagrams": 0,
+                        "samples": 0, "flows": []})
+
+    agg_bytes = defaultdict(int)
+    agg_pkts  = defaultdict(int)
+    datagrams_first = window_entries[0].get("datagrams", 0)
+    datagrams_last  = window_entries[-1].get("datagrams", 0)
+    for entry in window_entries:
+        for f in entry.get("delta_flows", []):
+            key = (f.get("src", ""), f.get("dst", ""))
+            agg_bytes[key] += f.get("bytes", 0)
+            agg_pkts[key]  += f.get("pkts", 0)
+
+    ranked = sorted(agg_bytes.items(), key=lambda x: x[1], reverse=True)[:20]
+    flows = [
+        {"src": k[0], "dst": k[1], "bytes": v, "pkts": agg_pkts[k]}
+        for k, v in ranked
+    ]
+    _enrich(flows, _build_host_map())
+
+    return jsonify({
+        "ts":         window_entries[-1].get("ts"),
+        "window_sec": window,
+        "datagrams":  max(0, datagrams_last - datagrams_first),
+        "samples":    len(window_entries),
+        "flows":      flows,
+    })
+
+
+@app.route("/api/flows")
+def api_flows():
+    """
+    Flujos extremo a extremo agregados por (src_ip, dst_ip) sobre la ventana
+    deslizante del daemon sFlow. Top N ya ordenado por bytes desc.
+
+    Enriquece cada flujo con src_name/dst_name si la topología los conoce
+    (cae al string IP si no hay mapping).
+
+    Estructura: {ts, window_sec, datagrams, flows: [{src, dst, src_name,
+    dst_name, bytes, pkts}, ...]}
+    """
+    snapshot = _load_json("flows.json", {})
+    if not snapshot:
+        return jsonify({"ts": None, "window_sec": 0, "datagrams": 0, "flows": []})
+
+    _enrich(snapshot.get("flows", []), _build_host_map())
+    return jsonify(snapshot)
+
+
+def _describe_actor(inj):
+    t = inj.get("type")
+    if t in ("port_scan", "dos_volumetric"):
+        return inj.get("attacker", "?")
+    if t == "ddos_fanin":
+        return ",".join(inj.get("attackers", []) or []) or "?"
+    return "?"
+
+
+def _describe_target(inj):
+    t = inj.get("type")
+    if t == "port_scan":
+        n = len(inj.get("victims", []) or [])
+        return f"{n} destinos"
+    return inj.get("victim", "?")
+
+
+def _alert_matches_injection(alert, injections, ar):
+    """
+    Una heurística cuenta como TP si dispara dentro de la ventana de alguna
+    inyección Y el host involucrado pertenece a ella (atacante o víctima).
+    """
+    ts = ar._parse_iso(alert.get("ts"))
+    if ts is None:
+        return False
+    alert_host = alert.get("host") or alert.get("host_ip")
+    for inj in injections:
+        if not ar._within(inj, ts):
+            continue
+        hosts = set(ar._attacker_hosts(inj))
+        if alert_host and alert_host in hosts:
+            return True
+    return False
+
+
+def _qos_apply_matches_injection(ev, injections, ar):
+    """
+    Una acción QoS 'apply' cuenta como TP si actúa sobre un puerto del
+    atacante/víctima de alguna inyección activa.
+    """
+    if ev.get("event") != "apply":
+        return None  # eventos relax/remove no entran en la matriz
+    ts = ar._parse_iso(ev.get("ts"))
+    port = ev.get("port")
+    if ts is None or not port:
+        return False
+    for inj in injections:
+        if not ar._within(inj, ts):
+            continue
+        if port in set(ar._attacker_ports(inj)):
+            return True
+    return False
+
+
+def _f1(precision, recall):
+    if precision + recall == 0:
+        return 0.0
+    return 2 * precision * recall / (precision + recall)
+
+
+@app.route("/api/security")
+def api_security():
+    """
+    Vista live del subsistema de detección de anomalías.
+
+    Devuelve:
+      scorecard: agregados (total, detected, mitigated, rates, by_type)
+      active:    ataques cuyo intervalo [ts_start, ts_end_planned] cubre ahora
+      recent:    últimos 20 ataques con su estado actual
+      alerts:    últimas 10 heurísticas disparadas (deduplicadas por type+host)
+    """
+    # Lazy import — evita que la importación del módulo Flask requiera
+    # agents/anomaly_report al instante.
+    from agents import anomaly_report as ar
+
+    injections  = ar._load_jsonl(ar.INJECTION_LOG)
+    qos_events  = ar._load_json(ar.QOS_HISTORY, [])
+    flow_alerts = ar._load_jsonl(ar.FLOW_ALERTS)
+    audit_lines = ar._read_audit_lines()
+
+    now = time.time()
+
+    enriched = []
+    for inj in injections:
+        start = inj.get("ts_start_epoch") or ar._parse_iso(inj.get("ts_start"))
+        if start is None:
+            continue
+        end_planned = ar._parse_iso(inj.get("ts_end_planned")) or (
+            start + inj.get("duration_sec", 60))
+
+        cls = ar.classify_injection(inj, qos_events, flow_alerts, audit_lines)
+
+        if start <= now <= end_planned:
+            status = "in_progress"
+        elif cls["signals"].get("resolver"):
+            status = "mitigated"
+        elif cls["detected"]:
+            status = "detected_only"
+        else:
+            # Sin detección y dentro del grace: aún podría llegar
+            if now <= end_planned + ar.GRACE_SEC:
+                status = "in_progress"
+            else:
+                status = "missed"
+
+        detected_by = [k for k, v in cls["signals"].items() if v]
+
+        enriched.append({
+            "id":          inj.get("id"),
+            "type":        inj.get("type"),
+            "ts_start":    inj.get("ts_start"),
+            "ts_epoch":    start,
+            "duration":    inj.get("duration_sec"),
+            "elapsed":     max(0, min(now, end_planned) - start),
+            "actor":       _describe_actor(inj),
+            "target":      _describe_target(inj),
+            "status":      status,
+            "detected_by": detected_by,
+            "lag":         cls["first_detection_lag_sec"],
+            "resolver":    cls["signals"].get("resolver"),
+        })
+
+    # Orden cronológico inverso (más reciente primero)
+    enriched.sort(key=lambda e: e["ts_epoch"], reverse=True)
+
+    # Scorecard
+    total       = len(enriched)
+    mitigated   = sum(1 for e in enriched if e["status"] == "mitigated")
+    detected    = sum(1 for e in enriched if e["status"] in ("mitigated", "detected_only"))
+    in_progress = sum(1 for e in enriched if e["status"] == "in_progress")
+    missed      = sum(1 for e in enriched if e["status"] == "missed")
+
+    by_type = {}
+    for t in ("port_scan", "dos_volumetric", "ddos_fanin"):
+        items = [e for e in enriched if e["type"] == t]
+        by_type[t] = {
+            "total":     len(items),
+            "detected":  sum(1 for e in items if e["status"] in ("mitigated","detected_only")),
+            "mitigated": sum(1 for e in items if e["status"] == "mitigated"),
+        }
+
+    # ── Matriz de confusión a nivel de evento ──────────────────────────────
+    # Cada heurística disparada es UN evento; cada acción QoS 'apply' también.
+    # Si solapa con alguna inyección y entidades coinciden → TP, si no → FP.
+    # FN se hereda del scorecard a nivel de inyección (missed).
+
+    heur_tp = sum(1 for a in flow_alerts if _alert_matches_injection(a, injections, ar))
+    heur_fp = max(0, len(flow_alerts) - heur_tp)
+
+    apply_events = [e for e in qos_events if e.get("event") == "apply"]
+    res_tp = sum(1 for e in apply_events if _qos_apply_matches_injection(e, injections, ar))
+    res_fp = max(0, len(apply_events) - res_tp)
+
+    heur_precision = heur_tp / (heur_tp + heur_fp) if (heur_tp + heur_fp) else 0.0
+    res_precision  = res_tp  / (res_tp  + res_fp)  if (res_tp  + res_fp ) else 0.0
+    # Recall a nivel inyección (cuántos ataques fueron detectados/mitigados)
+    recall_detection  = (detected  / total) if total else 0.0
+    recall_mitigation = (mitigated / total) if total else 0.0
+
+    metrics = {
+        "heuristic": {
+            "tp":        heur_tp,
+            "fp":        heur_fp,
+            "total":     len(flow_alerts),
+            "precision": round(heur_precision, 3),
+            "recall":    round(recall_detection, 3),
+            "f1":        round(_f1(heur_precision, recall_detection), 3),
+        },
+        "resolver": {
+            "tp":        res_tp,
+            "fp":        res_fp,
+            "total":     len(apply_events),
+            "precision": round(res_precision, 3),
+            "recall":    round(recall_mitigation, 3),
+            "f1":        round(_f1(res_precision, recall_mitigation), 3),
+        },
+        "confusion": {
+            "tp_injections":  detected,
+            "fn_injections":  missed,
+            "fp_heuristic":   heur_fp,
+            "fp_resolver":    res_fp,
+        },
+    }
+
+    # Últimas heurísticas (deduplicadas) con flag tp/fp para el dashboard
+    seen = set()
+    recent_alerts = []
+    for a in reversed(flow_alerts):
+        key = (a.get("type"), a.get("host"))
+        if key in seen:
+            continue
+        seen.add(key)
+        recent_alerts.append({
+            "ts":     a.get("ts"),
+            "type":   a.get("type"),
+            "host":   a.get("host"),
+            "port":   a.get("port"),
+            "is_tp":  _alert_matches_injection(a, injections, ar),
+        })
+        if len(recent_alerts) >= 10:
+            break
+
+    return jsonify({
+        "scorecard": {
+            "total":           total,
+            "detected":        detected,
+            "mitigated":       mitigated,
+            "in_progress":     in_progress,
+            "missed":          missed,
+            "detection_rate":  (detected / total) if total else 0,
+            "mitigation_rate": (mitigated / total) if total else 0,
+            "by_type":         by_type,
+        },
+        "metrics": metrics,
+        "active":  [e for e in enriched if e["status"] == "in_progress"],
+        "recent":  enriched[:20],
+        "alerts":  recent_alerts,
+    })
 
 
 @app.route("/api/qos/history")
