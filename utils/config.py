@@ -34,3 +34,16 @@ METRICS_MAX_ENTRIES = 500   # entradas máximas en metrics_history.json (~83 min
 
 # --- Dashboard web ---
 DASHBOARD_PORT = 5000
+
+# --- Inyección de anomalías (motor de ataques sintéticos) ---
+ANOMALY_PROBABILITY     = 0.15   # prob. por ciclo NOC de inyectar un ataque
+ANOMALY_MIN_DURATION    = 30     # duración mínima de un ataque (s)
+ANOMALY_MAX_DURATION    = 60     # duración máxima de un ataque (s)
+ANOMALY_COOLDOWN        = 90     # tras un ataque, descanso antes de poder inyectar otro
+ANOMALY_RNG_SEED        = None   # entero → resultados reproducibles; None → estocástico
+
+# Umbrales de las heurísticas de anomalía sobre flujos sFlow
+FAN_OUT_THRESHOLD       = 5                       # ≥N destinos distintos desde 1 origen → port scan
+FAN_IN_THRESHOLD        = 3                       # ≥N orígenes distintos hacia 1 destino → DDoS
+FAN_IN_BYTES_THRESHOLD  = 30 * 1024 * 1024        # 30 MB combinados en ventana
+SURGE_BYTES_THRESHOLD   = 50 * 1024 * 1024        # 50 MB en un solo flujo → DoS volumétrico

@@ -28,9 +28,21 @@ from agents.traffic_agent import (
     launch_background_traffic,
     stop_background_traffic,
 )
-from agents.topology import get_topology_links, draw_topology
+from agents.topology import (
+    get_topology_links, draw_topology,
+    dump_host_interfaces, persist_topology_json,
+)
 from agents.monitor_agent import collect_telemetry, generate_network_report
 from agents.resolver_agent import analyze_and_decide, resolve_multiple, run_relaxation
+from agents.sflow_agent import (
+    configure_sflow_on_bridges,
+    remove_sflow_from_bridges,
+    start_sflow_daemon,
+    stop_sflow_daemon,
+    fetch_flows,
+)
+from agents.anomaly_agent import maybe_inject_anomaly, build_host_port_map
+from agents.anomaly_report import generate_report as generate_anomaly_report
 
 # -------------------------------------------------------
 # Auditoría con rotación automática
@@ -209,6 +221,62 @@ def _live_collector():
             _live_lock.release()
 
 
+FLOWS_HISTORY_CAP = 720   # ~1 h con muestras cada 5 s
+
+
+def _sflow_collector():
+    """
+    Hilo background: lee /tmp/sflow_flows.json desde la VM cada 5 s,
+    replica el snapshot en tmp/flows.json (vista live) y acumula los
+    delta_flows en tmp/flows_history.json (cap FLOWS_HISTORY_CAP).
+
+    No usa el _live_lock: fetch_flows es una sola lectura de fichero
+    via SSH, ortogonal a los comandos tmux.
+    """
+    from utils.ssh_client import get_ssh_connection
+
+    flows_file   = os.path.join(TMP_DIR, "flows.json")
+    history_file = os.path.join(TMP_DIR, "flows_history.json")
+    last_ts: str = ""
+
+    while True:
+        time.sleep(5)
+        try:
+            ssh = get_ssh_connection()
+            snapshot = fetch_flows(ssh)
+            if not snapshot:
+                continue
+
+            with open(flows_file, "w", encoding="utf-8") as f:
+                json.dump(snapshot, f, ensure_ascii=False)
+
+            # Append al historial — solo si la marca temporal cambió (evita
+            # duplicar si el daemon aún no ha hecho un nuevo flush).
+            ts = snapshot.get("ts", "")
+            if not ts or ts == last_ts:
+                continue
+            last_ts = ts
+
+            history = []
+            if os.path.exists(history_file):
+                try:
+                    with open(history_file, encoding="utf-8") as f:
+                        history = json.load(f)
+                except (json.JSONDecodeError, IOError):
+                    history = []
+
+            history.append({
+                "ts":          ts,
+                "datagrams":   snapshot.get("datagrams", 0),
+                "delta_flows": snapshot.get("delta_flows", []),
+            })
+            history = history[-FLOWS_HISTORY_CAP:]
+            with open(history_file, "w", encoding="utf-8") as f:
+                json.dump(history, f, ensure_ascii=False)
+        except Exception:
+            pass
+
+
 def print_header(texto):
     print("\n" + "=" * 60)
     print(f" {texto.upper()} ".center(60, "="))
@@ -225,6 +293,10 @@ def run_aiops_pipeline():
     for _stale in (
         "metrics_history.json", "state.json", "topologia_interactiva.html",
         "qos_history.json", "live_metrics.json", "network_history.json",
+        "flows.json", "flows_history.json",
+        "anomaly_injections.jsonl", "flow_alerts.jsonl",
+        "anomaly_report.md", "host_port_map.json",
+        "topology.json",
     ):
         _p = os.path.join(TMP_DIR, _stale)
         try:
@@ -313,12 +385,50 @@ def run_aiops_pipeline():
         draw_topology(links)
     except Exception as _e:
         print(f"[WARN] No se pudo generar la topología interactiva: {_e}")
+        links = []
+
+    # ── topology.json fresco: mapping ip→host completo (multi-interfaz) ──
+    # Es lo que usan /api/flows (Sankey) y monitor_agent.detect_flow_anomalies
+    # para resolver IPs a nombres. Sin esto, todo aparece como IP cruda.
+    try:
+        host_ips = dump_host_interfaces()
+        if not host_ips:
+            print("[WARN] dump_host_interfaces devolvió vacío — el Sankey "
+                  "mostrará IPs en vez de nombres. Revisa el prompt de Mininet.")
+        persist_topology_json(host_ips, links)
+        if host_ips:
+            print(f"[INFO] Mapping ip→host persistido para {len(host_ips)} host(s): "
+                  f"{ {k: v for k, v in list(host_ips.items())[:6]} }"
+                  f"{'…' if len(host_ips) > 6 else ''}")
+    except Exception as _e:
+        print(f"[WARN] No se pudo persistir topology.json: {_e}")
+
+    # Mapa host → puerto OVS: lo necesitan anomaly_agent y monitor_agent
+    try:
+        host_port = build_host_port_map()
+        print(f"[INFO] Host→puerto OVS: {host_port}")
+    except Exception as _e:
+        print(f"[WARN] No se pudo construir host_port_map: {_e}")
 
     # =======================================================
     # === FASE 2: TRÁFICO + COLECTOR LIVE ===================
     # =======================================================
     registrar_log(f"Lanzando tráfico en background: {list(endpoints.keys())}")
     launch_background_traffic(endpoints)
+
+    # ── sFlow: visibilidad de flujos extremo a extremo ──────────────────────
+    try:
+        from utils.ssh_client import get_ssh_connection
+        _ssh = get_ssh_connection()
+        bridges_ok = configure_sflow_on_bridges(_ssh)
+        if bridges_ok:
+            if start_sflow_daemon(_ssh):
+                registrar_log(f"sFlow activo en bridges: {bridges_ok}")
+                threading.Thread(
+                    target=_sflow_collector, daemon=True, name="sflow-collector",
+                ).start()
+    except Exception as _e:
+        print(f"[WARN] No se pudo activar sFlow: {_e}")
 
     # El colector se ejecuta de forma continua. El lock SSH solo se adquiere
     # durante las operaciones tmux (telemetría y ejecución QoS), no durante LLM.
@@ -462,6 +572,19 @@ def run_aiops_pipeline():
             except IOError:
                 pass
 
+            # ── E. INYECCIÓN DE ANOMALÍAS ────────────────────────────────────
+            # Probabilística (config.ANOMALY_PROBABILITY). Si dispara, queda
+            # registrada en tmp/anomaly_injections.jsonl para correlacionar.
+            try:
+                inj = maybe_inject_anomaly(endpoints)
+                if inj:
+                    registrar_log(
+                        f"ANOMALY INJECTED id={inj['id']} type={inj['type']} "
+                        f"duration={inj['duration_sec']}s"
+                    )
+            except Exception as _e:
+                print(f"[WARN] anomaly_agent falló: {_e}")
+
             print(
                 f"\n[NOC] Ciclo #{ciclo} completado [{estado_red}]. "
                 f"Próximo análisis en {intervalo_actual}s..."
@@ -474,6 +597,24 @@ def run_aiops_pipeline():
         print_header("SUPERVISOR DETENIDO POR EL USUARIO")
         registrar_log("=== APAGADO DEL SISTEMA (Intervención manual) ===")
         stop_background_traffic()
+        try:
+            from utils.ssh_client import get_ssh_connection
+            _ssh = get_ssh_connection()
+            remove_sflow_from_bridges(_ssh)
+            stop_sflow_daemon(_ssh)
+        except Exception:
+            pass
+        # ── Reporte de detección de anomalías ──────────────────────────────
+        try:
+            report_path, results = generate_anomaly_report()
+            total = len(results)
+            det   = sum(1 for r in results if r["detected"])
+            print(f"\n[REPORT] Anomalías inyectadas: {total} · detectadas: {det} "
+                  f"({100.0*det/total:.0f}% si total>0)")
+            print(f"[REPORT] Informe completo: {report_path}")
+            registrar_log(f"REPORT anomalías: {det}/{total} detectadas")
+        except Exception as _e:
+            print(f"[WARN] No se pudo generar el reporte de anomalías: {_e}")
         close_persistent_connection()
         print("Sistema NOC detenido. ¡Hasta pronto!")
 
