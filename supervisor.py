@@ -296,7 +296,7 @@ def run_aiops_pipeline():
         "flows.json", "flows_history.json",
         "anomaly_injections.jsonl", "flow_alerts.jsonl",
         "anomaly_report.md", "host_port_map.json",
-        "topology.json",
+        "topology.json", "port_baseline.json",
     ):
         _p = os.path.join(TMP_DIR, _stale)
         try:
@@ -359,19 +359,8 @@ def run_aiops_pipeline():
 
     print(f"\n[IA] Intención:\n{json.dumps(intent, indent=2)}")
 
-    # Preguntar si redesplegar (solo cuando se usa caché)
-    if use_cache:
-        resp = input("¿Redesplegar la topología en la VM? (S/n): ").strip().lower()
-        do_deploy = resp != "n"
-    else:
-        do_deploy = True
-
-    if do_deploy:
-        registrar_log(f"Desplegando topología: tipo={intent.get('tipo')} intent={intent}")
-        deploy_unified_in_vm(code)
-    else:
-        print("[INFO] Saltando despliegue — se asume que Mininet ya está activo.")
-        registrar_log("INFO: Despliegue omitido por el usuario (caché reutilizada).")
+    registrar_log(f"Desplegando topología: tipo={intent.get('tipo')} intent={intent}")
+    deploy_unified_in_vm(code)
 
     endpoints = get_active_endpoints()
     if not endpoints:
@@ -609,8 +598,8 @@ def run_aiops_pipeline():
             report_path, results = generate_anomaly_report()
             total = len(results)
             det   = sum(1 for r in results if r["detected"])
-            print(f"\n[REPORT] Anomalías inyectadas: {total} · detectadas: {det} "
-                  f"({100.0*det/total:.0f}% si total>0)")
+            pct   = (100.0 * det / total) if total else 0.0
+            print(f"\n[REPORT] Anomalías inyectadas: {total} · detectadas: {det} ({pct:.0f}%)")
             print(f"[REPORT] Informe completo: {report_path}")
             registrar_log(f"REPORT anomalías: {det}/{total} detectadas")
         except Exception as _e:

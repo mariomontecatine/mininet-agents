@@ -33,7 +33,10 @@ TMP_DIR        = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__
 INJECTION_LOG  = os.path.join(TMP_DIR, "anomaly_injections.jsonl")
 HOST_PORT_FILE = os.path.join(TMP_DIR, "host_port_map.json")
 
-ATTACK_TYPES = ("port_scan", "dos_volumetric", "ddos_fanin")
+# ddos_fanin queda desactivado temporalmente: en este baseline (15 clientes → 4 servidores)
+# el fan-in legítimo es ruido constante y mezcla TP con FP. Lo volveremos a activar cuando
+# port_scan y dos_volumetric se vean limpios.
+ATTACK_TYPES = ("port_scan", "dos_volumetric")
 
 # Estado interno del scheduler — se accede solo desde el hilo del supervisor.
 _state = {

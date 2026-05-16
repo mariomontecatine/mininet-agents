@@ -14,11 +14,31 @@ MODEL_NAME = config.MODEL_RESOLVER
 TMP_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tmp")
 os.makedirs(TMP_DIR, exist_ok=True)
 
+# Cliente Ollama con timeout — evita que un ciclo cuelgue indefinidamente si el modelo se atasca.
+_ollama_client = ollama.Client(host="http://localhost:11434", timeout=config.RESOLVER_LLM_TIMEOUT)
+
 # Escala de severidad: cada nivel sólo puede subir, nunca bajar
 ESCALATION = {"POLICING": "SHAPING", "SHAPING": "BLOCK", "BLOCK": "BLOCK"}
 
 # Relajación: camino inverso cuando el tráfico vuelve a la normalidad
 RELAXATION = {"BLOCK": "SHAPING", "SHAPING": "POLICING", "POLICING": None}
+
+# Política por defecto para alertas de baja prioridad (las que no llegan al LLM).
+# Determinista, replica las reglas del system prompt — el LLM "delega" en esta tabla.
+DEFAULT_POLICY = {
+    "ALERTA ROJA": "POLICING",  # pérdidas de paquetes: limitar ingress
+    "ESCANEO":     "BLOCK",     # port scan: bloquear el origen
+    "FAN-IN":      "BLOCK",     # DDoS fan-in: bloquear el puerto víctima
+    "DoS":         "SHAPING",   # flujo volumétrico: moldear egress
+}
+
+# Pesos de severidad por categoría — definen el orden de prioridad para el top-K.
+_CATEGORY_WEIGHT = {
+    "ALERTA ROJA": 1000,  # pérdidas reales: siempre lo más urgente
+    "ESCANEO":      800,  # seguridad: amenaza activa
+    "FAN-IN":       600,  # DDoS coordinado
+    "DoS":          400,  # volumétrico unitario
+}
 
 
 # =============================================================
@@ -217,38 +237,138 @@ def resolve_multiple(actions_list):
 # === AGENTE DE DECISIÓN (LLM con Tool Calling multi-acción) ==
 # =============================================================
 
+def _parse_alerts(raw_telemetry):
+    """
+    Extrae alertas estructuradas (puerto, categoría, severidad) del texto crudo de telemetría.
+    Devuelve lista ordenada por severidad descendente, sin duplicados por puerto.
+    """
+    if not raw_telemetry:
+        return []
+
+    alerts = []
+
+    # [ALERTA ROJA]: pérdidas. El drop_delta da el peso fino.
+    for m in re.finditer(
+        r"\[ALERTA ROJA\].*?Port\s+(s\d+-eth\d+):.*?drop_delta=(\d+)",
+        raw_telemetry,
+    ):
+        alerts.append({
+            "port":     m.group(1),
+            "category": "ALERTA ROJA",
+            "metric":   int(m.group(2)),
+            "severity": _CATEGORY_WEIGHT["ALERTA ROJA"] + int(m.group(2)),
+        })
+
+    # [ESCANEO]: port scan. Peso fijo (la severidad real está en el nº de destinos).
+    for m in re.finditer(r"\[ESCANEO\].*?Port\s+(s\d+-eth\d+):", raw_telemetry):
+        alerts.append({
+            "port":     m.group(1),
+            "category": "ESCANEO",
+            "metric":   0,
+            "severity": _CATEGORY_WEIGHT["ESCANEO"],
+        })
+
+    # [FAN-IN]: DDoS coordinado. Peso = MB combinados.
+    for m in re.finditer(
+        r"\[FAN-IN\].*?Port\s+(s\d+-eth\d+):.*?([\d.]+)\s*MB\s*combinados",
+        raw_telemetry,
+    ):
+        mb = float(m.group(2))
+        alerts.append({
+            "port":     m.group(1),
+            "category": "FAN-IN",
+            "metric":   mb,
+            "severity": _CATEGORY_WEIGHT["FAN-IN"] + mb,
+        })
+
+    # [DoS]: flujo volumétrico unitario. Peso = MB del flujo.
+    for m in re.finditer(
+        r"\[DoS\].*?Port\s+(s\d+-eth\d+):.*?\(([\d.]+)\s*MB\)",
+        raw_telemetry,
+    ):
+        mb = float(m.group(2))
+        alerts.append({
+            "port":     m.group(1),
+            "category": "DoS",
+            "metric":   mb,
+            "severity": _CATEGORY_WEIGHT["DoS"] + mb,
+        })
+
+    # Deduplicar por puerto, conservando la categoría de mayor severidad.
+    by_port = {}
+    for a in alerts:
+        if a["port"] not in by_port or a["severity"] > by_port[a["port"]]["severity"]:
+            by_port[a["port"]] = a
+
+    return sorted(by_port.values(), key=lambda x: x["severity"], reverse=True)
+
+
+def _default_action(alert, reglas_activas):
+    """
+    Decisión determinista para una alerta delegada (fuera del top-K del LLM).
+    Aplica la política base y escala si el puerto ya tenía mitigación activa.
+    """
+    cat  = alert["category"]
+    port = alert["port"]
+    base = DEFAULT_POLICY.get(cat, "POLICING")
+
+    # Si la acción propuesta coincide con la ya activa, hay que escalar.
+    if reglas_activas and port in reglas_activas:
+        previa = reglas_activas[port]["action"]
+        if base == previa:
+            base = ESCALATION.get(previa, "BLOCK")
+
+    return {
+        "action":      base,
+        "target_port": port,
+        "rate_mbps":   config.TASA_POLICING_MBPS,
+        "reason":      f"Política por defecto ({cat} → {base}, severidad {alert['metric']:.1f})",
+    }
+
+
 def analyze_and_decide(report_text, raw_telemetry=None, reglas_activas=None):
     """
-    Analiza el informe y devuelve una lista de acciones.
-    - raw_telemetry: texto crudo de collect_telemetry() para extraer puertos alertados con regex.
-    - reglas_activas: dict {puerto → {"action": str, "ciclo": int}} para inyectar contexto de estado.
+    Híbrido LLM + política determinista.
+    - Las top-K alertas más críticas se envían al LLM (decisión informada).
+    - El resto se resuelve con DEFAULT_POLICY (decisión inmediata, sin Ollama).
+    Devuelve la lista combinada de acciones.
     """
-    print("\n[IA] Evaluando el informe con Tool Calling (multi-acción)...")
+    print("\n[IA] Evaluando el informe (top-K LLM + política por defecto)...")
 
-    # --- 1. Extraer puertos alertados de la telemetría cruda (no del informe LLM) ---
-    alerted_ports = []
-    if raw_telemetry:
-        found = re.findall(
-            r"(?:\[ALERTA ROJA\]|\[TRÁFICO INTENSO\]|\[ESCANEO\]|\[FAN-IN\]|\[DoS\]).*?Port\s+(s\d+-eth\d+):",
-            raw_telemetry,
-        )
-        alerted_ports = list(dict.fromkeys(found))  # deduplicar, preservar orden
+    alerts = _parse_alerts(raw_telemetry)
 
-    # Fast-path: sin alertas → NO_ACTION inmediato sin llamar al LLM
-    if not alerted_ports and not reglas_activas:
+    # Fast-path: sin alertas ni reglas activas → NO_ACTION inmediato.
+    if not alerts and not reglas_activas:
         print("[IA] Red limpia. Sin acción necesaria.")
         return [{"action": "NO_ACTION"}]
 
-    # --- 2. Bloque de enumeración 1:1 para el LLM ---
-    if alerted_ports:
-        enum_lines = "\n".join(f"  {i+1}. {p}" for i, p in enumerate(alerted_ports))
-        enum_ctx = (
-            f"PUERTOS EN ALERTA (MAPEO 1:1 OBLIGATORIO):\n{enum_lines}\n"
-            f"TOTAL: {len(alerted_ports)} puertos. "
-            f"El array DEBE contener EXACTAMENTE {len(alerted_ports)} entradas, una por puerto."
-        )
-    else:
-        enum_ctx = "PUERTOS EN ALERTA: ninguno detectado en este ciclo."
+    # Split top-K (LLM) vs resto (política por defecto).
+    top_k = alerts[: config.RESOLVER_LLM_TOPK]
+    rest  = alerts[config.RESOLVER_LLM_TOPK:]
+
+    # Acciones deterministas para las alertas delegadas.
+    default_actions = [_default_action(a, reglas_activas) for a in rest]
+    if default_actions:
+        resumen_default = [(a["target_port"], a["action"]) for a in default_actions]
+        print(f"[IA] {len(default_actions)} alerta(s) delegadas a política por defecto: {resumen_default}")
+
+    # Si no quedan alertas para el LLM (porque K cubre todo o porque hay 0 alertas
+    # pero sí reglas_activas), devolvemos lo que tengamos. Las reglas_activas se
+    # gestionan en el supervisor (escalado forzado + relajación).
+    if not top_k:
+        return default_actions or [{"action": "NO_ACTION"}]
+
+    # --- Enumeración 1:1 para el LLM, ahora solo sobre top-K ---
+    enum_lines = "\n".join(
+        f"  {i+1}. {a['port']} [{a['category']}, severidad {a['metric']:.1f}]"
+        for i, a in enumerate(top_k)
+    )
+    enum_ctx = (
+        f"PUERTOS EN ALERTA (TOP-{len(top_k)} más críticos, MAPEO 1:1 OBLIGATORIO):\n{enum_lines}\n"
+        f"TOTAL: {len(top_k)} puertos. "
+        f"El array DEBE contener EXACTAMENTE {len(top_k)} entradas, una por puerto."
+    )
+    alerted_ports = [a["port"] for a in top_k]
 
     # --- 3. Bloque de estado/escalado ---
     if reglas_activas:
@@ -263,20 +383,19 @@ def analyze_and_decide(report_text, raw_telemetry=None, reglas_activas=None):
 
     system_prompt = (
         "Eres un Orquestador Automático de Redes (SDN/QoS). "
-        "Analiza el informe y usa 'apply_network_actions' para resolver TODAS las alertas en un solo ciclo.\n"
+        "Decides sobre las alertas más críticas del ciclo (top-K). "
+        "Las alertas secundarias se resuelven con política por defecto antes de llegar a ti.\n"
         "REGLAS DE DECISIÓN:\n"
         "1. REGLA CRÍTICA DE CARDINALIDAD: el array de acciones debe tener EXACTAMENTE tantas entradas "
         "como el TOTAL indicado en 'PUERTOS EN ALERTA'. Ni una más, ni una menos.\n"
         "2. REGLA DE ESCALADO: si un puerto ya tiene una mitigación activa y sigue en alerta, "
         "DEBES escalar según la cadena POLICING → SHAPING → BLOCK. "
         "Nunca repitas la misma acción que ya falló en un ciclo anterior.\n"
-        "3. Usa POLICING para [TRÁFICO INTENSO] sin mitigación previa (limita ingress a 20 Mbps).\n"
-        "4. Usa SHAPING para congestión de egress o como escalado tras POLICING fallido.\n"
-        "5. Usa BLOCK para drop_delta muy alto, [ESCANEO] (port scan: bloquear origen) o "
-        "[FAN-IN] (DDoS coordinado: bloquear la víctima saturada). También como escalado tras SHAPING.\n"
-        "6. Usa SHAPING para [DoS] (flujo volumétrico anómalo) — mitiga sin cortar la conectividad.\n"
-        "7. Si no hay puertos en alerta, devuelve una única acción NO_ACTION.\n"
-        "8. NUNCA actúes sobre puertos 'LOCAL'. Formato obligatorio: sX-ethY (ej: s1-eth2).\n"
+        "3. Usa SHAPING para [DoS] (flujo volumétrico anómalo) — mitiga sin cortar la conectividad.\n"
+        "4. Usa BLOCK para [ESCANEO] (port scan: bloquear origen) y [FAN-IN] (DDoS: bloquear la víctima). "
+        "También como escalado final tras SHAPING.\n"
+        "5. Usa POLICING para [ALERTA ROJA] (pérdidas) sin mitigación previa.\n"
+        "6. NUNCA actúes sobre puertos 'LOCAL'. Formato obligatorio: sX-ethY (ej: s1-eth2).\n"
         "Siempre invoca la herramienta. Nunca respondas con texto plano."
     )
 
@@ -342,7 +461,8 @@ def analyze_and_decide(report_text, raw_telemetry=None, reglas_activas=None):
     )
 
     try:
-        response = ollama.chat(
+        t0 = time.time()
+        response = _ollama_client.chat(
             model=MODEL_NAME,
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -351,21 +471,27 @@ def analyze_and_decide(report_text, raw_telemetry=None, reglas_activas=None):
             tools=tools,
             options={"temperature": 0},
         )
+        dt = time.time() - t0
 
+        llm_actions = None
         if response.get("message", {}).get("tool_calls"):
             tool_call = response["message"]["tool_calls"][0]
             if tool_call["function"]["name"] == "apply_network_actions":
-                actions = tool_call["function"]["arguments"].get("actions", [])
-                resumen = [f"{a.get('action')}@{a.get('target_port', '-')}" for a in actions]
-                print(f"[IA] {len(actions)} acción(es): {resumen}")
-                return actions
+                llm_actions = tool_call["function"]["arguments"].get("actions", [])
 
-        print("[IA] Red estable. No se invocaron acciones de mitigación.")
-        return [{"action": "NO_ACTION"}]
+        if llm_actions:
+            resumen = [f"{a.get('action')}@{a.get('target_port', '-')}" for a in llm_actions]
+            print(f"[IA] LLM resolvió {len(llm_actions)} acción(es) en {dt:.1f}s: {resumen}")
+            return llm_actions + default_actions
+
+        print(f"[IA] LLM no invocó la herramienta ({dt:.1f}s). Fallback a política por defecto para top-K.")
+        fallback = [_default_action(a, reglas_activas) for a in top_k]
+        return fallback + default_actions
 
     except Exception as e:
-        print(f"[ERROR CRÍTICO] Fallo en la comunicación con Ollama: {e}")
-        return None
+        print(f"[ERROR] Fallo en la llamada al LLM ({e}). Fallback a política por defecto para top-K.")
+        fallback = [_default_action(a, reglas_activas) for a in top_k]
+        return fallback + default_actions
 
 
 def execute_resolution(decision):

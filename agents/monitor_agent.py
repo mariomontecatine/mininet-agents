@@ -27,16 +27,90 @@ METRICS_FILE     = os.path.join(TMP_DIR, "metrics_history.json")
 FLOWS_FILE       = os.path.join(TMP_DIR, "flows.json")
 FLOW_ALERTS_FILE = os.path.join(TMP_DIR, "flow_alerts.jsonl")
 HOST_PORT_FILE   = os.path.join(TMP_DIR, "host_port_map.json")
+BASELINE_FILE    = os.path.join(TMP_DIR, "port_baseline.json")
+
+
+# ============================================================
+# === Capa A: rol del puerto (host / server / trunk) =========
+# ============================================================
+
+_PORT_ROLE_CACHE = {"data": None, "mtime": 0}
+
+
+def _port_role(port):
+    """
+    Devuelve 'host', 'server' o 'trunk' según el host conectado al puerto OVS.
+    Cachea por mtime de host_port_map.json — coste amortizado constante.
+    """
+    if not os.path.exists(HOST_PORT_FILE):
+        return "trunk"
+    mtime = os.path.getmtime(HOST_PORT_FILE)
+    if _PORT_ROLE_CACHE["data"] is None or mtime > _PORT_ROLE_CACHE["mtime"]:
+        try:
+            with open(HOST_PORT_FILE, encoding="utf-8") as f:
+                hp = json.load(f)
+            port_to_host = {v: k for k, v in hp.items()}
+            roles = {}
+            for p, host in port_to_host.items():
+                if host.startswith("srv"):
+                    roles[p] = "server"
+                elif host.startswith("h"):
+                    roles[p] = "host"
+                else:
+                    roles[p] = "trunk"
+            _PORT_ROLE_CACHE["data"]  = roles
+            _PORT_ROLE_CACHE["mtime"] = mtime
+        except (json.JSONDecodeError, IOError):
+            return "trunk"
+    return _PORT_ROLE_CACHE["data"].get(port, "trunk")
+
+
+def _role_multiplier(port):
+    return config.PORT_ROLE_MULTIPLIER.get(_port_role(port), 1.0)
+
+
+# ============================================================
+# === Capa C: baseline adaptativo (EMA por puerto) ===========
+# ============================================================
+
+def _load_baseline():
+    if not os.path.exists(BASELINE_FILE):
+        return {}
+    try:
+        with open(BASELINE_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, IOError):
+        return {}
+
+
+def _save_baseline(baseline):
+    try:
+        with open(BASELINE_FILE, "w", encoding="utf-8") as f:
+            json.dump(baseline, f)
+    except IOError:
+        pass
+
+
+def _ema(prev, current, alpha=None):
+    """EMA estándar; en el primer sample devuelve el valor crudo."""
+    if alpha is None:
+        alpha = config.BASELINE_EMA_ALPHA
+    if prev is None or prev == 0:
+        return float(current)
+    return alpha * float(current) + (1.0 - alpha) * float(prev)
 
 
 def _append_metrics(delta_stats):
     """Añade un snapshot de deltas a la serie temporal con clasificación de severidad."""
     severity = {}
     for port, vals in delta_stats.items():
+        # Umbral ajustado al rol — un uplink/server NO debe pintarse 'warn' por tráfico legítimo.
+        port_floor = config.UMBRAL_TRAFICO_BYTES * config.PORT_ROLE_MULTIPLIER.get(
+            _port_role(port), 1.0
+        )
         if vals.get("drop", 0) > 0:
             severity[port] = "critical"
-        elif (vals.get("rx", 0) > config.UMBRAL_TRAFICO_BYTES
-              or vals.get("tx", 0) > config.UMBRAL_TRAFICO_BYTES):
+        elif vals.get("rx", 0) > port_floor or vals.get("tx", 0) > port_floor:
             severity[port] = "warn"
         elif vals.get("rx", 0) > 0 or vals.get("tx", 0) > 0:
             severity[port] = "normal"
@@ -136,52 +210,79 @@ def detect_flow_anomalies(flows, host_port):
         fan_out_dsts.setdefault(src, set()).add(dst)
         fan_in_srcs.setdefault(dst, set()).add(src)
         fan_in_bytes[dst] = fan_in_bytes.get(dst, 0) + b
-        if b >= config.SURGE_BYTES_THRESHOLD:
+        # Capa A: el umbral SURGE se relaja según el rol del puerto-origen.
+        # Un servidor sirviendo a varios clientes mueve bytes "como si fuera DoS" por construcción.
+        src_host = ip_to_name.get(src, src)
+        src_port = host_port.get(src_host)
+        surge_floor = config.SURGE_BYTES_THRESHOLD * (
+            config.PORT_ROLE_MULTIPLIER.get(_port_role(src_port), 1.0) if src_port else 1.0
+        )
+        if b >= surge_floor:
             surge_flows.append((src, dst, b, pkts))
 
     alerts = []
     ts = datetime.now().isoformat(timespec="seconds")
 
-    for src_ip, dsts in fan_out_dsts.items():
-        if len(dsts) >= config.FAN_OUT_THRESHOLD:
-            host = ip_to_name.get(src_ip, src_ip)
+    # Scope: solo emitimos alertas de los tipos que el inyector está usando.
+    # Evita ruido del baseline en heurísticas no evaluadas en esta ronda.
+    try:
+        from agents.anomaly_agent import ATTACK_TYPES as _ACTIVE_ATTACKS
+    except Exception:
+        _ACTIVE_ATTACKS = ("port_scan", "dos_volumetric", "ddos_fanin")
+
+    if "port_scan" in _ACTIVE_ATTACKS:
+        for src_ip, dsts in fan_out_dsts.items():
+            if len(dsts) < config.FAN_OUT_THRESHOLD:
+                continue
+            host     = ip_to_name.get(src_ip, src_ip)
+            src_port = host_port.get(host)
+            # Filtro de FP estructural: un servidor responde a sus clientes, no escanea.
+            if _port_role(src_port) == "server":
+                continue
             alerts.append({
                 "type":    "port_scan",
                 "host":    host,
                 "host_ip": src_ip,
-                "port":    host_port.get(host),
+                "port":    src_port,
                 "dsts":    len(dsts),
                 "ts":      ts,
             })
 
-    for dst_ip, srcs in fan_in_srcs.items():
-        if (len(srcs) >= config.FAN_IN_THRESHOLD
-                and fan_in_bytes.get(dst_ip, 0) >= config.FAN_IN_BYTES_THRESHOLD):
-            host = ip_to_name.get(dst_ip, dst_ip)
-            alerts.append({
-                "type":    "ddos_fanin",
-                "host":    host,
-                "host_ip": dst_ip,
-                "port":    host_port.get(host),
-                "srcs":    len(srcs),
-                "bytes":   fan_in_bytes[dst_ip],
-                "ts":      ts,
-            })
+    if "ddos_fanin" in _ACTIVE_ATTACKS:
+        for dst_ip, srcs in fan_in_srcs.items():
+            # Capa A: el umbral FAN-IN se relaja según el rol del puerto-víctima.
+            victim_host = ip_to_name.get(dst_ip, dst_ip)
+            victim_port = host_port.get(victim_host)
+            fanin_floor = config.FAN_IN_BYTES_THRESHOLD * (
+                config.PORT_ROLE_MULTIPLIER.get(_port_role(victim_port), 1.0) if victim_port else 1.0
+            )
+            if (len(srcs) >= config.FAN_IN_THRESHOLD
+                    and fan_in_bytes.get(dst_ip, 0) >= fanin_floor):
+                alerts.append({
+                    "type":    "ddos_fanin",
+                    "host":    victim_host,
+                    "host_ip": dst_ip,
+                    "port":    victim_port,
+                    "srcs":    len(srcs),
+                    "bytes":   fan_in_bytes[dst_ip],
+                    "ts":      ts,
+                })
 
-    for src_ip, dst_ip, b, pkts in surge_flows:
-        src_host = ip_to_name.get(src_ip, src_ip)
-        dst_host = ip_to_name.get(dst_ip, dst_ip)
-        alerts.append({
-            "type":     "dos_volumetric",
-            "host":     src_host,
-            "host_ip":  src_ip,
-            "port":     host_port.get(src_host),
-            "victim":   dst_host,
-            "victim_ip":dst_ip,
-            "bytes":    b,
-            "pkts":     pkts,
-            "ts":       ts,
-        })
+    if "dos_volumetric" in _ACTIVE_ATTACKS:
+        for src_ip, dst_ip, b, pkts in surge_flows:
+            src_host = ip_to_name.get(src_ip, src_ip)
+            dst_host = ip_to_name.get(dst_ip, dst_ip)
+            alerts.append({
+                "type":     "dos_volumetric",
+                "host":     src_host,
+                "host_ip":  src_ip,
+                "port":     host_port.get(src_host),
+                "victim":   dst_host,
+                "victim_ip":dst_ip,
+                "bytes":    b,
+                "pkts":     pkts,
+                "ts":       ts,
+            })
 
     return alerts
 
@@ -321,22 +422,50 @@ def collect_telemetry():
             if res:
                 important_lines.append(f">>> CONECTIVIDAD: {res.group(0)}")
 
+        baseline = _load_baseline()
+
         for port, val in deltas.items():
             if val["rx"] == 0 and val["tx"] == 0 and val["drop"] == 0:
                 continue
 
-            # USAMOS LA NUEVA FUNCIÓN PARA HUMANIZAR LOS NÚMEROS
+            # --- Capa A: floor absoluto ajustado al rol del puerto ---
+            role  = _port_role(port)
+            mult  = config.PORT_ROLE_MULTIPLIER.get(role, 1.0)
+            floor = config.UMBRAL_TRAFICO_BYTES * mult
+
+            # --- Capa C: comparación contra EMA por puerto ---
+            entry = baseline.get(port, {"ema_rx": 0.0, "ema_tx": 0.0, "samples": 0})
+            warm  = entry["samples"] >= config.BASELINE_WARMUP
+            ratio_rx = val["rx"] / max(entry["ema_rx"], 1.0)
+            ratio_tx = val["tx"] / max(entry["ema_tx"], 1.0)
+            relative_anomaly = warm and (
+                ratio_rx >= config.BASELINE_ALERT_K or ratio_tx >= config.BASELINE_ALERT_K
+            )
+            absolute_high = val["rx"] > floor or val["tx"] > floor
+            is_intense = absolute_high and relative_anomaly
+
+            # Actualizar EMA *después* de la evaluación
+            entry["ema_rx"]  = _ema(entry["ema_rx"],  val["rx"])
+            entry["ema_tx"]  = _ema(entry["ema_tx"],  val["tx"])
+            entry["samples"] = min(entry["samples"] + 1, 9999)
+            baseline[port]   = entry
+
             rx_str = format_bytes(val["rx"])
             tx_str = format_bytes(val["tx"])
-
-            line = f"Port {port}: rx_delta={rx_str}, tx_delta={tx_str}, drop_delta={val['drop']}"
+            line   = f"Port {port}: rx_delta={rx_str}, tx_delta={tx_str}, drop_delta={val['drop']}"
 
             if val["drop"] > 0:
                 line = f"🔴 [ALERTA ROJA] {line} <-- ¡PÉRDIDA ACTIVA!"
-            if val["rx"] > config.UMBRAL_TRAFICO_BYTES or val["tx"] > config.UMBRAL_TRAFICO_BYTES:
-                line = f"⚠️ [TRÁFICO INTENSO] {line} <-- FLUJO ALTO DETECTADO"
+            if is_intense:
+                dev = max(ratio_rx, ratio_tx)
+                line = (
+                    f"⚠️ [TRÁFICO INTENSO] {line} "
+                    f"<-- DESVIACIÓN {dev:.1f}× SOBRE BASELINE ({role})"
+                )
 
             important_lines.append(line)
+
+        _save_baseline(baseline)
 
         # ── Capa de flujos sFlow: heurísticas de anomalía ────────────────────
         snapshot = _load_flows()

@@ -256,7 +256,7 @@ def render(results):
                 s[k] += 1
 
     detected_total = sum(1 for r in results if r["detected"])
-    pct = 100.0 * detected_total / total
+    pct = (100.0 * detected_total / total) if total else 0.0
 
     out = []
     out.append("# Anomaly Detection Report")
