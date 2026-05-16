@@ -310,7 +310,7 @@
 <div class="topbar">
   <span class="topbar-title">NOC — Mininet AIOps</span>
   <span class="topbar-spacer"></span>
-  <button class="icon-btn primary" id="btn-save-run" onclick="openSaveModal()" title="Guardar la ejecución actual">💾 Guardar</button>
+  <button class="icon-btn primary" id="btn-save-run" onclick="openSaveModal()" title="Guardar la ejecución actual">Guardar</button>
   <span id="badge-estado" class="status-pill s-none">
     <span class="dot"></span>
     <span id="estado-text">Sin datos</span>
@@ -337,7 +337,7 @@
   </div>
   <div class="body">
     <div class="actions">
-      <button class="icon-btn primary" onclick="openSaveModal()">💾 Guardar actual</button>
+      <button class="icon-btn primary" onclick="openSaveModal()">Guardar actual</button>
       <button class="icon-btn" onclick="loadRuns()">↻ Recargar</button>
     </div>
     <div id="runs-list">
@@ -478,12 +478,113 @@
     </div>
   </div>
 
-  <!-- ROW 3c: Ciberseguridad — detección y mitigación de anomalías -->
+  <!-- ROW 4: tráfico histórico + drops -->
+  <div class="row">
+    <div class="panel" style="flex:2">
+      <div class="panel-hd">
+        <span class="panel-title">Tráfico en tiempo real</span>
+        <div class="btn-group">
+          <button class="btn-tog active" id="btn-view-sw" onclick="setView('switch')">Switch</button>
+          <button class="btn-tog"        id="btn-view-pt" onclick="setView('port')">Puerto</button>
+          <button class="btn-tog active" id="btn-scale"   onclick="toggleScale()">Log</button>
+          <button class="btn-tog active" id="btn-window"  onclick="toggleTrafficWindow()" title="Ventana viva (60 muestras) vs histórico completo">Live</button>
+        </div>
+      </div>
+      <div class="panel-body">
+        <div class="chart-wrap" id="chart-traffic-wrap">
+          <div id="chart-traffic-inner">
+            <canvas id="chart-traffic"></canvas>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="panel" style="flex:1">
+      <div class="panel-hd">
+        <span class="panel-title">Drops por puerto</span>
+        <span class="panel-hint">Solo puertos con pérdidas</span>
+      </div>
+      <div class="panel-body">
+        <div class="chart-wrap" id="chart-drops-wrap">
+          <canvas id="chart-drops"></canvas>
+          <div id="drops-empty" style="display:none;position:absolute;inset:0;
+            align-items:center;justify-content:center;
+            color:var(--dim);font-size:11px;letter-spacing:.05em;text-transform:uppercase">
+            Sin drops detectados
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ROW 5: heatmap -->
+  <div class="row">
+    <div class="panel">
+      <div class="panel-hd">
+        <span class="panel-title">Mapa de calor — severidad por puerto y ciclo</span>
+        <span class="panel-hint" style="display:flex;gap:10px">
+          <span><span style="color:var(--green)">■</span> Normal</span>
+          <span><span style="color:var(--orange)">■</span> Tráfico intenso</span>
+          <span><span style="color:var(--red)">■</span> Crítico / drops</span>
+        </span>
+      </div>
+      <div class="panel-body p0" style="padding:8px 12px 12px">
+        <canvas id="heatmap-canvas"></canvas>
+      </div>
+    </div>
+  </div>
+
+  <!-- ROW 6: informe IA + reglas QoS -->
+  <div class="row">
+    <div class="panel">
+      <div class="panel-hd"><span class="panel-title">Informe del monitor IA</span></div>
+      <div class="panel-body">
+        <pre id="informe-ia">Sin datos aún…</pre>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="panel-hd"><span class="panel-title">Reglas activas de QoS</span></div>
+      <div class="panel-body p0" style="max-height:220px;overflow-y:auto">
+        <table class="qos-table">
+          <thead style="position:sticky;top:0;background:var(--panel);z-index:1">
+            <tr><th>Puerto</th><th>Acción</th><th>Ciclo</th></tr>
+          </thead>
+          <tbody id="tabla-reglas">
+            <tr class="empty"><td colspan="3">Sin restricciones activas</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- ROW 7: timeline QoS -->
+  <div class="row">
+    <div class="panel">
+      <div class="panel-hd">
+        <span class="panel-title">Timeline de restricciones QoS</span>
+        <span class="panel-hint">Eje X = ciclos NOC · segmento activo tiene borde</span>
+      </div>
+      <div id="qos-timeline">
+        <span class="tl-empty">Sin historial de restricciones aún.</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ROW 7b: Ciberseguridad — detección y mitigación de anomalías -->
   <div class="row">
     <div class="panel">
       <div class="panel-hd">
         <span class="panel-title">🛡 Ciberseguridad — detección de anomalías</span>
         <span class="panel-hint" id="sec-hint">esperando datos…</span>
+        <div class="btn-group" style="margin-left:auto">
+          <button class="btn-tog" onclick="injectAttack('port_scan')"
+                  title="Forzar la inyección de un port scan (salta cooldown y probabilidad)">
+            ⚡ Port scan
+          </button>
+          <button class="btn-tog" onclick="injectAttack('dos_volumetric')"
+                  title="Forzar la inyección de un DoS volumétrico">
+            ⚡ DoS volumétrico
+          </button>
+        </div>
       </div>
       <div class="panel-body" style="padding:14px 16px">
 
@@ -515,7 +616,7 @@
 
         <!-- Per-type breakdown -->
         <div id="sec-by-type"
-             style="display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-bottom:14px;
+             style="display:grid;grid-template-columns:repeat(2,1fr);gap:14px;margin-bottom:14px;
                     padding:10px 12px;background:rgba(255,255,255,.02);border-radius:3px"></div>
 
         <!-- Eficiencia agente — matriz de confusión y métricas P/R/F1 -->
@@ -614,10 +715,10 @@
         <table class="tt-table" style="margin-bottom:14px">
           <thead><tr>
             <th>Inicio</th><th>Tipo</th><th>Atacante → Víctima</th>
-            <th>Dur</th><th>Señales</th><th>Estado</th>
+            <th>Dur</th><th>Estado</th>
           </tr></thead>
           <tbody id="sec-recent-body">
-            <tr class="empty"><td colspan="6">Sin ataques registrados aún…</td></tr>
+            <tr class="empty"><td colspan="5">Sin ataques registrados aún…</td></tr>
           </tbody>
         </table>
 
@@ -627,97 +728,6 @@
         <div id="sec-alerts" style="font-size:11px;color:var(--muted);
              font-variant-numeric:tabular-nums">—</div>
 
-      </div>
-    </div>
-  </div>
-
-  <!-- ROW 4: tráfico histórico + drops -->
-  <div class="row">
-    <div class="panel" style="flex:2">
-      <div class="panel-hd">
-        <span class="panel-title">Tráfico en tiempo real</span>
-        <div class="btn-group">
-          <button class="btn-tog active" id="btn-view-sw" onclick="setView('switch')">Switch</button>
-          <button class="btn-tog"        id="btn-view-pt" onclick="setView('port')">Puerto</button>
-          <button class="btn-tog active" id="btn-scale"   onclick="toggleScale()">Log</button>
-          <button class="btn-tog active" id="btn-window"  onclick="toggleTrafficWindow()" title="Ventana viva (60 muestras) vs histórico completo">Live</button>
-        </div>
-      </div>
-      <div class="panel-body">
-        <div class="chart-wrap" id="chart-traffic-wrap">
-          <div id="chart-traffic-inner">
-            <canvas id="chart-traffic"></canvas>
-          </div>
-        </div>
-      </div>
-    </div>
-    <div class="panel" style="flex:1">
-      <div class="panel-hd">
-        <span class="panel-title">Drops por puerto</span>
-        <span class="panel-hint">Solo puertos con pérdidas</span>
-      </div>
-      <div class="panel-body">
-        <div class="chart-wrap" id="chart-drops-wrap">
-          <canvas id="chart-drops"></canvas>
-          <div id="drops-empty" style="display:none;position:absolute;inset:0;
-            align-items:center;justify-content:center;
-            color:var(--dim);font-size:11px;letter-spacing:.05em;text-transform:uppercase">
-            Sin drops detectados
-          </div>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <!-- ROW 5: heatmap -->
-  <div class="row">
-    <div class="panel">
-      <div class="panel-hd">
-        <span class="panel-title">Mapa de calor — severidad por puerto y ciclo</span>
-        <span class="panel-hint" style="display:flex;gap:10px">
-          <span><span style="color:var(--green)">■</span> Normal</span>
-          <span><span style="color:var(--orange)">■</span> Tráfico intenso</span>
-          <span><span style="color:var(--red)">■</span> Crítico / drops</span>
-        </span>
-      </div>
-      <div class="panel-body p0" style="padding:8px 12px 12px">
-        <canvas id="heatmap-canvas"></canvas>
-      </div>
-    </div>
-  </div>
-
-  <!-- ROW 6: informe IA + reglas QoS -->
-  <div class="row">
-    <div class="panel">
-      <div class="panel-hd"><span class="panel-title">Informe del monitor IA</span></div>
-      <div class="panel-body">
-        <pre id="informe-ia">Sin datos aún…</pre>
-      </div>
-    </div>
-    <div class="panel">
-      <div class="panel-hd"><span class="panel-title">Reglas activas de QoS</span></div>
-      <div class="panel-body p0" style="max-height:220px;overflow-y:auto">
-        <table class="qos-table">
-          <thead style="position:sticky;top:0;background:var(--panel);z-index:1">
-            <tr><th>Puerto</th><th>Acción</th><th>Ciclo</th></tr>
-          </thead>
-          <tbody id="tabla-reglas">
-            <tr class="empty"><td colspan="3">Sin restricciones activas</td></tr>
-          </tbody>
-        </table>
-      </div>
-    </div>
-  </div>
-
-  <!-- ROW 7: timeline QoS -->
-  <div class="row">
-    <div class="panel">
-      <div class="panel-hd">
-        <span class="panel-title">Timeline de restricciones QoS</span>
-        <span class="panel-hint">Eje X = ciclos NOC · segmento activo tiene borde</span>
-      </div>
-      <div id="qos-timeline">
-        <span class="tl-empty">Sin historial de restricciones aún.</span>
       </div>
     </div>
   </div>
@@ -884,6 +894,12 @@ function toggleTrafficWindow() {
   const btn = document.getElementById('btn-window');
   btn.textContent = _trafficWindow === 'live' ? 'Live' : 'Full';
   btn.classList.toggle('active', _trafficWindow === 'live');
+  // Cuando entras en Full, mostramos lo más antiguo a la izquierda con el
+  // eje Y a la vista. El usuario puede scrollear a la derecha para ver lo
+  // más reciente; mientras esté pegado al borde derecho, los nuevos
+  // samples le siguen automáticamente (modo «follow tail»).
+  const wrap = document.getElementById('chart-traffic-wrap');
+  if (wrap) wrap.scrollLeft = 0;
   // Fuerza fetch inmediato para refrescar la serie con el nuevo límite
   updateLiveMetrics();
 }
@@ -906,11 +922,16 @@ function rebuildTrafficChart() {
       needed = Math.max(baseW, n * PX_PER_SAMPLE);
     }
     const prev = inner.style.width;
+    // ¿El usuario está pegado al borde derecho? Si sí, le seguimos los
+    // nuevos samples; si está revisando datos antiguos, no le movemos.
+    const followTail = (wrapper.scrollWidth - wrapper.scrollLeft
+                        - wrapper.clientWidth) < 30;
     inner.style.width = needed + 'px';
     if (prev !== inner.style.width) {
-      // Auto-scroll al borde derecho cuando se amplía (ver lo más reciente)
-      requestAnimationFrame(() => { wrapper.scrollLeft = wrapper.scrollWidth; });
       trafficChart.resize();
+      if (followTail) {
+        requestAnimationFrame(() => { wrapper.scrollLeft = wrapper.scrollWidth; });
+      }
     }
   }
 
@@ -1036,7 +1057,7 @@ function _tlSeg(open, w, active) {
        + open.action + '</div>';
 }
 
-function renderQosTimeline(events) {
+function renderQosTimeline(events, currentCycle) {
   const el = document.getElementById('qos-timeline');
   if (!events || events.length === 0) {
     el.innerHTML = '<span class="tl-empty">Sin historial de restricciones aún.</span>';
@@ -1049,9 +1070,12 @@ function renderQosTimeline(events) {
     byPort[ev.port].push(ev);
   }
 
-  const allCycles = events.map(e => e.cycle);
-  const minCycle  = Math.min(...allCycles);
-  const maxCycle  = Math.max(...allCycles);
+  // Eje X cubre toda la ejecución: del ciclo 1 al ciclo actual del NOC,
+  // no sólo el rango de eventos QoS. Así los puertos con un apply
+  // reciente que sigue activo se ven con su anchura real.
+  const evMax     = Math.max(...events.map(e => e.cycle));
+  const minCycle  = 1;
+  const maxCycle  = Math.max(evMax, currentCycle || evMax);
   const span      = Math.max(maxCycle - minCycle, 1);
 
   let html = '';
@@ -1061,14 +1085,15 @@ function renderQosTimeline(events) {
 
     for (const ev of byPort[port]) {
       const pct = ((ev.cycle - minCycle) / span * 100).toFixed(2);
-      if (ev.event === 'apply') {
-        if (open) {
-          segments += _tlSeg(open, Math.max(0.5, pct - open.pct).toFixed(2), false);
-        }
-        open = { pct: parseFloat(pct), action: ev.action, cycle: ev.cycle };
-      } else if (open) {
+      // Cualquier evento (apply / relax / remove) cierra el segmento activo.
+      if (open) {
         segments += _tlSeg(open, Math.max(0.5, pct - open.pct).toFixed(2), false);
         open = null;
+      }
+      // apply y relax abren un nuevo segmento al nivel correspondiente.
+      // 'remove' (acción None) sólo cierra y deja al puerto sin restricción.
+      if ((ev.event === 'apply' || ev.event === 'relax') && ev.action) {
+        open = { pct: parseFloat(pct), action: ev.action, cycle: ev.cycle };
       }
     }
     if (open) {
@@ -1579,7 +1604,7 @@ async function updateSecurity() {
     // Per-type
     const byType = s.by_type || {};
     document.getElementById('sec-by-type').innerHTML =
-      ['port_scan','dos_volumetric','ddos_fanin'].map(t => {
+      ['port_scan','dos_volumetric'].map(t => {
         const st = byType[t] || {total:0, detected:0, mitigated:0};
         const pct = st.total ? Math.round(100*st.detected/st.total) : 0;
         const [lbl] = SEC_TYPE_LABELS[t];
@@ -1630,7 +1655,7 @@ async function updateSecurity() {
     const tbody = document.getElementById('sec-recent-body');
     const recent = d.recent || [];
     if (recent.length === 0) {
-      tbody.innerHTML = '<tr class="empty"><td colspan="6">Sin ataques registrados aún…</td></tr>';
+      tbody.innerHTML = '<tr class="empty"><td colspan="5">Sin ataques registrados aún…</td></tr>';
     } else {
       tbody.innerHTML = recent.map(r =>
         '<tr>'
@@ -1638,7 +1663,6 @@ async function updateSecurity() {
         + '<td>' + secTypeTag(r.type) + '</td>'
         + '<td><code>' + (r.actor||'?') + '</code> → <code>' + (r.target||'?') + '</code></td>'
         + '<td style="color:var(--muted)">' + (r.duration||'?') + 's</td>'
-        + '<td>' + secSignalsCell(r.detected_by) + '</td>'
         + '<td>' + secStatusBadge(r.status) + '</td>'
         + '</tr>'
       ).join('');
@@ -1678,8 +1702,11 @@ async function updateSecurity() {
 // ═══════════════════════════════════════════════════════════════════════════
 async function updateQosTimeline() {
   try {
-    const data = await fetch('/api/qos/history').then(r => r.json());
-    renderQosTimeline(data);
+    const [data, status] = await Promise.all([
+      fetch('/api/qos/history').then(r => r.json()),
+      fetch('/api/status').then(r => r.json()).catch(() => ({})),
+    ]);
+    renderQosTimeline(data, status && status.ciclo);
   } catch (e) { console.warn('updateQosTimeline:', e); }
 }
 
@@ -1866,6 +1893,32 @@ async function deleteRun(name) {
       return;
     }
     loadRuns();
+  } catch (e) {
+    alert('Error de red: ' + e);
+  }
+}
+
+async function injectAttack(type) {
+  const labels = {
+    'port_scan':      'Port scan',
+    'dos_volumetric': 'DoS volumétrico',
+  };
+  try {
+    const res = await fetch('/api/inject', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ type }),
+    });
+    const data = await res.json();
+    if (!res.ok || !data.ok) {
+      alert('No se pudo inyectar (' + (labels[type] || type) + '): '
+            + (data.error || 'HTTP ' + res.status));
+      return;
+    }
+    // Refresca la vista de ciberseguridad al instante para que aparezca «en curso».
+    updateSecurity();
+    const inj = data.injection || {};
+    console.log('[INJECT]', inj);
   } catch (e) {
     alert('Error de red: ' + e);
   }

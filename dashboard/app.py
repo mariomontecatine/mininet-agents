@@ -670,6 +670,48 @@ def api_live_metrics_switch():
     return jsonify({"labels": labels, "switches": switches})
 
 
+# ── inyección manual de ataques (para demo) ──────────────────────────────────
+
+@app.route("/api/inject", methods=["POST"])
+def api_inject():
+    """Fuerza la inyección de un ataque sintético sin esperar al RNG.
+
+    body: {"type": "port_scan" | "dos_volumetric"}
+    Salta el cooldown y la probabilidad — pensado para demos.
+    """
+    payload = request.get_json(silent=True) or {}
+    attack_type = (payload.get("type") or "").strip()
+    if attack_type not in ("port_scan", "dos_volumetric"):
+        return jsonify({"ok": False,
+                        "error": "type debe ser 'port_scan' o 'dos_volumetric'"}), 400
+
+    # Lazy import + traffic_agent para obtener endpoints
+    try:
+        from agents.anomaly_agent import maybe_inject_anomaly
+        from agents.traffic_agent import get_active_endpoints
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"módulos: {e}"}), 500
+
+    endpoints = get_active_endpoints() or {}
+    if len(endpoints) < 2:
+        return jsonify({"ok": False,
+                        "error": "no se detectan endpoints activos en Mininet"}), 503
+
+    try:
+        rec = maybe_inject_anomaly(endpoints, force_type=attack_type)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+    if not rec:
+        return jsonify({"ok": False,
+                        "error": "la inyección no se ejecutó (¿SSH caída?)"}), 500
+    return jsonify({"ok": True, "injection": {
+        "id":       rec.get("id"),
+        "type":     rec.get("type"),
+        "duration": rec.get("duration_sec"),
+        "ts_start": rec.get("ts_start"),
+    }})
+
+
 # ── runs guardados ────────────────────────────────────────────────────────────
 
 def _run_metadata_path(run: str) -> str:

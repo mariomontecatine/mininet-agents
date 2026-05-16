@@ -37,27 +37,29 @@ _HTML = """\
   <title>Topología de Red — Mininet</title>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-    body { background: #f0f4f8; font-family: 'Segoe UI', system-ui, sans-serif; }
+    body { background: #ffffff; color: #1a1c1f;
+           font-family: 'Inter', 'Segoe UI', system-ui, sans-serif; }
     #cy { width: 100vw; height: 100vh; }
     #fit-btn {
       position: fixed; top: 16px; right: 20px;
-      background: rgba(255,255,255,0.97); border: 1px solid #ddd;
-      border-radius: 8px; padding: 7px 14px; cursor: pointer;
-      font-size: 13px; color: #2c3e50;
-      box-shadow: 0 2px 8px rgba(0,0,0,0.1);
-      transition: background 0.15s;
+      background: #1c1f24; border: 1px solid #2d3035;
+      border-radius: 3px; padding: 6px 12px; cursor: pointer;
+      font-size: 11px; color: #d9d9d9;
+      letter-spacing: .05em; text-transform: uppercase;
+      transition: border-color 0.15s, color 0.15s;
     }
-    #fit-btn:hover { background: #e8edf2; }
+    #fit-btn:hover { border-color: #5794f2; color: #5794f2; }
     #legend {
       position: fixed; bottom: 20px; right: 20px;
-      background: rgba(255,255,255,0.97);
-      border-radius: 10px; padding: 14px 18px;
-      box-shadow: 0 2px 16px rgba(0,0,0,0.15);
-      font-size: 12px; min-width: 120px;
+      background: #1c1f24; border: 1px solid #2d3035;
+      border-radius: 3px; padding: 12px 14px;
+      box-shadow: 0 2px 12px rgba(0,0,0,0.4);
+      font-size: 11px; min-width: 130px; color: #d9d9d9;
     }
-    #legend h3 { font-size: 13px; margin-bottom: 10px; color: #2c3e50; }
-    .li { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; color: #555; }
-    .li img { width: 20px; height: 20px; object-fit: contain; }
+    #legend h3 { font-size: 10px; margin-bottom: 8px; color: #6e7177;
+                 letter-spacing: .08em; text-transform: uppercase; font-weight: 600; }
+    .li { display: flex; align-items: center; gap: 8px; margin-bottom: 5px; color: #d9d9d9; }
+    .li img { width: 18px; height: 18px; object-fit: contain; }
   </style>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.28.1/cytoscape.min.js"
           crossorigin="anonymous"></script>
@@ -89,7 +91,9 @@ _HTML = """\
             'text-halign': 'center',
             'font-size': '12px',
             'font-weight': 'bold',
-            'color': '#2c3e50',
+            'color': '#1a1c1f',
+            'text-outline-color': '#ffffff',
+            'text-outline-width': 2,
             'text-margin-y': '6px',
             /* El nodo es solo el icono: sin fondo de color ni borde */
             'background-image': 'data(icon)',
@@ -126,7 +130,7 @@ _HTML = """\
             'target-text-offset': 12,
             'font-size': '10px',
             'font-family': 'monospace, Courier New',
-            'color': '#2c3e50',
+            'color': '#1a1c1f',
             /* Fondo 100 % opaco: cuando dos etiquetas se acercan,
                una tapa a la otra en lugar de fundirse y confundirse */
             'text-background-color': '#ffffff',
