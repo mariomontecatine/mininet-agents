@@ -915,17 +915,38 @@ function renderQosTimeline(events) {
           + '</div>';
   }
 
-  // Axis
-  const mid = Math.round((minCycle + maxCycle) / 2);
-  html += '<div class="tl-row" style="margin-top:3px">'
-        + '<div class="tl-label" style="font-size:9px;color:var(--dim)">ciclo</div>'
-        + '<div style="flex:1;display:flex;justify-content:space-between;padding:0 2px">'
-        + '<span style="font-size:9px;color:var(--dim)">#' + minCycle + '</span>'
-        + '<span style="font-size:9px;color:var(--dim)">#' + mid + '</span>'
-        + '<span style="font-size:9px;color:var(--dim)">#' + maxCycle + '</span>'
-        + '</div></div>';
+  // Eje X — ticks de ciclo a intervalos uniformes (hasta ~10 marcas)
+  const desiredTicks = Math.min(10, span + 1);
+  const step = Math.max(1, Math.ceil(span / Math.max(1, desiredTicks - 1)));
+  const ticks = [];
+  for (let c = minCycle; c <= maxCycle; c += step) ticks.push(c);
+  if (ticks[ticks.length - 1] !== maxCycle) ticks.push(maxCycle);
 
-  el.innerHTML = html || '<span class="tl-empty">Sin eventos.</span>';
+  let axisHtml = '';
+  // Bandas verticales (grid) detrás de los segmentos
+  let grid = '';
+  for (const c of ticks) {
+    const pct = ((c - minCycle) / span * 100).toFixed(2);
+    grid += '<div style="position:absolute;left:' + pct + '%;top:0;bottom:0;'
+          + 'width:1px;background:rgba(255,255,255,.04);pointer-events:none"></div>';
+  }
+  // Insertamos grid en cada track existente
+  html = html.replace(/<div class="tl-track">/g,
+                      '<div class="tl-track" style="position:relative">' + grid);
+
+  // Fila eje
+  let tickHtml = '';
+  for (const c of ticks) {
+    const pct = ((c - minCycle) / span * 100).toFixed(2);
+    tickHtml += '<span style="position:absolute;left:' + pct + '%;transform:translateX(-50%);'
+              + 'font-size:9px;color:var(--dim);font-variant-numeric:tabular-nums">#' + c + '</span>';
+  }
+  axisHtml = '<div class="tl-row" style="margin-top:3px">'
+           + '<div class="tl-label" style="font-size:9px;color:var(--dim)">ciclo</div>'
+           + '<div style="flex:1;position:relative;height:14px">' + tickHtml + '</div>'
+           + '</div>';
+
+  el.innerHTML = (html + axisHtml) || '<span class="tl-empty">Sin eventos.</span>';
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
