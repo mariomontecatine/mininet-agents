@@ -2,6 +2,7 @@ import os
 import re
 import json
 import time
+import shutil
 import logging
 import threading
 from collections import defaultdict
@@ -10,17 +11,50 @@ from datetime import datetime
 from flask import Flask, jsonify, render_template, request
 
 _IP_RE = re.compile(r"^\d+\.\d+\.\d+\.\d+$")
+_RUN_NAME_RE = re.compile(r"^[A-Za-z0-9 _.\-]{1,80}$")
 
-_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_TMP_DIR = os.path.join(_PROJECT_ROOT, "tmp")
+_PROJECT_ROOT    = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_TMP_DIR         = os.path.join(_PROJECT_ROOT, "tmp")
+_SAVED_RUNS_DIR  = os.path.join(_PROJECT_ROOT, "saved_runs")
+
+# Estado de "qué directorio servir": None → live (tmp/), str → saved_runs/<str>/
+_active_run: str | None = None
+_active_lock = threading.Lock()
+
+# Ficheros que constituyen una ejecución y se copian al guardar.
+_RUN_FILES = (
+    "state.json",
+    "metrics_history.json",
+    "live_metrics.json",
+    "flows.json",
+    "flows_history.json",
+    "qos_history.json",
+    "anomaly_injections.jsonl",
+    "flow_alerts.jsonl",
+    "topology.json",
+    "topologia_interactiva.html",
+    "noc_audit.log",
+    "network_history.json",
+    "port_baseline.json",
+    "host_port_map.json",
+)
 
 app = Flask(__name__)
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
+def _active_dir() -> str:
+    """Devuelve el directorio fuente actual: tmp/ (live) o saved_runs/<run>/."""
+    with _active_lock:
+        run = _active_run
+    if run:
+        return os.path.join(_SAVED_RUNS_DIR, run)
+    return _TMP_DIR
+
+
 def _load_json(filename, default):
-    path = os.path.join(_TMP_DIR, filename)
+    path = os.path.join(_active_dir(), filename)
     if not os.path.exists(path):
         return default
     try:
@@ -28,6 +62,12 @@ def _load_json(filename, default):
             return json.load(f)
     except (json.JSONDecodeError, IOError):
         return default
+
+
+def _safe_run_name(name: str) -> str | None:
+    if not name or not _RUN_NAME_RE.match(name):
+        return None
+    return name.strip()
 
 
 def _pad_series(series, target_len):
@@ -45,7 +85,7 @@ def index():
 
 @app.route("/topology")
 def topology_page():
-    topo_path = os.path.join(_TMP_DIR, "topologia_interactiva.html")
+    topo_path = os.path.join(_active_dir(), "topologia_interactiva.html")
     if not os.path.exists(topo_path):
         return (
             "<body style='background:#0d1117;color:#8b949e;font-family:monospace;"
@@ -62,19 +102,22 @@ def topology_page():
 def api_status():
     state = _load_json("state.json", {})
     log_lines = []
-    log_path = os.path.join(_TMP_DIR, "noc_audit.log")
+    log_path = os.path.join(_active_dir(), "noc_audit.log")
     if os.path.exists(log_path):
         try:
             with open(log_path, encoding="utf-8") as f:
                 log_lines = [l.rstrip() for l in f.readlines()[-60:]]
         except IOError:
             pass
-    return jsonify({**state, "log_lines": log_lines})
+    with _active_lock:
+        run = _active_run
+    return jsonify({**state, "log_lines": log_lines,
+                    "active_run": run, "is_live": run is None})
 
 
 @app.route("/api/topology-ready")
 def api_topology_ready():
-    ready = os.path.exists(os.path.join(_TMP_DIR, "topologia_interactiva.html"))
+    ready = os.path.exists(os.path.join(_active_dir(), "topologia_interactiva.html"))
     return jsonify({"ready": ready})
 
 
@@ -386,10 +429,23 @@ def api_security():
     # agents/anomaly_report al instante.
     from agents import anomaly_report as ar
 
-    injections  = ar._load_jsonl(ar.INJECTION_LOG)
-    qos_events  = ar._load_json(ar.QOS_HISTORY, [])
-    flow_alerts = ar._load_jsonl(ar.FLOW_ALERTS)
-    audit_lines = ar._read_audit_lines()
+    # Reapuntamos a los ficheros del directorio activo (live o saved run).
+    src = _active_dir()
+    injection_log = os.path.join(src, "anomaly_injections.jsonl")
+    qos_history   = os.path.join(src, "qos_history.json")
+    flow_alerts_p = os.path.join(src, "flow_alerts.jsonl")
+    audit_log_p   = os.path.join(src, "noc_audit.log")
+
+    injections  = ar._load_jsonl(injection_log)
+    qos_events  = ar._load_json(qos_history, [])
+    flow_alerts = ar._load_jsonl(flow_alerts_p)
+    audit_lines = []
+    if os.path.exists(audit_log_p):
+        try:
+            with open(audit_log_p, encoding="utf-8", errors="replace") as f:
+                audit_lines = f.readlines()
+        except IOError:
+            pass
 
     now = time.time()
 
@@ -612,6 +668,159 @@ def api_live_metrics_switch():
             sw_data[key] = _pad_series(sw_data[key], n)
 
     return jsonify({"labels": labels, "switches": switches})
+
+
+# ── runs guardados ────────────────────────────────────────────────────────────
+
+def _run_metadata_path(run: str) -> str:
+    return os.path.join(_SAVED_RUNS_DIR, run, "_run.json")
+
+
+def _read_run_meta(run: str) -> dict:
+    path = _run_metadata_path(run)
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, IOError):
+        return {}
+
+
+@app.route("/api/runs", methods=["GET"])
+def api_runs_list():
+    """Lista las ejecuciones guardadas en saved_runs/."""
+    if not os.path.isdir(_SAVED_RUNS_DIR):
+        items = []
+    else:
+        items = []
+        for name in sorted(os.listdir(_SAVED_RUNS_DIR)):
+            run_dir = os.path.join(_SAVED_RUNS_DIR, name)
+            if not os.path.isdir(run_dir):
+                continue
+            meta = _read_run_meta(name)
+            items.append({
+                "name":       name,
+                "saved_at":   meta.get("saved_at"),
+                "ciclo":      meta.get("ciclo"),
+                "last_state": meta.get("last_state"),
+                "last_ts":    meta.get("last_ts"),
+                "ataques":    meta.get("ataques_inyectados"),
+                "notes":      meta.get("notes", ""),
+            })
+        items.sort(key=lambda r: r.get("saved_at") or "", reverse=True)
+    with _active_lock:
+        run = _active_run
+    return jsonify({"runs": items, "active": run})
+
+
+@app.route("/api/runs/save", methods=["POST"])
+def api_runs_save():
+    """Copia el contenido de tmp/ a saved_runs/<name>/."""
+    payload = request.get_json(silent=True) or {}
+    raw_name = (payload.get("name") or "").strip()
+    notes    = (payload.get("notes") or "").strip()
+    if not raw_name:
+        raw_name = "run-" + datetime.now().strftime("%Y%m%d-%H%M%S")
+    name = _safe_run_name(raw_name)
+    if not name:
+        return jsonify({"ok": False,
+                        "error": "Nombre no válido (letras, dígitos, espacios, _-., máx 80)"}), 400
+
+    dst = os.path.join(_SAVED_RUNS_DIR, name)
+    if os.path.exists(dst):
+        return jsonify({"ok": False, "error": "Ya existe una ejecución con ese nombre"}), 409
+
+    os.makedirs(dst, exist_ok=True)
+    copied = []
+    for fname in _RUN_FILES:
+        src = os.path.join(_TMP_DIR, fname)
+        if os.path.exists(src):
+            try:
+                shutil.copy2(src, os.path.join(dst, fname))
+                copied.append(fname)
+            except IOError:
+                pass
+
+    # Metadatos derivados del state.json para el listado.
+    state = {}
+    state_path = os.path.join(_TMP_DIR, "state.json")
+    if os.path.exists(state_path):
+        try:
+            with open(state_path, encoding="utf-8") as f:
+                state = json.load(f)
+        except (json.JSONDecodeError, IOError):
+            pass
+
+    injections = []
+    inj_path = os.path.join(_TMP_DIR, "anomaly_injections.jsonl")
+    if os.path.exists(inj_path):
+        try:
+            with open(inj_path, encoding="utf-8") as f:
+                injections = [l for l in f if l.strip()]
+        except IOError:
+            pass
+
+    meta = {
+        "name":               name,
+        "saved_at":           datetime.now().isoformat(timespec="seconds"),
+        "ciclo":              state.get("ciclo"),
+        "last_state":         state.get("estado_red"),
+        "last_ts":            state.get("timestamp"),
+        "ataques_inyectados": len(injections),
+        "files":              copied,
+        "notes":              notes,
+    }
+    try:
+        with open(_run_metadata_path(name), "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+    except IOError:
+        pass
+
+    return jsonify({"ok": True, "name": name, "files": copied, "meta": meta})
+
+
+@app.route("/api/runs/load", methods=["POST"])
+def api_runs_load():
+    """Cambia el dashboard a modo lectura sobre saved_runs/<name>/."""
+    payload = request.get_json(silent=True) or {}
+    name = _safe_run_name((payload.get("name") or "").strip())
+    if not name:
+        return jsonify({"ok": False, "error": "Nombre inválido"}), 400
+    if not os.path.isdir(os.path.join(_SAVED_RUNS_DIR, name)):
+        return jsonify({"ok": False, "error": "Run no encontrado"}), 404
+    global _active_run
+    with _active_lock:
+        _active_run = name
+    return jsonify({"ok": True, "active": name})
+
+
+@app.route("/api/runs/live", methods=["POST"])
+def api_runs_live():
+    """Vuelve a servir datos en vivo (tmp/)."""
+    global _active_run
+    with _active_lock:
+        _active_run = None
+    return jsonify({"ok": True, "active": None})
+
+
+@app.route("/api/runs/<name>", methods=["DELETE"])
+def api_runs_delete(name):
+    safe = _safe_run_name(name)
+    if not safe:
+        return jsonify({"ok": False, "error": "Nombre inválido"}), 400
+    run_dir = os.path.join(_SAVED_RUNS_DIR, safe)
+    if not os.path.isdir(run_dir):
+        return jsonify({"ok": False, "error": "Run no encontrado"}), 404
+    global _active_run
+    with _active_lock:
+        if _active_run == safe:
+            _active_run = None
+    try:
+        shutil.rmtree(run_dir)
+    except OSError as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+    return jsonify({"ok": True})
 
 
 # ── servidor ──────────────────────────────────────────────────────────────────

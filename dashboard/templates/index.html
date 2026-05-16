@@ -39,6 +39,90 @@
     }
     .topbar-title { font-size: 13px; font-weight: 600; letter-spacing: .02em; }
     .topbar-spacer { flex: 1; }
+    /* ── Hamburguesa + acciones ── */
+    .icon-btn {
+      background: transparent; border: 1px solid var(--border);
+      color: var(--muted); padding: 4px 8px; border-radius: 2px;
+      cursor: pointer; font: inherit; font-size: 11px;
+      letter-spacing: .05em; text-transform: uppercase; transition: .15s;
+    }
+    .icon-btn:hover { border-color: var(--blue); color: var(--blue); }
+    .icon-btn.primary { color: var(--blue); border-color: var(--blue); }
+    .icon-btn.danger:hover  { border-color: var(--red);   color: var(--red); }
+    .hamburger { width: 32px; height: 28px; display:inline-flex;
+                 flex-direction:column; align-items:center; justify-content:center; gap:4px;
+                 padding:0; }
+    .hamburger span { width: 16px; height: 2px; background: currentColor; border-radius: 1px; }
+
+    /* Modo lectura banner */
+    #readonly-banner {
+      display:none; align-items:center; gap:10px;
+      background: rgba(255,152,48,.12); color: var(--orange);
+      border-bottom: 1px solid rgba(255,152,48,.3);
+      padding: 6px 16px; font-size: 11px; letter-spacing: .05em;
+      text-transform: uppercase;
+    }
+    #readonly-banner.on { display: flex; }
+    #readonly-banner .name { color: var(--text); text-transform: none; letter-spacing: 0;
+                             font-weight: 600; }
+
+    /* Drawer / menú lateral */
+    #drawer-overlay {
+      position: fixed; inset: 0; background: rgba(0,0,0,.55); z-index: 200;
+      display: none;
+    }
+    #drawer-overlay.on { display: block; }
+    #drawer {
+      position: fixed; top: 0; right: 0; bottom: 0; width: 380px; max-width: 90vw;
+      background: var(--panel); border-left: 1px solid var(--border);
+      transform: translateX(100%); transition: transform .22s ease;
+      display: flex; flex-direction: column; z-index: 210;
+    }
+    #drawer.on { transform: translateX(0); }
+    #drawer .hd { display: flex; align-items: center; gap: 10px; padding: 12px 14px;
+                  border-bottom: 1px solid var(--border); }
+    #drawer .hd h3 { font-size: 12px; font-weight: 600; color: var(--text);
+                     letter-spacing: .06em; text-transform: uppercase; }
+    #drawer .hd .close { margin-left: auto; }
+    #drawer .body { padding: 12px 14px; overflow-y: auto; flex: 1; }
+    #drawer .actions { display:flex; gap:8px; margin-bottom: 12px; flex-wrap: wrap; }
+    .run-card {
+      border: 1px solid var(--border); border-radius: 3px;
+      padding: 10px 12px; margin-bottom: 8px; background: rgba(255,255,255,.02);
+    }
+    .run-card.active { border-color: var(--blue); background: rgba(87,148,242,.06); }
+    .run-card .name { font-size: 12px; font-weight: 600; color: var(--text);
+                      margin-bottom: 4px; word-break: break-all; }
+    .run-card .meta { font-size: 10px; color: var(--muted); margin-bottom: 8px;
+                      line-height: 1.5; }
+    .run-card .meta b { color: var(--text); font-weight: 600; }
+    .run-card .row-btns { display:flex; gap:6px; flex-wrap: wrap; }
+    .run-empty { color: var(--dim); font-size: 11px; padding: 20px 0; text-align:center;
+                 font-style: italic; }
+
+    /* Modal genérico */
+    .modal-overlay {
+      position: fixed; inset:0; background: rgba(0,0,0,.6); z-index: 220;
+      display: none; align-items:center; justify-content:center;
+    }
+    .modal-overlay.on { display: flex; }
+    .modal {
+      background: var(--panel); border: 1px solid var(--border);
+      border-radius: 3px; padding: 18px 18px 14px; min-width: 360px; max-width: 92vw;
+    }
+    .modal h3 { font-size: 13px; font-weight: 600; color: var(--text);
+                margin-bottom: 12px; letter-spacing: .04em; }
+    .modal label { display:block; font-size: 10px; color: var(--muted);
+                   letter-spacing:.06em; text-transform:uppercase; margin: 8px 0 4px; }
+    .modal input, .modal textarea {
+      width: 100%; background: var(--bg); border: 1px solid var(--border);
+      color: var(--text); padding: 7px 9px; font: inherit; font-size: 12px;
+      border-radius: 2px; outline: none;
+    }
+    .modal input:focus, .modal textarea:focus { border-color: var(--blue); }
+    .modal .hint { font-size: 10px; color: var(--dim); margin-top: 4px; }
+    .modal .btns { display:flex; gap:8px; margin-top: 14px; justify-content: flex-end; }
+    .modal .err { color: var(--red); font-size: 11px; margin-top: 8px; min-height: 14px; }
     .status-pill {
       display: inline-flex; align-items: center; gap: 6px;
       font-size: 11px; font-weight: 600; padding: 3px 10px;
@@ -226,13 +310,58 @@
 <div class="topbar">
   <span class="topbar-title">NOC — Mininet AIOps</span>
   <span class="topbar-spacer"></span>
+  <button class="icon-btn primary" id="btn-save-run" onclick="openSaveModal()" title="Guardar la ejecución actual">💾 Guardar</button>
   <span id="badge-estado" class="status-pill s-none">
     <span class="dot"></span>
     <span id="estado-text">Sin datos</span>
   </span>
+  <button class="icon-btn hamburger" onclick="openDrawer()" title="Simulaciones guardadas" aria-label="Menú">
+    <span></span><span></span><span></span>
+  </button>
+</div>
+
+<div id="readonly-banner">
+  <span>⏵ Modo lectura · viendo</span>
+  <span class="name" id="readonly-name">—</span>
+  <button class="icon-btn" style="margin-left:auto" onclick="returnToLive()">↺ Volver a live</button>
 </div>
 
 <div id="heatmap-tooltip"></div>
+
+<!-- Drawer lateral con simulaciones guardadas -->
+<div id="drawer-overlay" onclick="closeDrawer()"></div>
+<aside id="drawer" aria-hidden="true">
+  <div class="hd">
+    <h3>Simulaciones guardadas</h3>
+    <button class="icon-btn close" onclick="closeDrawer()">✕</button>
+  </div>
+  <div class="body">
+    <div class="actions">
+      <button class="icon-btn primary" onclick="openSaveModal()">💾 Guardar actual</button>
+      <button class="icon-btn" onclick="loadRuns()">↻ Recargar</button>
+    </div>
+    <div id="runs-list">
+      <div class="run-empty">Cargando…</div>
+    </div>
+  </div>
+</aside>
+
+<!-- Modal: guardar ejecución -->
+<div class="modal-overlay" id="save-modal">
+  <div class="modal" role="dialog" aria-label="Guardar ejecución">
+    <h3>Guardar ejecución</h3>
+    <label for="save-name">Nombre</label>
+    <input id="save-name" type="text" placeholder="p.ej. demo-tfg-dos" maxlength="80" autocomplete="off">
+    <div class="hint">Letras, dígitos, espacios, guiones (- _ .) — máx. 80 caracteres.</div>
+    <label for="save-notes">Notas (opcional)</label>
+    <textarea id="save-notes" rows="3" placeholder="Detalles para la reunión: escenario, ataques inyectados, observaciones…"></textarea>
+    <div class="err" id="save-err"></div>
+    <div class="btns">
+      <button class="icon-btn" onclick="closeSaveModal()">Cancelar</button>
+      <button class="icon-btn primary" id="save-confirm" onclick="confirmSaveRun()">Guardar</button>
+    </div>
+  </div>
+</div>
 
 <div class="dash">
 
@@ -779,6 +908,7 @@ function rebuildTrafficChart() {
     const prev = inner.style.width;
     inner.style.width = needed + 'px';
     if (prev !== inner.style.width) {
+      // Auto-scroll al borde derecho cuando se amplía (ver lo más reciente)
       requestAnimationFrame(() => { wrapper.scrollLeft = wrapper.scrollWidth; });
       trafficChart.resize();
     }
@@ -1026,6 +1156,10 @@ async function updateStatus() {
           + '<td style="color:var(--muted)">' + reglas[p].ciclo + '</td></tr>').join('');
 
     renderLog(d.log_lines || []);
+
+    if ((d.active_run || null) !== _activeRun) {
+      applyActiveRun(d.active_run || null);
+    }
   } catch (e) { console.warn('updateStatus:', e); }
 }
 
@@ -1570,6 +1704,178 @@ async function pollTopology() {
 window.addEventListener('message', function(e) {
   if (e.data && typeof e.data.noc_scroll === 'number')
     window.scrollBy({ top: e.data.noc_scroll, behavior: 'auto' });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SAVED RUNS · drawer + save modal
+// ═══════════════════════════════════════════════════════════════════════════
+let _activeRun = null;   // null = live, str = saved run en lectura
+
+function applyActiveRun(name) {
+  _activeRun = name || null;
+  const banner = document.getElementById('readonly-banner');
+  const nameEl = document.getElementById('readonly-name');
+  if (_activeRun) {
+    banner.classList.add('on');
+    nameEl.textContent = _activeRun;
+    document.getElementById('btn-save-run').style.display = 'none';
+  } else {
+    banner.classList.remove('on');
+    document.getElementById('btn-save-run').style.display = '';
+  }
+}
+
+function openDrawer() {
+  document.getElementById('drawer').classList.add('on');
+  document.getElementById('drawer-overlay').classList.add('on');
+  loadRuns();
+}
+function closeDrawer() {
+  document.getElementById('drawer').classList.remove('on');
+  document.getElementById('drawer-overlay').classList.remove('on');
+}
+function openSaveModal() {
+  const m = document.getElementById('save-modal');
+  m.classList.add('on');
+  const def = 'run-' + new Date().toISOString().replace(/[:T]/g,'-').slice(0,16);
+  const inp = document.getElementById('save-name');
+  inp.value = def;
+  document.getElementById('save-notes').value = '';
+  document.getElementById('save-err').textContent = '';
+  setTimeout(() => { inp.focus(); inp.select(); }, 30);
+}
+function closeSaveModal() {
+  document.getElementById('save-modal').classList.remove('on');
+}
+async function confirmSaveRun() {
+  const btn   = document.getElementById('save-confirm');
+  const errEl = document.getElementById('save-err');
+  const name  = document.getElementById('save-name').value.trim();
+  const notes = document.getElementById('save-notes').value.trim();
+  errEl.textContent = '';
+  btn.disabled = true;
+  try {
+    const res = await fetch('/api/runs/save', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ name, notes }),
+    });
+    const data = await res.json();
+    if (!res.ok || !data.ok) {
+      errEl.textContent = data.error || ('HTTP ' + res.status);
+      return;
+    }
+    closeSaveModal();
+    openDrawer();
+  } catch (e) {
+    errEl.textContent = 'Error de red: ' + e;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function fmtTs(s) {
+  if (!s) return '—';
+  return s.replace('T', ' ');
+}
+
+async function loadRuns() {
+  const list = document.getElementById('runs-list');
+  list.innerHTML = '<div class="run-empty">Cargando…</div>';
+  try {
+    const data = await fetch('/api/runs').then(r => r.json());
+    applyActiveRun(data.active);
+    const runs = data.runs || [];
+    if (runs.length === 0) {
+      list.innerHTML = '<div class="run-empty">No hay simulaciones guardadas todavía.<br>Pulsa «Guardar actual» para crear la primera.</div>';
+      return;
+    }
+    list.innerHTML = runs.map(r => {
+      const isActive = (data.active === r.name);
+      return ''
+        + '<div class="run-card' + (isActive ? ' active' : '') + '">'
+        +   '<div class="name">' + escHtml(r.name) + (isActive ? ' <span style="color:var(--blue);font-size:10px">(activa)</span>' : '') + '</div>'
+        +   '<div class="meta">'
+        +     '<b>Guardado:</b> ' + escHtml(fmtTs(r.saved_at)) + '<br>'
+        +     '<b>Ciclo:</b> ' + (r.ciclo ?? '—')
+        +     ' · <b>Estado:</b> ' + escHtml(r.last_state || '—')
+        +     ' · <b>Ataques:</b> ' + (r.ataques ?? 0)
+        +     (r.notes ? '<br><b>Notas:</b> ' + escHtml(r.notes) : '')
+        +   '</div>'
+        +   '<div class="row-btns">'
+        +     (isActive
+              ? '<button class="icon-btn" onclick="returnToLive()">↺ Volver a live</button>'
+              : '<button class="icon-btn primary" onclick="loadRun(\'' + r.name.replace(/'/g, "\\'") + '\')">▶ Cargar</button>')
+        +     '<button class="icon-btn danger" onclick="deleteRun(\'' + r.name.replace(/'/g, "\\'") + '\')">✕ Borrar</button>'
+        +   '</div>'
+        + '</div>';
+    }).join('');
+  } catch (e) {
+    list.innerHTML = '<div class="run-empty" style="color:var(--red)">Error: ' + escHtml(String(e)) + '</div>';
+  }
+}
+
+async function loadRun(name) {
+  try {
+    const res = await fetch('/api/runs/load', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ name }),
+    });
+    const data = await res.json();
+    if (!res.ok || !data.ok) {
+      alert(data.error || ('No se pudo cargar (HTTP ' + res.status + ')'));
+      return;
+    }
+    applyActiveRun(data.active);
+    closeDrawer();
+    // Refresca topología e info inmediatamente
+    _topoLoaded = false;
+    document.getElementById('topo-placeholder').style.display = 'flex';
+    document.getElementById('topology-frame').style.display = 'none';
+    document.getElementById('topology-frame').src = '';
+    updateStatus(); updateLiveMetrics(); updateMetrics();
+    updateFlows(); updateSecurity(); updateQosTimeline(); pollTopology();
+  } catch (e) {
+    alert('Error de red: ' + e);
+  }
+}
+
+async function returnToLive() {
+  try {
+    const res = await fetch('/api/runs/live', { method: 'POST' });
+    const data = await res.json();
+    if (!res.ok || !data.ok) return;
+    applyActiveRun(null);
+    _topoLoaded = false;
+    document.getElementById('topo-placeholder').style.display = 'flex';
+    document.getElementById('topology-frame').style.display = 'none';
+    document.getElementById('topology-frame').src = '';
+    updateStatus(); updateLiveMetrics(); updateMetrics();
+    updateFlows(); updateSecurity(); updateQosTimeline(); pollTopology();
+  } catch (_) {}
+}
+
+async function deleteRun(name) {
+  if (!confirm('¿Borrar la simulación "' + name + '"? Esta acción no se puede deshacer.')) return;
+  try {
+    const res = await fetch('/api/runs/' + encodeURIComponent(name), { method: 'DELETE' });
+    const data = await res.json();
+    if (!res.ok || !data.ok) {
+      alert(data.error || 'No se pudo borrar');
+      return;
+    }
+    loadRuns();
+  } catch (e) {
+    alert('Error de red: ' + e);
+  }
+}
+
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') {
+    if (document.getElementById('save-modal').classList.contains('on')) closeSaveModal();
+    else if (document.getElementById('drawer').classList.contains('on')) closeDrawer();
+  }
 });
 
 // ═══════════════════════════════════════════════════════════════════════════

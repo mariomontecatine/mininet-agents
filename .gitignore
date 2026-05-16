@@ -8,3 +8,5 @@ __pycache__/
 
 tmp/*
 !tmp/.gitkeep
+
+saved_runs/
