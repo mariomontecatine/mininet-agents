@@ -437,6 +437,7 @@ def run_aiops_pipeline():
 
     try:
         while True:
+            cycle_t0 = time.monotonic()
             print_header(f"CICLO DE SUPERVISIÓN #{ciclo}")
             registrar_log(f"--- Iniciando Ciclo #{ciclo} (intervalo={intervalo_actual}s) ---")
 
@@ -573,13 +574,24 @@ def run_aiops_pipeline():
                     )
             except Exception as _e:
                 print(f"[WARN] anomaly_agent falló: {_e}")
+                registrar_log(f"WARN anomaly_agent falló: {_e}")
 
+            # Sleep adaptativo: `intervalo_actual` es el período objetivo del ciclo
+            # entero (telemetría + LLM + QoS). Sólo dormimos lo que falte para
+            # cumplirlo. Si el LLM se pasó, seguimos sin pausa adicional.
+            elapsed   = time.monotonic() - cycle_t0
+            remaining = max(0.0, intervalo_actual - elapsed)
             print(
                 f"\n[NOC] Ciclo #{ciclo} completado [{estado_red}]. "
-                f"Próximo análisis en {intervalo_actual}s..."
+                f"Trabajo={elapsed:.1f}s · durmiendo {remaining:.1f}s "
+                f"(objetivo {intervalo_actual}s)"
             )
-            registrar_log(f"Ciclo #{ciclo} finalizado — estado={estado_red}, next={intervalo_actual}s")
-            time.sleep(intervalo_actual)
+            registrar_log(
+                f"Ciclo #{ciclo} finalizado — estado={estado_red}, "
+                f"work={elapsed:.1f}s, sleep={remaining:.1f}s, target={intervalo_actual}s"
+            )
+            if remaining > 0:
+                time.sleep(remaining)
             ciclo += 1
 
     except KeyboardInterrupt:

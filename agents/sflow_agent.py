@@ -204,10 +204,13 @@ def _list_bridges(ssh):
 # ── API pública ──────────────────────────────────────────────────────────────
 
 def configure_sflow_on_bridges(ssh, collector_ip="127.0.0.1", port=6343,
-                               sampling=64, polling=5):
+                               sampling=16, polling=5):
     """Aplica sFlow a todos los bridges OVS activos.
 
-    sampling=64 → 1 de cada 64 paquetes (compromiso CPU/precisión).
+    sampling=16 → 1 de cada 16 paquetes. Más fino que 1/64 para que la
+    heurística de port scan vea suficientes destinos distintos en
+    escaneos cortos (12 destinos ≈ 75 % de probabilidad de captura).
+    En Mininet el coste extra de CPU/IO es despreciable.
     polling=5   → contadores cada 5 s.
     """
     bridges = _list_bridges(ssh)
