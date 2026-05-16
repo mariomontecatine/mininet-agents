@@ -211,7 +211,7 @@ def _live_collector():
                 "ts":    datetime.now().isoformat(timespec="seconds"),
                 "ports": deltas,
             })
-            live_data = live_data[-60:]
+            live_data = live_data[-2000:]
             with open(live_file, "w", encoding="utf-8") as f:
                 json.dump(live_data, f, ensure_ascii=False)
 

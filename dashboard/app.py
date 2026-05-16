@@ -540,8 +540,16 @@ def api_qos_history():
 
 @app.route("/api/live-metrics")
 def api_live_metrics():
-    """Serie temporal por puerto desde live_metrics.json (muestras cada ~5s)."""
-    history = _load_json("live_metrics.json", [])[-60:]
+    """Serie temporal por puerto desde live_metrics.json (muestras cada ~5s).
+
+    Query param `limit` (default 60, máx 2000): nº de muestras devueltas.
+    """
+    try:
+        limit = int(request.args.get("limit", 60))
+    except (TypeError, ValueError):
+        limit = 60
+    limit = max(10, min(limit, 2000))
+    history = _load_json("live_metrics.json", [])[-limit:]
     if not history:
         return jsonify({"labels": [], "ports": {}})
 
@@ -568,8 +576,16 @@ def api_live_metrics():
 
 @app.route("/api/live-metrics/switch")
 def api_live_metrics_switch():
-    """Serie temporal agregada por switch desde live_metrics.json (muestras cada ~5s)."""
-    history = _load_json("live_metrics.json", [])[-60:]
+    """Serie temporal agregada por switch desde live_metrics.json (muestras cada ~5s).
+
+    Query param `limit` (default 60, máx 2000): nº de muestras devueltas.
+    """
+    try:
+        limit = int(request.args.get("limit", 60))
+    except (TypeError, ValueError):
+        limit = 60
+    limit = max(10, min(limit, 2000))
+    history = _load_json("live_metrics.json", [])[-limit:]
     if not history:
         return jsonify({"labels": [], "switches": {}})
 

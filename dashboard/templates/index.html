@@ -101,7 +101,11 @@
 
     /* ── Chart containers ── */
     .chart-wrap { position: relative; }
-    #chart-traffic-wrap { height: 220px; }
+    #chart-traffic-wrap { height: 220px; overflow-x: auto; overflow-y: hidden; }
+    #chart-traffic-wrap::-webkit-scrollbar { height: 6px; }
+    #chart-traffic-wrap::-webkit-scrollbar-track { background: transparent; }
+    #chart-traffic-wrap::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+    #chart-traffic-inner { height: 100%; min-width: 100%; position: relative; }
     #chart-drops-wrap   { height: 220px; }
     #chart-util-wrap    { height: 160px; }
 
@@ -507,11 +511,14 @@
           <button class="btn-tog active" id="btn-view-sw" onclick="setView('switch')">Switch</button>
           <button class="btn-tog"        id="btn-view-pt" onclick="setView('port')">Puerto</button>
           <button class="btn-tog active" id="btn-scale"   onclick="toggleScale()">Log</button>
+          <button class="btn-tog active" id="btn-window"  onclick="toggleTrafficWindow()" title="Ventana viva (60 muestras) vs histórico completo">Live</button>
         </div>
       </div>
       <div class="panel-body">
         <div class="chart-wrap" id="chart-traffic-wrap">
-          <canvas id="chart-traffic"></canvas>
+          <div id="chart-traffic-inner">
+            <canvas id="chart-traffic"></canvas>
+          </div>
         </div>
       </div>
     </div>
@@ -638,6 +645,8 @@ let _portMetrics   = null;
 let _viewMode      = 'switch';
 let _scaleLog      = true;
 let _heatData      = null;
+let _trafficWindow = 'live';   // 'live' (60 muestras) | 'full' (hasta 2000)
+const PX_PER_SAMPLE = 18;      // ancho mínimo por muestra cuando hay scroll
 
 // ═══════════════════════════════════════════════════════════════════════════
 // STATUS BADGE
@@ -741,12 +750,39 @@ function toggleScale() {
   trafficChart.options.scales.y.min  = _scaleLog ? 1 : 0;
   trafficChart.update('none');
 }
+function toggleTrafficWindow() {
+  _trafficWindow = (_trafficWindow === 'live') ? 'full' : 'live';
+  const btn = document.getElementById('btn-window');
+  btn.textContent = _trafficWindow === 'live' ? 'Live' : 'Full';
+  btn.classList.toggle('active', _trafficWindow === 'live');
+  // Fuerza fetch inmediato para refrescar la serie con el nuevo límite
+  updateLiveMetrics();
+}
 
 function rebuildTrafficChart() {
   const data = _viewMode === 'switch' ? _switchMetrics : _portMetrics;
   if (!data || !data.labels) return;
   const entries = _viewMode === 'switch' ? data.switches : data.ports;
   if (!entries) return;
+
+  // Ancho dinámico del canvas: si modo Full y hay más de 60 muestras,
+  // ampliamos el canvas y dejamos que el wrapper haga scroll horizontal.
+  const inner   = document.getElementById('chart-traffic-inner');
+  const wrapper = document.getElementById('chart-traffic-wrap');
+  if (inner && wrapper) {
+    const baseW = wrapper.clientWidth || 0;
+    const n     = data.labels.length;
+    let needed  = baseW;
+    if (_trafficWindow === 'full' && n > 60) {
+      needed = Math.max(baseW, n * PX_PER_SAMPLE);
+    }
+    const prev = inner.style.width;
+    inner.style.width = needed + 'px';
+    if (prev !== inner.style.width) {
+      requestAnimationFrame(() => { wrapper.scrollLeft = wrapper.scrollWidth; });
+      trafficChart.resize();
+    }
+  }
 
   const datasets = [];
   let ci = 0;
@@ -998,9 +1034,11 @@ async function updateStatus() {
 // ═══════════════════════════════════════════════════════════════════════════
 async function updateLiveMetrics() {
   try {
+    const limit = _trafficWindow === 'live' ? 60 : 2000;
+    const qs    = '?limit=' + limit;
     const [swData, ptData] = await Promise.all([
-      fetch('/api/live-metrics/switch').then(r => r.json()),
-      fetch('/api/live-metrics').then(r => r.json()),
+      fetch('/api/live-metrics/switch' + qs).then(r => r.json()),
+      fetch('/api/live-metrics'        + qs).then(r => r.json()),
     ]);
     _switchMetrics = swData;
     _portMetrics   = ptData;
