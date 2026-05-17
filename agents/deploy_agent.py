@@ -20,6 +20,16 @@ from agents.topology import run_visualizer
 VM_PASSWORD = "mininet"
 MODEL_NAME = config.MODEL_DEPLOY
 
+# Timeout en segundos por llamada al LLM del deploy.
+# Si el modelo se atasca, cortamos y reintentamos en vez de colgar el supervisor.
+_DEPLOY_LLM_TIMEOUT = getattr(config, "DEPLOY_LLM_TIMEOUT", 90)
+
+# Cliente Ollama con timeout (mismo patrón que resolver_agent).
+_ollama_deploy_client = ollama.Client(
+    host="http://localhost:11434",
+    timeout=_DEPLOY_LLM_TIMEOUT,
+)
+
 
 def generate_network_intent(user_prompt):
     """Convierte lenguaje natural en un JSON estructurado (Arquitectura Unificada)."""
@@ -102,7 +112,17 @@ def generate_network_intent(user_prompt):
 
     for intento in range(1, 4):
         try:
-            response = ollama.chat(model=MODEL_NAME, messages=messages, tools=tools, options={"temperature": 0})
+            print(f"[IA] Intento {intento}/3 con {MODEL_NAME} "
+                  f"(timeout={_DEPLOY_LLM_TIMEOUT}s, mensajes={len(messages)})...")
+            t0 = time.time()
+            response = _ollama_deploy_client.chat(
+                model=MODEL_NAME,
+                messages=messages,
+                tools=tools,
+                options={"temperature": 0},
+            )
+            dt = time.time() - t0
+            print(f"[IA] Respuesta recibida en {dt:.1f}s.")
 
             if response.get("message", {}).get("tool_calls"):
                 args = response["message"]["tool_calls"][0]["function"]["arguments"]
@@ -155,15 +175,33 @@ def generate_network_intent(user_prompt):
 
                 return args
 
-            print(f"[WARN] Intento {intento}: la IA no invocó la herramienta.")
-            # Si ya tenemos un intento parcial, no abandonar
-            if best_args is None:
-                return None
-            break
+            print(f"[WARN] Intento {intento}: la IA no invocó la herramienta. Reintentando con instrucción explícita...")
+            # Reintentamos pidiendo expresamente la llamada a la herramienta —
+            # los modelos pequeños a veces responden en texto plano y abandonar
+            # tras el primer intento perdía el resto de la cuota de reintentos.
+            messages.append(response.get("message") or {"role": "assistant", "content": ""})
+            messages.append({
+                "role": "user",
+                "content": (
+                    "DEBES llamar a la herramienta `build_network_json` con la "
+                    "topología en formato estructurado. NO respondas en texto plano. "
+                    "Invoca la herramienta ahora con todos los campos: tipo='custom', "
+                    "routers, switches, servers, hosts y links."
+                ),
+            })
+            continue
 
         except Exception as e:
-            print(f"[ERROR CRÍTICO] Ollama falló: {e}")
-            return None
+            # Timeout o error de red: NO abandonamos al primer fallo, reintentamos
+            # con contexto fresco — un Ctrl+C explícito sigue rompiendo el bucle.
+            print(f"[WARN] Intento {intento} falló ({type(e).__name__}: {e}). Reintentando con contexto reducido...")
+            # Reset de mensajes: descartamos el historial acumulado (que crece y
+            # ralentiza cada llamada) y reintentamos con solo system + user.
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ]
+            continue
 
     # Último recurso: inferir enlaces faltantes desde el texto del prompt
     if best_args is not None:
@@ -443,26 +481,92 @@ def build_python_script(intent_json):
                     hosts.append(nodo)
 
         # 1. MOTOR IPAM
+        # Cada switch s_i define una subred 192.168.(i+1).0/24.
+        # Los routers conectados a un mismo switch reciben IPs únicas:
+        # el primero se queda con .254 (gateway de los hosts), el siguiente
+        # .253, .252, ... — esto evita colisiones en topologías con dos
+        # routers compartiendo subred (p.ej. zona DMZ con r1↔s2↔r2).
         host_ips = {}
         host_gws = {}
-        router_ips = {}
+        router_ips = {}                # router → [(switch, ip), ...]
+        router_ip_per_switch = {}      # (router, switch) → ip — para el BFS de rutas
+        switch_idx = {sw: i for i, sw in enumerate(switches)}
 
         for i, sw in enumerate(switches):
             prefix = f"192.168.{i+1}"
             host_counter = 1
-            router_gw = f"{prefix}.254"
+
+            # PRIMERA PASADA: enumerar routers de esta subred y asignarles
+            # IPs distintas. El orden viene de la lista `links` (estable).
+            sw_routers = []
             for link in links:
                 n1, n2 = link[0], link[1]
                 target = n2 if n1 == sw else (n1 if n2 == sw else None)
-                if target:
-                    if target.startswith("h") or target.startswith("srv"):
-                        host_ips[target] = f"{prefix}.{host_counter}"
-                        host_gws[target] = router_gw
-                        host_counter += 1
-                    elif target.startswith("r"):
-                        if target not in router_ips:
-                            router_ips[target] = []
-                        router_ips[target].append((sw, router_gw))
+                if target and target.startswith("r") and target not in sw_routers:
+                    sw_routers.append(target)
+            for j, r in enumerate(sw_routers):
+                ip = f"{prefix}.{254 - j}"
+                router_ip_per_switch[(r, sw)] = ip
+                router_ips.setdefault(r, []).append((sw, ip))
+
+            # Gateway por defecto de los hosts/servers de esta subred:
+            # el PRIMER router (.254). Si no hay router, no hay gateway.
+            primary_gw = f"{prefix}.254" if sw_routers else None
+
+            # SEGUNDA PASADA: asignar IPs a hosts y servidores.
+            for link in links:
+                n1, n2 = link[0], link[1]
+                target = n2 if n1 == sw else (n1 if n2 == sw else None)
+                if target and (target.startswith("h") or target.startswith("srv")):
+                    host_ips[target] = f"{prefix}.{host_counter}"
+                    if primary_gw:
+                        host_gws[target] = primary_gw
+                    host_counter += 1
+
+        # 1.b RUTAS ESTÁTICAS — solo necesarias cuando hay ≥2 routers
+        # interconectados (en single-router todas las subredes son vecinas
+        # directas y la ruta por defecto basta).
+        static_routes = []   # lista de tuplas (router, dest_subnet, via_ip)
+        if len(routers) >= 2:
+            # Grafo de routing: routers y switches como nodos, links como aristas.
+            adj = {n: [] for n in set(routers) | set(switches)}
+            for a, b in links:
+                if a in adj and b in adj:
+                    adj[a].append(b)
+                    adj[b].append(a)
+
+            for r in routers:
+                # BFS desde r — `prev[n]` = nodo anterior en el camino más corto.
+                prev = {r: None}
+                queue = [r]
+                while queue:
+                    cur = queue.pop(0)
+                    for nb in adj.get(cur, []):
+                        if nb not in prev:
+                            prev[nb] = cur
+                            queue.append(nb)
+
+                direct_switches = {n for n in adj[r] if n in switch_idx}
+                for s in switches:
+                    if s == r or s not in prev or s in direct_switches:
+                        continue
+                    # Reconstruir camino r → ... → s
+                    path = []
+                    cur = s
+                    while cur is not None:
+                        path.append(cur)
+                        cur = prev[cur]
+                    path.reverse()
+                    # path[0] = r ; path[1] = switch compartido ; path[2] = next-hop router
+                    if len(path) < 3 or path[2] not in routers:
+                        continue
+                    shared_sw = path[1]
+                    next_hop  = path[2]
+                    via_ip = router_ip_per_switch.get((next_hop, shared_sw))
+                    if not via_ip:
+                        continue
+                    dest_subnet = f"192.168.{switch_idx[s] + 1}.0/24"
+                    static_routes.append((r, dest_subnet, via_ip))
 
         # 2. CLASE LINUXROUTER
         script.extend(
@@ -526,6 +630,15 @@ def build_python_script(intent_json):
                     script.append(
                         f"    net.get('{r}').setIP('{ip}/24', intf=net.get('{r}').connectionsTo(net.get('{sw}'))[0][0])"
                     )
+
+        # 5.b RUTAS ESTÁTICAS — inter-router (solo si hay ≥2 routers).
+        # Cada router aprende a alcanzar subredes "lejanas" vía el router
+        # contiguo. Sin esto, las topologías con r1↔s↔r2 quedan partidas a L3.
+        if static_routes:
+            for r, subnet, via in static_routes:
+                script.append(
+                    f"    net.get('{r}').cmd('ip route add {subnet} via {via}')"
+                )
 
         if servers:
             for srv in servers:
