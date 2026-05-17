@@ -5,6 +5,7 @@ import time
 import json
 import logging
 import threading
+from collections import deque
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
 
@@ -33,7 +34,7 @@ from agents.topology import (
     dump_host_interfaces, persist_topology_json,
 )
 from agents.monitor_agent import collect_telemetry, generate_network_report
-from agents.resolver_agent import analyze_and_decide, resolve_multiple, run_relaxation
+from agents.resolver_agent import analyze_and_decide, fast_decide, resolve_multiple, run_desescalado
 from agents.sflow_agent import (
     configure_sflow_on_bridges,
     remove_sflow_from_bridges,
@@ -41,8 +42,8 @@ from agents.sflow_agent import (
     stop_sflow_daemon,
     fetch_flows,
 )
-from agents.anomaly_agent import maybe_inject_anomaly, build_host_port_map
-from agents.anomaly_report import generate_report as generate_anomaly_report
+from agents.attack_agent import maybe_inject_anomaly, build_host_port_map
+from agents.attack_report import generate_report as generate_anomaly_report
 
 # -------------------------------------------------------
 # Auditoría con rotación automática
@@ -52,6 +53,19 @@ _audit_logger: logging.Logger | None = None
 # Lock SSH: solo para secciones que envían comandos tmux.
 # Se libera durante las llamadas LLM para que el colector live pueda actuar.
 _live_lock = threading.Lock()
+
+# Estado NOC compartido — leído/escrito por _flow_watcher y el bucle principal.
+# _live_lock protege los accesos que implican resolve_multiple (SSH).
+_reglas_activas: dict = {}   # port → {"action": ..., "ciclo": ...}
+_ciclos_limpios: dict = {}   # port → int
+_current_ciclo:  int  = 1    # ciclo actual, actualizado por el bucle principal
+
+# Puertos que acaban de salir de mitigación: el watcher exige más confirmaciones
+# antes de re-actuar (anti-flap). Mapping port → ciclo_de_desescalado_completo.
+_recently_relaxed: dict = {}
+
+# Cola de alertas de flujo (solo para enriquecer la telemetría del LLM).
+_pending_flow_alerts: deque = deque(maxlen=200)
 
 
 def setup_audit_log():
@@ -125,7 +139,7 @@ def _save_topology_cache(user_request, intent, code):
 # -------------------------------------------------------
 
 def _write_qos_event(port, action, event_type, ciclo):
-    """Persiste un evento QoS (apply/relax/remove) en qos_history.json para el dashboard."""
+    """Persiste un evento QoS (apply/desescalado/remove) en qos_history.json para el dashboard."""
     qos_path = os.path.join(TMP_DIR, "qos_history.json")
     history = []
     if os.path.exists(qos_path):
@@ -277,6 +291,136 @@ def _sflow_collector():
             pass
 
 
+def _flow_watcher():
+    """
+    Hilo background: evalúa detect_flow_anomalies sobre el snapshot sFlow cada
+    5 s y actúa DE INMEDIATO con fast_decide + resolve_multiple sin esperar a
+    que el LLM termine (evita que ataques cortos escapen durante ciclos largos).
+
+    También alimenta _pending_flow_alerts para que el LLM reciba contexto de
+    los flujos anómalos en el próximo ciclo.
+
+    Dedup 60 s por (port, type): una alerta solo se reinyecta si el puerto ya
+    no está en _reglas_activas y han pasado >60 s desde el último disparo.
+    """
+    from agents.monitor_agent import detect_flow_anomalies, _format_anomaly_lines, _record_flow_alert
+    from agents.resolver_agent import fast_decide, resolve_multiple
+
+    flows_file     = os.path.join(TMP_DIR, "flows.json")
+    host_port_file = os.path.join(TMP_DIR, "host_port_map.json")
+    last_ts: str   = ""
+    seen: dict     = {}   # "port:type" → epoch del último disparo
+    pending: dict  = {}   # "port:type" → snapshots consecutivos vistos (confirmación N=2)
+    windows_seen   = 0    # warmup: no actuar en los primeros 8 snapshots (~40s)
+
+    while True:
+        time.sleep(5)
+        try:
+            if not os.path.exists(flows_file):
+                continue
+            with open(flows_file, encoding="utf-8") as f:
+                snapshot = json.load(f)
+            ts = snapshot.get("ts", "")
+            if not ts or ts == last_ts:
+                continue
+            last_ts = ts
+            windows_seen += 1
+            flows = snapshot.get("flows")
+            if not flows:
+                continue
+
+            host_port = {}
+            if os.path.exists(host_port_file):
+                try:
+                    with open(host_port_file, encoding="utf-8") as f:
+                        host_port = json.load(f)
+                except Exception:
+                    pass
+
+            alerts = detect_flow_anomalies(flows, host_port)
+
+            # Actualizar contador de confirmación (N=2 snapshots consecutivos
+            # antes de actuar — filtra ráfagas de 5s del bulk legítimo).
+            current_keys = {f"{a.get('port','?')}:{a['type']}" for a in alerts}
+            for k in list(pending.keys()):
+                if k not in current_keys:
+                    del pending[k]
+            for k in current_keys:
+                pending[k] = pending.get(k, 0) + 1
+
+            if windows_seen <= 8:
+                # Warmup ~40s: cubre el arranque simultáneo del bulk iperf (35s).
+                # NO grabamos las alertas — son falsos positivos legítimos del
+                # tráfico que arranca a la vez y no deben contar en la métrica
+                # de FP del monitor.
+                continue
+            now = time.time()
+
+            # Umbral de severidad alta: una alerta así de grande es por
+            # construcción un ataque, no ruido — saltamos la confirmación N=2.
+            HIGH_SURGE   = config.SURGE_BYTES_THRESHOLD  * 1.5
+            HIGH_FANIN_B = config.FAN_IN_BYTES_THRESHOLD * 1.5
+
+            def _required_n(alert):
+                """Confirmaciones necesarias antes de actuar para esta alerta."""
+                port    = alert.get("port", "?")
+                a_type  = alert.get("type")
+                # Cooling: si el puerto se desescaló hace ≤2 ciclos, exigir N=3
+                # para evitar oscilación POLICING→nada→POLICING.
+                relaxed_at = _recently_relaxed.get(port)
+                if relaxed_at is not None and (_current_ciclo - relaxed_at) <= 2:
+                    return 3
+                # N=1 para severidad muy alta (DoS o DDoS evidentes)
+                if a_type == "dos_volumetric" and alert.get("bytes", 0) >= HIGH_SURGE:
+                    return 1
+                if a_type == "ddos" and alert.get("bytes", 0) >= HIGH_FANIN_B:
+                    return 1
+                # Resto: N=2 (confirmación 2 snapshots seguidos)
+                return 2
+
+            fresh = [
+                a for a in alerts
+                if pending.get(f"{a.get('port','?')}:{a['type']}", 0) >= _required_n(a)
+                and now - seen.get(f"{a.get('port','?')}:{a['type']}", 0) >= 60
+            ]
+            for a in fresh:
+                seen[f"{a.get('port','?')}:{a['type']}"] = now
+                _record_flow_alert(a)   # persiste en flow_alerts.jsonl
+
+            lines = _format_anomaly_lines(fresh)
+            for line in lines:
+                _pending_flow_alerts.append(line)
+
+            if not lines:
+                continue
+
+            # Acción inmediata: fast_decide sobre las líneas recién detectadas.
+            fake_telemetry = "\n".join(lines)
+            fast_actions = fast_decide(fake_telemetry, _reglas_activas)
+            new_fast = [
+                a for a in fast_actions
+                if a.get("action") not in ("NO_ACTION", None)
+                and a.get("target_port") not in _reglas_activas
+            ]
+            if not new_fast:
+                continue
+
+            ciclo_now = _current_ciclo
+            with _live_lock:
+                resolve_multiple(new_fast)
+            for a in new_fast:
+                p = a["target_port"]
+                _reglas_activas[p] = {"action": a["action"], "ciclo": ciclo_now}
+                _ciclos_limpios[p] = 0
+                registrar_log(
+                    f"ACCIÓN RÁPIDA [FLOW]: {a['action']} en {p}. "
+                    f"Motivo: {a.get('reason', 'Automático')}"
+                )
+                _write_qos_event(p, a["action"], "apply", ciclo_now)
+        except Exception:
+            pass
+
+
 def print_header(texto):
     print("\n" + "=" * 60)
     print(f" {texto.upper()} ".center(60, "="))
@@ -286,23 +430,51 @@ def print_header(texto):
 def run_aiops_pipeline():
     print_header("INICIANDO SUPERVISOR AIOPS (MODO NOC CONTINUO)")
 
-    setup_audit_log()
-    registrar_log("=== INICIO DE SESIÓN NOC ===")
+    # Reset de estado en memoria (defensivo: si se re-entra al pipeline dentro
+    # del mismo proceso Python, no queremos arrastrar reglas/ciclos de la
+    # sesión anterior — los falsos positivos antiguos no deben "reciclarse").
+    global _current_ciclo
+    _reglas_activas.clear()
+    _ciclos_limpios.clear()
+    _recently_relaxed.clear()
+    _pending_flow_alerts.clear()
+    _current_ciclo = 1
 
-    # Limpiar datos de sesiones anteriores (la caché NO se borra)
+    # Limpieza agresiva de tmp/ — sólo se preserva topology_cache.json (la
+    # plantilla de topología). Todo lo demás (logs, métricas, alertas, reportes,
+    # ficheros sueltos) se borra para empezar la simulación con cero ruido.
     for _stale in (
+        # estado de la sesión NOC
         "metrics_history.json", "state.json", "topologia_interactiva.html",
         "qos_history.json", "live_metrics.json", "network_history.json",
         "flows.json", "flows_history.json",
         "anomaly_injections.jsonl", "flow_alerts.jsonl",
-        "anomaly_report.md", "host_port_map.json",
-        "topology.json", "port_baseline.json",
+        "attack_report.md", "anomaly_report.md",
+        "host_port_map.json", "topology.json", "port_baseline.json",
+        # informes y artefactos de agentes
+        "ultimo_informe.txt", "ultima_rafaga_realista.txt",
+        # audit log: se reinicia por sesión — para histórico usa saved_runs/
+        "noc_audit.log",
+        "noc_audit.log.1", "noc_audit.log.2", "noc_audit.log.3",
+        "noc_audit.log.4", "noc_audit.log.5",
     ):
         _p = os.path.join(TMP_DIR, _stale)
         try:
             os.remove(_p)
         except FileNotFoundError:
             pass
+
+    # Volver dashboard a modo "live" (tmp/) por si quedó apuntando a un
+    # saved_runs/<run> de una sesión anterior — sin esto el dashboard
+    # seguiría mostrando datos del run guardado en vez de la sesión nueva.
+    try:
+        from dashboard import app as _dash_app
+        _dash_app._active_run = None
+    except Exception:
+        pass
+
+    setup_audit_log()
+    registrar_log("=== INICIO DE SESIÓN NOC ===")
 
     # =======================================================
     # === FASE 1: TOPOLOGÍA (con caché opcional) ============
@@ -392,7 +564,7 @@ def run_aiops_pipeline():
     except Exception as _e:
         print(f"[WARN] No se pudo persistir topology.json: {_e}")
 
-    # Mapa host → puerto OVS: lo necesitan anomaly_agent y monitor_agent
+    # Mapa host → puerto OVS: lo necesitan attack_agent y monitor_agent
     try:
         host_port = build_host_port_map()
         print(f"[INFO] Host→puerto OVS: {host_port}")
@@ -422,6 +594,7 @@ def run_aiops_pipeline():
     # El colector se ejecuta de forma continua. El lock SSH solo se adquiere
     # durante las operaciones tmux (telemetría y ejecución QoS), no durante LLM.
     threading.Thread(target=_live_collector, daemon=True, name="live-collector").start()
+    threading.Thread(target=_flow_watcher,   daemon=True, name="flow-watcher").start()
 
     # =======================================================
     # === BUCLE INFINITO DE MONITORIZACIÓN Y RESOLUCIÓN =====
@@ -432,11 +605,13 @@ def run_aiops_pipeline():
     print_header("NOC ACTIVO — TRÁFICO CORRIENDO EN BACKGROUND")
     print(">>> Pulsa Ctrl+C en cualquier momento para detener el sistema NOC <<<\n")
 
-    reglas_activas = {}
-    ciclos_limpios = {}
+    # Alias locales al estado compartido con _flow_watcher.
+    reglas_activas = _reglas_activas
+    ciclos_limpios = _ciclos_limpios
 
     try:
         while True:
+            _current_ciclo = ciclo
             cycle_t0 = time.monotonic()
             print_header(f"CICLO DE SUPERVISIÓN #{ciclo}")
             registrar_log(f"--- Iniciando Ciclo #{ciclo} (intervalo={intervalo_actual}s) ---")
@@ -445,8 +620,45 @@ def run_aiops_pipeline():
             with _live_lock:
                 telemetry = collect_telemetry()
 
+            # Incorporar alertas de flujo acumuladas por _flow_watcher
+            # (ataques detectados entre ciclos, mientras el LLM bloqueaba)
+            pending_lines = []
+            while _pending_flow_alerts:
+                pending_lines.append(_pending_flow_alerts.popleft())
+            if pending_lines:
+                telemetry = (telemetry or "") + "\n" + "\n".join(pending_lines)
+                print(f"\n[FLOW WATCHER] {len(pending_lines)} alerta(s) acumuladas:\n"
+                      + "\n".join(pending_lines))
+
             if telemetry and telemetry.strip():
                 print(f"\n[TELEMETRÍA DELTA]\n{telemetry}")
+
+            # ── B-fast: acciones deterministas inmediatas (sin LLM) ───────────
+            # Aplica DEFAULT_POLICY a puertos con alertas en telemetría/pending
+            # que aún no hayan sido tratados por _flow_watcher mid-ciclo.
+            # Los puertos ya en reglas_activas (incluyendo acciones del watcher)
+            # se excluyen automáticamente por la condición "not in reglas_activas".
+            newly_fast_ports: set = set()
+            fast_actions = fast_decide(telemetry, reglas_activas)
+            new_fast = [
+                a for a in fast_actions
+                if a.get("action") not in ("NO_ACTION", None)
+                and a.get("target_port") not in reglas_activas
+            ]
+            if new_fast:
+                print(f"\n[FAST QoS] {len(new_fast)} acción(es) inmediatas antes del LLM...")
+                with _live_lock:
+                    resolve_multiple(new_fast)
+                for a in new_fast:
+                    p = a["target_port"]
+                    reglas_activas[p] = {"action": a["action"], "ciclo": ciclo}
+                    ciclos_limpios[p] = 0
+                    newly_fast_ports.add(p)
+                    registrar_log(
+                        f"ACCIÓN RÁPIDA: {a['action']} en {p}. "
+                        f"Motivo: {a.get('reason', 'Automático')}"
+                    )
+                    _write_qos_event(p, a["action"], "apply", ciclo)
 
             # ── B. ANÁLISIS IA: sin lock — el colector puede muestrear ────────
             print("\n[SUPERVISOR] Analizando estado de la red...")
@@ -456,11 +668,15 @@ def run_aiops_pipeline():
             print("\n[SUPERVISOR] Evaluando intervenciones (QoS)...")
             decision = analyze_and_decide(informe, telemetry, reglas_activas)
 
-            # Escalado forzado (sin SSH)
-            _esc = {"POLICING": "SHAPING", "SHAPING": "BLOCK", "BLOCK": "BLOCK"}
+            # Escalado forzado — excluye puertos que acaban de recibir fast_decide
+            # en este mismo ciclo para evitar escalar inmediatamente.
+            _esc = {"SHAPING": "POLICING", "POLICING": "BLOCK", "BLOCK": "BLOCK"}
             for a in (decision or []):
                 port   = a.get("target_port")
                 action = a.get("action")
+                if port in newly_fast_ports:
+                    a["action"] = "NO_ACTION"  # LLM no re-actúa sobre fast ports este ciclo
+                    continue
                 if port and action not in ("NO_ACTION", None) and port in reglas_activas:
                     previa = reglas_activas[port]["action"]
                     if action == previa:
@@ -473,7 +689,7 @@ def run_aiops_pipeline():
                         )
 
             acciones_reales = [a for a in (decision or []) if a.get("action") != "NO_ACTION"]
-            if acciones_reales:
+            if acciones_reales or new_fast:
                 for a in acciones_reales:
                     registrar_log(
                         f"ALERTA RESUELTA: {a.get('action')} en {a.get('target_port')}. "
@@ -491,8 +707,9 @@ def run_aiops_pipeline():
                 )
             )
 
-            # ── C. EJECUCIÓN + RELAJACIÓN: bloqueo SSH breve ─────────────────
+            # ── C. EJECUCIÓN + DESESCALADO: bloqueo SSH breve ────────────────
             with _live_lock:
+                # Solo ejecuta las decisiones LLM (los fast ya se aplicaron arriba)
                 resolve_multiple(decision)
 
                 for a in (decision or []):
@@ -503,31 +720,40 @@ def run_aiops_pipeline():
                         }
                         ciclos_limpios[a["target_port"]] = 0
 
-                puertos_a_relajar = {}
+                puertos_a_desescalar = {}
                 for port, info in list(reglas_activas.items()):
                     if port not in alerted_this_cycle:
                         ciclos_limpios[port] = ciclos_limpios.get(port, 0) + 1
-                        if ciclos_limpios[port] >= config.CICLOS_PARA_RELAJAR:
-                            puertos_a_relajar[port] = info["action"]
+                        if ciclos_limpios[port] >= config.CICLOS_PARA_DESESCALAR:
+                            puertos_a_desescalar[port] = info["action"]
                     else:
                         ciclos_limpios[port] = 0
 
-                if puertos_a_relajar:
-                    registrar_log(
-                        f"RELAJACIÓN INICIADA: {list(puertos_a_relajar.keys())} "
-                        f"tras {config.CICLOS_PARA_RELAJAR} ciclos limpios"
-                    )
-                    nuevas = run_relaxation(puertos_a_relajar)
+                if puertos_a_desescalar:
+                    nuevas = run_desescalado(puertos_a_desescalar)
+                    resumen = []   # para log consolidado en una sola línea
                     for port, nuevo_nivel in nuevas.items():
                         if nuevo_nivel is None:
                             del reglas_activas[port]
-                            registrar_log(f"RELAJACIÓN COMPLETA: {port} sin restricciones activas")
                             _write_qos_event(port, None, "remove", ciclo)
+                            # Cooling: el watcher exigirá N=3 sobre este puerto
+                            # durante los próximos 2 ciclos para evitar flapping.
+                            _recently_relaxed[port] = ciclo
+                            resumen.append(f"{port}→remove")
                         else:
                             reglas_activas[port] = {"action": nuevo_nivel, "ciclo": ciclo}
-                            registrar_log(f"RELAJACIÓN PARCIAL: {port} reducido a {nuevo_nivel}")
                             _write_qos_event(port, nuevo_nivel, "relax", ciclo)
+                            resumen.append(f"{port}→{nuevo_nivel}")
                         ciclos_limpios.pop(port, None)
+                    registrar_log(
+                        f"DESESCALADO: {', '.join(resumen)} "
+                        f"(tras {config.CICLOS_PARA_DESESCALAR} ciclos limpios)"
+                    )
+
+                # Limpiar entradas de cooling expiradas (>2 ciclos)
+                for p in list(_recently_relaxed.keys()):
+                    if ciclo - _recently_relaxed[p] > 2:
+                        del _recently_relaxed[p]
 
             # ── D. INTERVALO ADAPTATIVO + ESTADO (sin SSH) ───────────────────
             if alerted_this_cycle:
@@ -535,7 +761,7 @@ def run_aiops_pipeline():
                 estado_red = "ALERTA"
             elif reglas_activas:
                 intervalo_actual = config.INTERVALO_BASE
-                estado_red = "MITIGACIÓN ACTIVA"
+                estado_red = "QoS Activa"
             else:
                 intervalo_actual = min(
                     config.INTERVALO_MAX,
@@ -573,8 +799,8 @@ def run_aiops_pipeline():
                         f"duration={inj['duration_sec']}s"
                     )
             except Exception as _e:
-                print(f"[WARN] anomaly_agent falló: {_e}")
-                registrar_log(f"WARN anomaly_agent falló: {_e}")
+                print(f"[WARN] attack_agent falló: {_e}")
+                registrar_log(f"WARN attack_agent falló: {_e}")
 
             # Sleep adaptativo: `intervalo_actual` es el período objetivo del ciclo
             # entero (telemetría + LLM + QoS). Sólo dormimos lo que falte para

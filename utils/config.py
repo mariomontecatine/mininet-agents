@@ -15,7 +15,7 @@ PASO_AMPLIACION = 5  # incremento por ciclo cuando la red está limpia
 
 # --- Cadencia de tareas periódicas ---
 CICLOS_ENTRE_RAFAGAS = 4  # inyectar tráfico realista cada N ciclos
-CICLOS_PARA_RELAJAR = 3  # ciclos limpios consecutivos para bajar un nivel de QoS
+CICLOS_PARA_DESESCALAR = 4  # ciclos limpios consecutivos para bajar un nivel de QoS
 
 # --- Umbrales de telemetría ---
 UMBRAL_TRAFICO_BYTES = (
@@ -26,6 +26,7 @@ TASA_POLICING_MBPS = 20  # límite por defecto en POLICING y SHAPING
 # --- Resolver: split LLM/política ---
 RESOLVER_LLM_TOPK = 3  # nº de alertas más críticas que decide el LLM; el resto va a política por defecto
 RESOLVER_LLM_TIMEOUT = 45  # segundos máx por llamada al LLM antes de hacer fallback
+DEPLOY_LLM_TIMEOUT = 90  # segundos máx por llamada al LLM de despliegue (solo al arrancar)
 
 # --- Tráfico bulk (simulación de usuarios reales) ---
 DURACION_BULK = 35  # segundos de duración de cada ráfaga iperf
@@ -52,23 +53,25 @@ ANOMALY_RNG_SEED = None  # entero → resultados reproducibles; None → estocá
 
 # Umbrales de las heurísticas de anomalía sobre flujos sFlow
 FAN_OUT_THRESHOLD = 5  # ≥N destinos distintos desde 1 origen → port scan
-FAN_IN_THRESHOLD = 3  # ≥N orígenes distintos hacia 1 destino → DDoS
-FAN_IN_BYTES_THRESHOLD = 80 * 1024 * 1024   # 80 MB combinados en ventana
-SURGE_BYTES_THRESHOLD  = 250 * 1024 * 1024  # 250 MB en un solo flujo → DoS volumétrico
-# Nota: el bulk legítimo iperf genera flujos de ~100-160 MB en la ventana
-# sFlow. Si SURGE_BYTES_THRESHOLD se queda en 50 MB, cada bulk → FP. Los
-# ataques reales (150-300 Mbit/s × 30-60s) producen 560-2250 MB.
+FAN_IN_THRESHOLD = 5  # ≥N orígenes simultáneos hacia 1 destino → DDoS (5 para evitar FP de tráfico cliente→servidor legítimo)
+FAN_IN_BYTES_THRESHOLD = 50 * 1024 * 1024  # 50 MB combinados en ventana
+SURGE_BYTES_THRESHOLD = 120 * 1024 * 1024  # 120 MB en un solo flujo → DoS volumétrico
+# Punto medio entre el 50 MB original (ruido por bulk iperf legítimo) y el
+# 250 MB de d0df926 (perdía ataques de 30 s a 150 Mbps cuando la muestra
+# sFlow caía a caballo del ataque). Con ventana sFlow de 20 s, 120 MB pasa
+# con ~6 s de ataque a 150 Mbps; el bulk legítimo (100-160 MB) sigue rozando
+# pero no abre las puertas a todo.
 
 # --- Capa A: multiplicadores por rol de puerto ---
 # El detector aplica el umbral base × multiplier según rol topológico del puerto.
 # Un uplink al router agrega ~20x el tráfico de un host hoja; un puerto-servidor ~5x.
 PORT_ROLE_MULTIPLIER = {
-    "host":   1.0,    # puerto que conecta un h*: línea base
-    "server": 5.0,    # puerto que conecta un srv*: agrega N clientes
-    "trunk":  20.0,   # uplink switch↔switch o switch↔router
+    "host": 1.0,  # puerto que conecta un h*: línea base
+    "server": 5.0,  # puerto que conecta un srv*: agrega N clientes
+    "trunk": 20.0,  # uplink switch↔switch o switch↔router
 }
 
 # --- Capa C: baseline adaptativo (EMA por puerto) ---
-BASELINE_EMA_ALPHA = 0.25   # peso del valor actual en la EMA. ~4-5 ciclos efectivos.
-BASELINE_ALERT_K   = 4.0    # delta actual > k × EMA → considerar anomalía
-BASELINE_WARMUP    = 3      # ciclos de aprendizaje antes de empezar a alertar
+BASELINE_EMA_ALPHA = 0.25  # peso del valor actual en la EMA. ~4-5 ciclos efectivos.
+BASELINE_ALERT_K = 4.0  # delta actual > k × EMA → considerar anomalía
+BASELINE_WARMUP = 3  # ciclos de aprendizaje antes de empezar a alertar
