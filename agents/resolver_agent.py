@@ -17,26 +17,29 @@ os.makedirs(TMP_DIR, exist_ok=True)
 # Cliente Ollama con timeout — evita que un ciclo cuelgue indefinidamente si el modelo se atasca.
 _ollama_client = ollama.Client(host="http://localhost:11434", timeout=config.RESOLVER_LLM_TIMEOUT)
 
-# Escala de severidad: cada nivel sólo puede subir, nunca bajar
-ESCALATION = {"POLICING": "SHAPING", "SHAPING": "BLOCK", "BLOCK": "BLOCK"}
+# Cadena de mitigación, de gentil a brutal:
+#   SHAPING  → encola en egress (TBF, atrasa pero no rompe TCP)
+#   POLICING → dropea en ingress (más agresivo: causa retransmisiones)
+#   BLOCK    → corte total (OpenFlow DROP)
+ESCALATION = {"SHAPING": "POLICING", "POLICING": "BLOCK", "BLOCK": "BLOCK"}
 
-# Relajación: camino inverso cuando el tráfico vuelve a la normalidad
-RELAXATION = {"BLOCK": "SHAPING", "SHAPING": "POLICING", "POLICING": None}
+# Desescalado: camino inverso cuando el tráfico vuelve a la normalidad
+RELAXATION = {"BLOCK": "POLICING", "POLICING": "SHAPING", "SHAPING": None}
 
 # Política por defecto para alertas de baja prioridad (las que no llegan al LLM).
 # Determinista, replica las reglas del system prompt — el LLM "delega" en esta tabla.
 DEFAULT_POLICY = {
-    "ALERTA ROJA": "POLICING",  # pérdidas de paquetes: limitar ingress
-    "ESCANEO":     "BLOCK",     # port scan: bloquear el origen
-    "FAN-IN":      "BLOCK",     # DDoS fan-in: bloquear el puerto víctima
-    "DoS":         "SHAPING",   # flujo volumétrico: moldear egress
+    "ALERTA ROJA": "SHAPING",  # pérdidas: empezar gentil, encolar antes de dropear
+    "ESCANEO":     "BLOCK",    # port scan: no hay nivel intermedio razonable, bloquear
+    "DDoS":        "SHAPING",  # DDoS fan-in: encolar hacia la víctima antes de cortar
+    "DoS":         "SHAPING",  # flujo volumétrico: encolar primero, escalar si persiste
 }
 
 # Pesos de severidad por categoría — definen el orden de prioridad para el top-K.
 _CATEGORY_WEIGHT = {
     "ALERTA ROJA": 1000,  # pérdidas reales: siempre lo más urgente
     "ESCANEO":      800,  # seguridad: amenaza activa
-    "FAN-IN":       600,  # DDoS coordinado
+    "DDoS":       600,  # DDoS coordinado
     "DoS":          400,  # volumétrico unitario
 }
 
@@ -49,14 +52,14 @@ def remove_policing(ssh, port):
     """Elimina el policing de ingress, devolviendo el puerto a estado libre."""
     send_tmux_command(ssh, f"sh tc qdisc del dev {port} ingress 2>/dev/null; true")
     time.sleep(0.2)
-    print(f"  [OK] RELAJACIÓN POLICING → {port}: restricción de ingress eliminada")
+    print(f"  [OK] DESESCALADO POLICING → {port}: restricción de ingress eliminada")
 
 
 def remove_shaping(ssh, port):
     """Elimina el shaping de egress, devolviendo el puerto a estado libre."""
     send_tmux_command(ssh, f"sh tc qdisc del dev {port} root 2>/dev/null; true")
     time.sleep(0.2)
-    print(f"  [OK] RELAJACIÓN SHAPING → {port}: restricción de egress eliminada")
+    print(f"  [OK] DESESCALADO SHAPING → {port}: restricción de egress eliminada")
 
 
 def remove_block(ssh, port):
@@ -72,7 +75,7 @@ def remove_block(ssh, port):
     time.sleep(0.2)
     send_tmux_command(ssh, f"sh tc qdisc del dev {port} ingress 2>/dev/null; true")
     time.sleep(0.2)
-    print(f"  [OK] RELAJACIÓN BLOCK → {port}: flujo OpenFlow DROP eliminado + tc block eliminado")
+    print(f"  [OK] DESESCALADO BLOCK → {port}: flujo OpenFlow DROP eliminado + tc block eliminado")
 
 
 def apply_policing(ssh, port, rate_mbps=20):
@@ -132,12 +135,12 @@ def block_port(ssh, port):
 
 
 # =============================================================
-# === RELAJACIÓN DE REGLAS ====================================
+# === DESESCALADO DE REGLAS ===================================
 # =============================================================
 
-def run_relaxation(ports_to_relax):
+def run_desescalado(ports_to_relax):
     """
-    Relaja las restricciones de los puertos cuyo tráfico ha vuelto a la normalidad.
+    Desescala las restricciones de los puertos cuyo tráfico ha vuelto a la normalidad.
 
     ports_to_relax: dict {port → current_action_str}
     Devuelve: dict {port → new_action_or_None}
@@ -147,7 +150,7 @@ def run_relaxation(ports_to_relax):
     if not ports_to_relax:
         return {}
 
-    print(f"\n[RELAJACIÓN] Reduciendo restricciones en {len(ports_to_relax)} puerto(s)...")
+    print(f"\n[DESESCALADO] Reduciendo restricciones en {len(ports_to_relax)} puerto(s)...")
     resultado = {}
 
     try:
@@ -156,7 +159,7 @@ def run_relaxation(ports_to_relax):
         for port, current_action in ports_to_relax.items():
             nuevo_nivel = RELAXATION.get(current_action)
             print(
-                f"\n  --- RELAJAR {port}: {current_action} → "
+                f"\n  --- DESESCALAR {port}: {current_action} → "
                 f"{nuevo_nivel if nuevo_nivel else 'SIN RESTRICCIÓN'} ---"
             )
 
@@ -179,7 +182,7 @@ def run_relaxation(ports_to_relax):
         ssh.close()
 
     except Exception as e:
-        print(f"[ERROR] Fallo en run_relaxation: {e}")
+        print(f"[ERROR] Fallo en run_desescalado: {e}")
 
     return resultado
 
@@ -268,17 +271,17 @@ def _parse_alerts(raw_telemetry):
             "severity": _CATEGORY_WEIGHT["ESCANEO"],
         })
 
-    # [FAN-IN]: DDoS coordinado. Peso = MB combinados.
+    # [DDoS]: ataque coordinado. Peso = MB combinados.
     for m in re.finditer(
-        r"\[FAN-IN\].*?Port\s+(s\d+-eth\d+):.*?([\d.]+)\s*MB\s*combinados",
+        r"\[DDoS\].*?Port\s+(s\d+-eth\d+):.*?([\d.]+)\s*MB\s*combinados",
         raw_telemetry,
     ):
         mb = float(m.group(2))
         alerts.append({
             "port":     m.group(1),
-            "category": "FAN-IN",
+            "category": "DDoS",
             "metric":   mb,
-            "severity": _CATEGORY_WEIGHT["FAN-IN"] + mb,
+            "severity": _CATEGORY_WEIGHT["DDoS"] + mb,
         })
 
     # [DoS]: flujo volumétrico unitario. Peso = MB del flujo.
@@ -326,6 +329,19 @@ def _default_action(alert, reglas_activas):
     }
 
 
+def fast_decide(raw_telemetry, reglas_activas=None):
+    """
+    Decisión puramente determinista (sin LLM) para TODAS las alertas activas.
+    Solo actúa sobre puertos que aún no tienen una regla aplicada — los que ya
+    la tienen se dejan al LLM para que decida si escalar.
+    Devuelve lista de acciones (puede estar vacía).
+    """
+    alerts = _parse_alerts(raw_telemetry)
+    if not alerts:
+        return []
+    return [_default_action(a, reglas_activas) for a in alerts]
+
+
 def analyze_and_decide(report_text, raw_telemetry=None, reglas_activas=None):
     """
     Híbrido LLM + política determinista.
@@ -354,7 +370,7 @@ def analyze_and_decide(report_text, raw_telemetry=None, reglas_activas=None):
 
     # Si no quedan alertas para el LLM (porque K cubre todo o porque hay 0 alertas
     # pero sí reglas_activas), devolvemos lo que tengamos. Las reglas_activas se
-    # gestionan en el supervisor (escalado forzado + relajación).
+    # gestionan en el supervisor (escalado forzado + desescalado).
     if not top_k:
         return default_actions or [{"action": "NO_ACTION"}]
 
@@ -389,12 +405,14 @@ def analyze_and_decide(report_text, raw_telemetry=None, reglas_activas=None):
         "1. REGLA CRÍTICA DE CARDINALIDAD: el array de acciones debe tener EXACTAMENTE tantas entradas "
         "como el TOTAL indicado en 'PUERTOS EN ALERTA'. Ni una más, ni una menos.\n"
         "2. REGLA DE ESCALADO: si un puerto ya tiene una mitigación activa y sigue en alerta, "
-        "DEBES escalar según la cadena POLICING → SHAPING → BLOCK. "
+        "DEBES escalar según la cadena SHAPING → POLICING → BLOCK "
+        "(de gentil a brutal: encolar → dropear excedente → corte total). "
         "Nunca repitas la misma acción que ya falló en un ciclo anterior.\n"
-        "3. Usa SHAPING para [DoS] (flujo volumétrico anómalo) — mitiga sin cortar la conectividad.\n"
-        "4. Usa BLOCK para [ESCANEO] (port scan: bloquear origen) y [FAN-IN] (DDoS: bloquear la víctima). "
-        "También como escalado final tras SHAPING.\n"
-        "5. Usa POLICING para [ALERTA ROJA] (pérdidas) sin mitigación previa.\n"
+        "3. Usa SHAPING como primera respuesta para [DoS], [DDoS] y [ALERTA ROJA] — "
+        "encola en egress y atrasa el exceso sin romper TCP.\n"
+        "4. Usa POLICING como escalado intermedio cuando SHAPING no contiene el ataque — "
+        "dropea en ingress, más agresivo pero más eficiente.\n"
+        "5. Usa BLOCK para [ESCANEO] (port scan: cortar el origen) y como escalado final tras POLICING.\n"
         "6. NUNCA actúes sobre puertos 'LOCAL'. Formato obligatorio: sX-ethY (ej: s1-eth2).\n"
         "Siempre invoca la herramienta. Nunca respondas con texto plano."
     )
