@@ -28,7 +28,7 @@ from collections import deque, defaultdict
 
 WINDOW_SEC = 20
 FLUSH_SEC  = 5
-TOP_N      = 20
+TOP_N      = 50
 OUTPUT     = "/tmp/sflow_flows.json"
 
 def parse_sflow_v5(data):

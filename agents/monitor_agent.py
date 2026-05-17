@@ -210,14 +210,13 @@ def detect_flow_anomalies(flows, host_port):
         fan_out_dsts.setdefault(src, set()).add(dst)
         fan_in_srcs.setdefault(dst, set()).add(src)
         fan_in_bytes[dst] = fan_in_bytes.get(dst, 0) + b
-        # Capa A: el umbral SURGE se relaja según el rol del puerto-origen.
-        # Un servidor sirviendo a varios clientes mueve bytes "como si fuera DoS" por construcción.
-        src_host = ip_to_name.get(src, src)
-        src_port = host_port.get(src_host)
-        surge_floor = config.SURGE_BYTES_THRESHOLD * (
-            config.PORT_ROLE_MULTIPLIER.get(_port_role(src_port), 1.0) if src_port else 1.0
-        )
-        if b >= surge_floor:
+        # Umbral plano: SURGE detecta un flujo único anómalo 1→1, así que el rol
+        # del puerto-origen no debe inflar el umbral. Un servidor "atacando" a
+        # un host con 150 Mbps sostenidos sigue siendo DoS volumétrico,
+        # independientemente de que el servidor sirva legítimamente a varios
+        # clientes en paralelo (eso lo cubre el filtro por rol del agregado RX,
+        # no este detector de flujo individual).
+        if b >= config.SURGE_BYTES_THRESHOLD:
             surge_flows.append((src, dst, b, pkts))
 
     alerts = []
@@ -226,9 +225,9 @@ def detect_flow_anomalies(flows, host_port):
     # Scope: solo emitimos alertas de los tipos que el inyector está usando.
     # Evita ruido del baseline en heurísticas no evaluadas en esta ronda.
     try:
-        from agents.anomaly_agent import ATTACK_TYPES as _ACTIVE_ATTACKS
+        from agents.attack_agent import ATTACK_TYPES as _ACTIVE_ATTACKS
     except Exception:
-        _ACTIVE_ATTACKS = ("port_scan", "dos_volumetric", "ddos_fanin")
+        _ACTIVE_ATTACKS = ("port_scan", "dos_volumetric", "ddos")
 
     if "port_scan" in _ACTIVE_ATTACKS:
         for src_ip, dsts in fan_out_dsts.items():
@@ -248,9 +247,9 @@ def detect_flow_anomalies(flows, host_port):
                 "ts":      ts,
             })
 
-    if "ddos_fanin" in _ACTIVE_ATTACKS:
+    ddos_victim_ips: set = set()
+    if "ddos" in _ACTIVE_ATTACKS:
         for dst_ip, srcs in fan_in_srcs.items():
-            # Capa A: el umbral FAN-IN se relaja según el rol del puerto-víctima.
             victim_host = ip_to_name.get(dst_ip, dst_ip)
             victim_port = host_port.get(victim_host)
             fanin_floor = config.FAN_IN_BYTES_THRESHOLD * (
@@ -258,8 +257,9 @@ def detect_flow_anomalies(flows, host_port):
             )
             if (len(srcs) >= config.FAN_IN_THRESHOLD
                     and fan_in_bytes.get(dst_ip, 0) >= fanin_floor):
+                ddos_victim_ips.add(dst_ip)
                 alerts.append({
-                    "type":    "ddos_fanin",
+                    "type":    "ddos",
                     "host":    victim_host,
                     "host_ip": dst_ip,
                     "port":    victim_port,
@@ -270,6 +270,8 @@ def detect_flow_anomalies(flows, host_port):
 
     if "dos_volumetric" in _ACTIVE_ATTACKS:
         for src_ip, dst_ip, b, pkts in surge_flows:
+            if dst_ip in ddos_victim_ips:
+                continue  # already counted as DDoS target, skip individual DoS
             src_host = ip_to_name.get(src_ip, src_ip)
             dst_host = ip_to_name.get(dst_ip, dst_ip)
             alerts.append({
@@ -295,9 +297,9 @@ def _format_anomaly_lines(alerts):
         if a["type"] == "port_scan":
             line = (f"🟠 [ESCANEO] Port {port}: origen={a['host']} ({a['host_ip']}), "
                     f"{a['dsts']} destinos en ventana [posible port scan]")
-        elif a["type"] == "ddos_fanin":
-            line = (f"🟠 [FAN-IN] Port {port}: víctima={a['host']} ({a['host_ip']}) ← "
-                    f"{a['srcs']} orígenes, {format_bytes(a['bytes'])} combinados [posible DDoS]")
+        elif a["type"] == "ddos":
+            line = (f"🟠 [DDoS] Port {port}: víctima={a['host']} ({a['host_ip']}) ← "
+                    f"{a['srcs']} orígenes, {format_bytes(a['bytes'])} combinados [DDoS coordinado]")
         elif a["type"] == "dos_volumetric":
             line = (f"🟠 [DoS] Port {port}: {a['host']}→{a['victim']} "
                     f"({format_bytes(a['bytes'])}) [flujo volumétrico anómalo]")
@@ -467,16 +469,12 @@ def collect_telemetry():
 
         _save_baseline(baseline)
 
-        # ── Capa de flujos sFlow: heurísticas de anomalía ────────────────────
-        snapshot = _load_flows()
-        if snapshot and snapshot.get("flows"):
-            host_port = _load_host_port_map()
-            anomaly_alerts = detect_flow_anomalies(snapshot["flows"], host_port)
-            for a in anomaly_alerts:
-                _record_flow_alert(a)
-            extra = _format_anomaly_lines(anomaly_alerts)
-            if extra:
-                important_lines.extend(extra)
+        # Nota: las alertas de flujo sFlow las inyecta el bucle principal vía
+        # _pending_flow_alerts (alimentado por _flow_watcher con filtros de
+        # warmup, confirmación N=2 y cooling). NO duplicamos la detección
+        # aquí — ejecutar detect_flow_anomalies sobre el mismo snapshot
+        # esquivaría todos esos filtros y reaccionaría a un solo pico de
+        # tráfico legítimo del bulk iperf.
 
         return "\n".join(important_lines)
 
@@ -490,6 +488,16 @@ def generate_network_report(filtered_telemetry):
 
     if not filtered_telemetry or not filtered_telemetry.strip():
         return "Red estable. No se detectó tráfico significativo ni pérdidas de paquetes en este ciclo."
+
+    # Atajo: si la telemetría no contiene NINGÚN marcador de anomalía, no merece
+    # la pena gastar una llamada LLM (30-180 s con qwen2.5:3b). El informe sería
+    # idéntico al fallback "Red estable.". El resolver tampoco necesita el
+    # informe para actuar — usa _parse_alerts(raw_telemetry) directamente.
+    anomaly_markers = ("[ALERTA ROJA]", "[TRÁFICO INTENSO]", "[ESCANEO]",
+                       "[DDoS]", "[FAN-IN]", "[DoS]")
+    if not any(m in filtered_telemetry for m in anomaly_markers):
+        print("[IA] Sin anomalías en la telemetría — se omite la llamada LLM.")
+        return "Red estable."
 
     system_prompt = (
         "Eres un Analista Senior de Redes (NOC). Responde SOLO con el diagnóstico, "

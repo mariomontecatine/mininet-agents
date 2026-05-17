@@ -7,7 +7,7 @@ Genera ataques sintéticos sobre la topología Mininet activa:
   * ddos_fanin     — varios hosts inundan a una víctima en paralelo
 
 Cada inyección se anota en `tmp/anomaly_injections.jsonl` (un JSON por línea)
-para que `anomaly_report.py` pueda correlacionarlas a posteriori con las
+para que `attack_report.py` pueda correlacionarlas a posteriori con las
 acciones tomadas por el resolver.
 
 NO contiene lógica de detección. Las heurísticas de detección viven en
@@ -33,10 +33,7 @@ TMP_DIR        = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__
 INJECTION_LOG  = os.path.join(TMP_DIR, "anomaly_injections.jsonl")
 HOST_PORT_FILE = os.path.join(TMP_DIR, "host_port_map.json")
 
-# ddos_fanin queda desactivado temporalmente: en este baseline (15 clientes → 4 servidores)
-# el fan-in legítimo es ruido constante y mezcla TP con FP. Lo volveremos a activar cuando
-# port_scan y dos_volumetric se vean limpios.
-ATTACK_TYPES = ("port_scan", "dos_volumetric")
+ATTACK_TYPES = ("port_scan", "dos_volumetric", "ddos")
 
 # Estado interno del scheduler — se accede solo desde el hilo del supervisor.
 _state = {
@@ -50,7 +47,7 @@ _state = {
 def build_host_port_map():
     """
     Construye {host_name: switch_port} usando agents.topology.get_topology_links().
-    Lo persiste en tmp/host_port_map.json para que anomaly_report.py pueda
+    Lo persiste en tmp/host_port_map.json para que attack_report.py pueda
     leerlo sin necesidad de SSH.
 
     Llamar UNA vez tras el despliegue. Si la topología cambia hay que rellamar.
@@ -165,6 +162,20 @@ def _attack_ddos_fanin(ssh, attackers, victim_host, victim_ip, bw_each_mbit, dur
               f"-b {bw_each_mbit}M -t {duration} >/dev/null 2>&1 &")
 
 
+def _attack_ddos(ssh, attackers, victim_host, victim_ip, bw_each_mbit, duration):
+    """
+    DDoS coordinado: todos los atacantes saturan un servicio en paralelo.
+    Usa el puerto 5055 (separado del tráfico normal en 5002) para no
+    interferir con los session workers del traffic_agent.
+    """
+    _send(ssh, f"{victim_host} iperf -s -u -p 5055 >/dev/null 2>&1 &")
+    time.sleep(0.4)
+    for a in attackers:
+        _send(ssh,
+              f"{a} iperf -c {victim_ip} -u -p 5055 "
+              f"-b {bw_each_mbit}M -t {duration} >/dev/null 2>&1 &")
+
+
 # ── Scheduler público ────────────────────────────────────────────────────────
 
 def maybe_inject_anomaly(endpoints, force_type=None):
@@ -242,14 +253,17 @@ def maybe_inject_anomaly(endpoints, force_type=None):
                 "bw_mbit":       bw,
             })
 
-        elif attack_type == "ddos_fanin":
-            if len(host_names) < 4:
-                # Necesita ≥3 atacantes + 1 víctima. Si no, fallback a DoS.
+        elif attack_type == "ddos":
+            # Víctima: preferiblemente un servidor (tiene servicio real que "tumbar")
+            servers = [n for n in host_names if n.startswith("srv")]
+            victim = rng.choice(servers) if servers else rng.choice(host_names)
+            # Atacantes: todos los h* disponibles (hasta 10), excluye la víctima
+            h_pool = [n for n in host_names if n.startswith("h") and n != victim]
+            if len(h_pool) < 2:
+                # Fallback a DoS simple si no hay suficientes hosts
                 attack_type = "dos_volumetric"
                 rec["type"] = "dos_volumetric"
-                src = rng.choice(host_names)
-                victim_candidates = [n for n in host_names if n != src]
-                victim = rng.choice(victim_candidates)
+                src = rng.choice([n for n in host_names if n != victim])
                 bw = rng.randint(150, 300)
                 _attack_dos_volumetric(ssh, src, victim, hosts[victim], bw, duration)
                 rec.update({
@@ -258,23 +272,20 @@ def maybe_inject_anomaly(endpoints, force_type=None):
                     "victim": victim, "victim_ip": hosts[victim],
                     "victim_port": host_port.get(victim),
                     "bw_mbit": bw,
-                    "note": "fallback desde ddos_fanin por hosts insuficientes",
                 })
             else:
-                victim = rng.choice(host_names)
-                pool = [n for n in host_names if n != victim]
-                n_attackers = min(3, len(pool))
-                attackers = rng.sample(pool, n_attackers)
-                bw_each = rng.randint(60, 120)
-                _attack_ddos_fanin(ssh, attackers, victim, hosts[victim], bw_each, duration)
+                n_attackers = min(10, len(h_pool))
+                attackers = rng.sample(h_pool, n_attackers)
+                bw_each = rng.randint(80, 150)
+                _attack_ddos(ssh, attackers, victim, hosts[victim], bw_each, duration)
                 rec.update({
-                    "attackers":     attackers,
-                    "attacker_ips":  [hosts[a] for a in attackers],
+                    "attackers":      attackers,
+                    "attacker_ips":   [hosts[a] for a in attackers],
                     "attacker_ports": [host_port.get(a) for a in attackers],
-                    "victim":        victim,
-                    "victim_ip":     hosts[victim],
-                    "victim_port":   host_port.get(victim),
-                    "bw_each_mbit":  bw_each,
+                    "victim":         victim,
+                    "victim_ip":      hosts[victim],
+                    "victim_port":    host_port.get(victim),
+                    "bw_each_mbit":   bw_each,
                 })
         else:
             return None

@@ -1,9 +1,9 @@
 """
 Correlaciona las anomalías inyectadas con la respuesta del NOC y emite un
-informe en `tmp/anomaly_report.md`.
+informe en `tmp/attack_report.md`.
 
 Fuentes:
-  - tmp/anomaly_injections.jsonl  (qué inyectó el anomaly_agent)
+  - tmp/anomaly_injections.jsonl  (qué inyectó el attack_agent)
   - tmp/qos_history.json          (qué acciones aplicó el resolver)
   - tmp/flow_alerts.jsonl         (qué detectaron las heurísticas del monitor)
   - tmp/noc_audit.log             (texto del informe IA de cada ciclo)
@@ -19,9 +19,9 @@ Para cada inyección registra tres señales de detección independientes:
 Una inyección cuenta como **detectada (TP)** si al menos una señal disparó.
 
 Ejecuta:
-    python3 -m agents.anomaly_report
+    python3 -m agents.attack_report
 o desde Python:
-    from agents.anomaly_report import generate_report; generate_report()
+    from agents.attack_report import generate_report; generate_report()
 """
 
 import os
@@ -39,7 +39,7 @@ INJECTION_LOG = os.path.join(TMP_DIR, "anomaly_injections.jsonl")
 QOS_HISTORY   = os.path.join(TMP_DIR, "qos_history.json")
 FLOW_ALERTS   = os.path.join(TMP_DIR, "flow_alerts.jsonl")
 AUDIT_LOG     = os.path.join(TMP_DIR, "noc_audit.log")
-REPORT_MD     = os.path.join(TMP_DIR, "anomaly_report.md")
+REPORT_MD     = os.path.join(TMP_DIR, "attack_report.md")
 
 GRACE_SEC = 60      # margen para que la cadena monitor→resolver actúe tras ts_end
 
@@ -323,7 +323,7 @@ def render(results):
 
 
 def generate_report():
-    """Correlaciona y vuelca tmp/anomaly_report.md. Devuelve el path."""
+    """Correlaciona y vuelca tmp/attack_report.md. Devuelve el path."""
     results = correlate()
     md = render(results)
     try:
