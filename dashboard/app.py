@@ -225,7 +225,8 @@ def api_alerts():
         return jsonify({"labels": [], "ports": [], "matrix": []})
 
     window = history[-40:]
-    labels = [e["ts"].split("T")[-1] for e in window]
+    window_ts = [e["ts"] for e in window]   # full ISO timestamps
+    labels    = [ts.split("T")[-1] for ts in window_ts]
 
     # Collect all known ports (order by most activity)
     port_activity: dict[str, int] = defaultdict(int)
@@ -244,6 +245,34 @@ def api_alerts():
             sev = entry.get("severity", {}).get(port, "idle")
             row.append(sev_to_int.get(sev, 0))
         matrix.append(row)
+
+    # Overlay: cualquier mitigación QoS activa (POLICING/SHAPING/BLOCK) se pinta
+    # como severidad=3 ("Crítico / mitigación activa"). Sin esto el heatmap nunca
+    # se pone rojo porque POLICING dropea pre-OVS y BLOCK usa OpenFlow DROP
+    # (ambos bypassean los contadores de drop del puerto).
+    qos_events = _load_json("qos_history.json", [])
+    mitig_open: dict[str, str] = {}   # port → apply_ts mientras la mitigación está activa
+    mitig_periods: dict[str, list] = defaultdict(list)
+    for ev in qos_events:
+        p  = ev.get("port", "")
+        ts = ev.get("ts", "")
+        ac = ev.get("action")
+        if ev.get("event") == "apply" and ac in ("POLICING", "SHAPING", "BLOCK"):
+            # Sólo abrir si no había una mitigación previa (escalado = misma sesión)
+            mitig_open.setdefault(p, ts)
+        elif ev.get("event") == "remove" and p in mitig_open:
+            mitig_periods[p].append((mitig_open.pop(p), ts))
+        # event=="relax" mantiene la sesión abierta: sigue habiendo mitigación
+    for p, ts in mitig_open.items():
+        mitig_periods[p].append((ts, None))   # aún activa
+
+    for i, port in enumerate(sorted_ports):
+        if port not in mitig_periods:
+            continue
+        for apply_ts, remove_ts in mitig_periods[port]:
+            for j, cell_ts in enumerate(window_ts):
+                if cell_ts >= apply_ts and (remove_ts is None or cell_ts <= remove_ts):
+                    matrix[i][j] = max(matrix[i][j], 3)
 
     return jsonify({"labels": labels, "ports": sorted_ports, "matrix": matrix})
 
@@ -358,7 +387,7 @@ def _describe_actor(inj):
     t = inj.get("type")
     if t in ("port_scan", "dos_volumetric"):
         return inj.get("attacker", "?")
-    if t == "ddos_fanin":
+    if t == "ddos":
         return ",".join(inj.get("attackers", []) or []) or "?"
     return "?"
 
@@ -373,14 +402,21 @@ def _describe_target(inj):
 
 def _alert_matches_injection(alert, injections, ar):
     """
-    Una heurística cuenta como TP si dispara dentro de la ventana de alguna
-    inyección Y el host involucrado pertenece a ella (atacante o víctima).
+    Una heurística cuenta como TP si (1) dispara dentro de la ventana de
+    alguna inyección, (2) el host involucrado pertenece a ella Y (3) el
+    tipo de la heurística coincide con el tipo de la inyección. Sin el
+    chequeo de tipo, una heurística port_scan se contaba como TP de una
+    inyección DDoS solo por compartir atacante y ventana — clasificación
+    espuria.
     """
     ts = ar._parse_iso(alert.get("ts"))
     if ts is None:
         return False
+    alert_type = alert.get("type")
     alert_host = alert.get("host") or alert.get("host_ip")
     for inj in injections:
+        if inj.get("type") != alert_type:
+            continue
         if not ar._within(inj, ts):
             continue
         hosts = set(ar._attacker_hosts(inj))
@@ -426,8 +462,8 @@ def api_security():
       alerts:    últimas 10 heurísticas disparadas (deduplicadas por type+host)
     """
     # Lazy import — evita que la importación del módulo Flask requiera
-    # agents/anomaly_report al instante.
-    from agents import anomaly_report as ar
+    # agents/attack_report al instante.
+    from agents import attack_report as ar
 
     # Reapuntamos a los ficheros del directorio activo (live o saved run).
     src = _active_dir()
@@ -500,7 +536,7 @@ def api_security():
     missed      = sum(1 for e in enriched if e["status"] == "missed")
 
     by_type = {}
-    for t in ("port_scan", "dos_volumetric", "ddos_fanin"):
+    for t in ("port_scan", "dos_volumetric", "ddos"):
         items = [e for e in enriched if e["type"] == t]
         by_type[t] = {
             "total":     len(items),
@@ -517,8 +553,47 @@ def api_security():
     heur_fp = max(0, len(flow_alerts) - heur_tp)
 
     apply_events = [e for e in qos_events if e.get("event") == "apply"]
-    res_tp = sum(1 for e in apply_events if _qos_apply_matches_injection(e, injections, ar))
-    res_fp = max(0, len(apply_events) - res_tp)
+
+    # Agrupar apply_events en "sesiones de mitigación" por puerto. Una sesión
+    # cubre escalados (SHAPING→POLICING→BLOCK) y re-aplicaciones tras
+    # desescalado completo. Eventos en el mismo puerto separados por ≤120s
+    # forman parte de la MISMA sesión — escalados/relajaciones internas no
+    # cuentan como decisiones nuevas, así que tampoco como FP independientes.
+    SESSION_GAP_SEC = 120
+    sessions_by_port: dict[str, list[list]] = {}
+    for e in sorted(apply_events, key=lambda x: x.get("ts", "")):
+        port = e.get("port")
+        ts   = ar._parse_iso(e.get("ts"))
+        if not port or ts is None:
+            continue
+        port_sessions = sessions_by_port.setdefault(port, [])
+        if port_sessions and ts - port_sessions[-1][-1]["_ts_epoch"] <= SESSION_GAP_SEC:
+            e["_ts_epoch"] = ts
+            port_sessions[-1].append(e)
+        else:
+            e["_ts_epoch"] = ts
+            port_sessions.append([e])
+
+    matched_inj_ids: set = set()
+    res_fp = 0
+    for port, port_sessions in sessions_by_port.items():
+        for session in port_sessions:
+            session_matched_any = False
+            # Una sola sesión puede mitigar VARIOS ataques solapados (mismo puerto,
+            # ventanas que se cruzan — p.ej. DoS h3→srv5 y DDoS sobre srv5 que llegan
+            # con segundos de diferencia). Contamos todas las inyecciones que la
+            # sesión cubre, sin parar al primer match — así res_tp queda consistente
+            # con el contador "mitigated" del scorecard.
+            for inj in injections:
+                inj_matches = any(
+                    _qos_apply_matches_injection(ev, [inj], ar) for ev in session
+                )
+                if inj_matches:
+                    matched_inj_ids.add(inj.get("id", id(inj)))
+                    session_matched_any = True
+            if not session_matched_any:
+                res_fp += 1
+    res_tp = len(matched_inj_ids)
 
     heur_precision = heur_tp / (heur_tp + heur_fp) if (heur_tp + heur_fp) else 0.0
     res_precision  = res_tp  / (res_tp  + res_fp)  if (res_tp  + res_fp ) else 0.0
@@ -681,13 +756,13 @@ def api_inject():
     """
     payload = request.get_json(silent=True) or {}
     attack_type = (payload.get("type") or "").strip()
-    if attack_type not in ("port_scan", "dos_volumetric"):
+    if attack_type not in ("port_scan", "dos_volumetric", "ddos"):
         return jsonify({"ok": False,
-                        "error": "type debe ser 'port_scan' o 'dos_volumetric'"}), 400
+                        "error": "type debe ser 'port_scan', 'dos_volumetric' o 'ddos'"}), 400
 
     # Lazy import + traffic_agent para obtener endpoints
     try:
-        from agents.anomaly_agent import maybe_inject_anomaly
+        from agents.attack_agent import maybe_inject_anomaly
         from agents.traffic_agent import get_active_endpoints
     except Exception as e:
         return jsonify({"ok": False, "error": f"módulos: {e}"}), 500
