@@ -32,6 +32,23 @@ DEPLOY_LLM_TIMEOUT = 90  # segundos máx por llamada al LLM de despliegue (solo 
 DURACION_BULK = 35  # segundos de duración de cada ráfaga iperf
 ESPERA_POST_BULK = 25  # segundos de margen tras lanzar los clientes
 
+# --- Puertos estándar por servicio (referencia central) ---
+# Lo consultan traffic_agent (DNS sintético) y futuras herramientas QoS por
+# protocolo. No alteran ningún comportamiento existente.
+SERVICE_PORTS = {
+    "http":     80,
+    "https":    443,
+    "http_alt": 8080,   # el python -m http.server escucha aquí en los srv*
+    "dns":      53,
+    "ssh":      22,
+    "ftp":      21,
+    "sip":      5060,
+    "smtp":     25,
+    "iperf":    5002,   # tráfico legítimo iperf TCP
+    "iperf_dos":  5050, # canal de los DoS UDP
+    "iperf_ddos": 5055, # canal de los DDoS UDP
+}
+
 # --- Auditoría / log ---
 LOG_MAX_BYTES = 1 * 1024 * 1024  # 1 MB por fichero antes de rotar
 LOG_BACKUP_COUNT = 5  # noc_audit.log.1 … noc_audit.log.5

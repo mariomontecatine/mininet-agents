@@ -67,6 +67,12 @@ def launch_background_traffic(endpoints):
         send_tmux_command(ssh, "sh pkill -f wget; true")
         time.sleep(0.2)
         send_tmux_command(ssh, "sh pkill -f http.server; true")
+        time.sleep(0.2)
+        # Mata pings y digs lanzados por launches anteriores. Patrón específico
+        # ('ping -c' y 'dig @') para no afectar al ping interno de Mininet.
+        send_tmux_command(ssh, "sh pkill -f 'ping -c'; true")
+        time.sleep(0.2)
+        send_tmux_command(ssh, "sh pkill -f 'dig @'; true")
         time.sleep(0.5)
 
         # ── 1. Servidores HTTP en cada srv* ────────────────────────────────────
@@ -192,6 +198,60 @@ def launch_background_traffic(endpoints):
         if intra_pairs:
             print(f"[TRAFFIC] Intra-subnet: {intra_pairs} par(es) iperf local (no cruzan router)")
 
+        # ── 6. Tráfico ICMP — ping periódico host↔host ────────────────────────
+        #    Volumen bajo (3 paquetes × cada 20-50s), solo aporta variedad de
+        #    protocolos y permite medir reachability vía sFlow. NO supera
+        #    umbrales de detección.
+        icmp_count = 0
+        host_items = list(hosts.items())
+        if len(host_items) >= 2:
+            for i, (host_name, _) in enumerate(host_items):
+                target_name, target_ip = host_items[(i + 1) % len(host_items)]
+                if target_name == host_name:
+                    continue
+                delay = random.randint(5, 30)
+                cmd = (
+                    f'{host_name} bash -c '
+                    f'"sleep {delay}; '
+                    f'while true; do '
+                    f'ping -c 3 -W 1 -q {target_ip} >/dev/null 2>&1; '
+                    f'sleep $((RANDOM % 30 + 20)); '
+                    f'done" &'
+                )
+                send_tmux_command(ssh, cmd)
+                time.sleep(0.05)
+                icmp_count += 1
+
+        # ── 7. Tráfico DNS sintético — queries UDP/53 hacia servidores ────────
+        #    Cada query es una llamada `dig` con timeout corto (1s). Si dig no
+        #    está instalado en la VM el comando falla silenciosamente y no
+        #    genera tráfico, pero el resto del sistema sigue funcionando.
+        dns_count = 0
+        dns_port = config.SERVICE_PORTS.get("dns", 53)
+        if servers:
+            queryers = list(hosts.keys())[:max(1, len(hosts) // 2)]
+            srv_ips_for_dns = list(servers.values())
+            for host_name in queryers:
+                target_ip = random.choice(srv_ips_for_dns)
+                delay = random.randint(10, 40)
+                cmd = (
+                    f'{host_name} bash -c '
+                    f'"sleep {delay}; '
+                    f'while true; do '
+                    f'dig @{target_ip} -p {dns_port} example.com +tries=1 +timeout=1 +short '
+                    f'>/dev/null 2>&1; '
+                    f'sleep $((RANDOM % 45 + 15)); '
+                    f'done" &'
+                )
+                send_tmux_command(ssh, cmd)
+                time.sleep(0.05)
+                dns_count += 1
+
+        if icmp_count:
+            print(f"[TRAFFIC] ICMP: {icmp_count} host(s) con pings periódicos host↔host")
+        if dns_count:
+            print(f"[TRAFFIC] DNS: {dns_count} host(s) con queries sintéticas UDP/{dns_port}")
+
         ssh.close()
         print("[TRAFFIC] Control devuelto al supervisor. El tráfico corre en background.")
 
@@ -209,6 +269,10 @@ def stop_background_traffic():
         send_tmux_command(ssh, "sh pkill -f wget; true")
         time.sleep(0.2)
         send_tmux_command(ssh, "sh pkill -f http.server; true")
+        time.sleep(0.2)
+        send_tmux_command(ssh, "sh pkill -f 'ping -c'; true")
+        time.sleep(0.2)
+        send_tmux_command(ssh, "sh pkill -f 'dig @'; true")
         time.sleep(0.3)
         ssh.close()
         print("[TRAFFIC] Procesos de background terminados.")
