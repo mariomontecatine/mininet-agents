@@ -35,6 +35,34 @@ DEFAULT_POLICY = {
     "DoS":         "SHAPING",  # flujo volumétrico: encolar primero, escalar si persiste
 }
 
+
+# ─── Helpers de QoS por protocolo ────────────────────────────────────────────
+def _tc_proto_match(protocol):
+    """Devuelve la cláusula tc u32 que matchea (ip_proto, dport) del servicio.
+
+    None si el protocolo no está en SERVICE_DEFS.
+    """
+    if not protocol or protocol not in config.SERVICE_DEFS:
+        return None
+    d = config.SERVICE_DEFS[protocol]
+    parts = [f"match ip protocol {d['ip_proto']} 0xff"]
+    if d.get("dport"):
+        parts.append(f"match ip dport {d['dport']} 0xffff")
+    return " ".join(parts)
+
+
+def _of_proto_match(protocol):
+    """Devuelve la cláusula OpenFlow para el protocolo (ej. 'udp,tp_dst=53')."""
+    if not protocol or protocol not in config.SERVICE_DEFS:
+        return None
+    d = config.SERVICE_DEFS[protocol]
+    transport = d.get("transport", "ip")
+    if transport == "icmp":
+        return "icmp"
+    if d.get("dport"):
+        return f"{transport},tp_dst={d['dport']}"
+    return transport
+
 # Pesos de severidad por categoría — definen el orden de prioridad para el top-K.
 _CATEGORY_WEIGHT = {
     "ALERTA ROJA": 1000,  # pérdidas reales: siempre lo más urgente
@@ -48,26 +76,43 @@ _CATEGORY_WEIGHT = {
 # === PRIMITIVAS DE EJECUCIÓN (operan sobre una SSH abierta) ==
 # =============================================================
 
-def remove_policing(ssh, port):
-    """Elimina el policing de ingress, devolviendo el puerto a estado libre."""
+def remove_policing(ssh, port, protocol=None):
+    """Elimina el policing de ingress (port-wide o por protocolo)."""
+    # `tc qdisc del ... ingress` borra todos los filtros u32 colgados de él, así
+    # que el caso protocol-aware y el port-wide convergen aquí.
     send_tmux_command(ssh, f"sh tc qdisc del dev {port} ingress 2>/dev/null; true")
     time.sleep(0.2)
-    print(f"  [OK] DESESCALADO POLICING → {port}: restricción de ingress eliminada")
+    scope = f"({protocol})" if protocol else ""
+    print(f"  [OK] DESESCALADO POLICING {scope} → {port}: restricción de ingress eliminada")
 
 
-def remove_shaping(ssh, port):
-    """Elimina el shaping de egress, devolviendo el puerto a estado libre."""
+def remove_shaping(ssh, port, protocol=None):
+    """Elimina el shaping de egress (port-wide o por protocolo)."""
     send_tmux_command(ssh, f"sh tc qdisc del dev {port} root 2>/dev/null; true")
     time.sleep(0.2)
-    print(f"  [OK] DESESCALADO SHAPING → {port}: restricción de egress eliminada")
+    scope = f"({protocol})" if protocol else ""
+    print(f"  [OK] DESESCALADO SHAPING {scope} → {port}: restricción de egress eliminada")
 
 
-def remove_block(ssh, port):
+def remove_block(ssh, port, protocol=None):
     """
-    Elimina el bloqueo OpenFlow de alta prioridad y el tc ingress block.
-    Permite que el controlador re-instale las reglas de reenvío normales.
+    Elimina el bloqueo OpenFlow + tc ingress block.
+
+    Si `protocol` está presente sólo elimina el flow que matchea ese protocolo
+    en ese puerto (deja intactos otros bloqueos); en port-wide barre todo el
+    in_port + tc ingress.
     """
     bridge = port.split("-")[0]
+    if protocol:
+        of_match = _of_proto_match(protocol)
+        if of_match:
+            send_tmux_command(
+                ssh,
+                f"sh ovs-ofctl del-flows {bridge} 'in_port={port},{of_match}' 2>/dev/null; true",
+            )
+            time.sleep(0.2)
+            print(f"  [OK] DESESCALADO BLOCK ({protocol}) → {port}: flow OpenFlow eliminado")
+            return
     send_tmux_command(
         ssh,
         f"sh ovs-ofctl del-flows {bridge} in_port={port} 2>/dev/null; true",
@@ -78,50 +123,102 @@ def remove_block(ssh, port):
     print(f"  [OK] DESESCALADO BLOCK → {port}: flujo OpenFlow DROP eliminado + tc block eliminado")
 
 
-def apply_policing(ssh, port, rate_mbps=20):
-    """
-    Limita ingress con tc ingress police.
-    Los paquetes excedentes se dropean ANTES de que entren al datapath OVS,
-    por lo que no se contabilizan en rx_bytes de dpctl dump-ports.
+def apply_policing(ssh, port, rate_mbps=20, protocol=None):
+    """Policing ingress (port-wide o limitado al protocolo indicado).
+
+    Si protocol está presente usa un filtro u32 que matchea (ip_proto, dport) y
+    deja el resto del tráfico sin tocar — limita solo a ese servicio.
     """
     send_tmux_command(ssh, f"sh tc qdisc del dev {port} ingress 2>/dev/null; true")
     time.sleep(0.2)
     send_tmux_command(ssh, f"sh tc qdisc add dev {port} handle ffff: ingress")
     time.sleep(0.1)
-    send_tmux_command(
-        ssh,
-        f"sh tc filter add dev {port} parent ffff: protocol all u32 match u32 0 0 "
-        f"police rate {rate_mbps}mbit burst 64k drop flowid :1",
-    )
-    print(f"  [OK] POLICING → {port}: {rate_mbps} Mbps ingress (tc police, pre-OVS)")
+
+    match = _tc_proto_match(protocol) if protocol else None
+    if match:
+        send_tmux_command(
+            ssh,
+            f"sh tc filter add dev {port} parent ffff: protocol ip prio 1 u32 "
+            f"{match} police rate {rate_mbps}mbit burst 64k drop flowid :1",
+        )
+        print(f"  [OK] POLICING ({protocol}) → {port}: {rate_mbps} Mbps ingress")
+    else:
+        send_tmux_command(
+            ssh,
+            f"sh tc filter add dev {port} parent ffff: protocol all u32 match u32 0 0 "
+            f"police rate {rate_mbps}mbit burst 64k drop flowid :1",
+        )
+        print(f"  [OK] POLICING → {port}: {rate_mbps} Mbps ingress (tc police, pre-OVS)")
 
 
-def apply_shaping(ssh, port, rate_mbps=20):
-    """Limita egress con tc TBF (Token Bucket Filter). burst=64kb para tolerar ráfagas legítimas."""
+def apply_shaping(ssh, port, rate_mbps=20, protocol=None):
+    """Shaping egress.
+
+    - Sin protocol → tc TBF clásico sobre todo el tráfico saliente.
+    - Con protocol → HTB con dos clases: 1:10 limitada a rate_mbps (el filtro
+      u32 envía ahí solo el tráfico del servicio) y 1:30 ilimitada (default).
+    """
     send_tmux_command(ssh, f"sh tc qdisc del dev {port} root 2>/dev/null; true")
     time.sleep(0.2)
-    send_tmux_command(
-        ssh,
-        f"sh tc qdisc add dev {port} root tbf rate {rate_mbps}mbit burst 64kb latency 200ms",
-    )
-    print(f"  [OK] SHAPING → {port}: {rate_mbps} Mbps egress (tc tbf)")
+
+    match = _tc_proto_match(protocol) if protocol else None
+    if match:
+        send_tmux_command(
+            ssh, f"sh tc qdisc add dev {port} root handle 1: htb default 30"
+        )
+        time.sleep(0.1)
+        send_tmux_command(
+            ssh,
+            f"sh tc class add dev {port} parent 1: classid 1:10 htb "
+            f"rate {rate_mbps}mbit ceil {rate_mbps}mbit",
+        )
+        time.sleep(0.1)
+        send_tmux_command(
+            ssh,
+            f"sh tc class add dev {port} parent 1: classid 1:30 htb "
+            f"rate 1000mbit ceil 1000mbit",
+        )
+        time.sleep(0.1)
+        send_tmux_command(
+            ssh,
+            f"sh tc filter add dev {port} parent 1: protocol ip prio 1 u32 "
+            f"{match} flowid 1:10",
+        )
+        print(f"  [OK] SHAPING ({protocol}) → {port}: {rate_mbps} Mbps egress (htb+u32)")
+    else:
+        send_tmux_command(
+            ssh,
+            f"sh tc qdisc add dev {port} root tbf rate {rate_mbps}mbit burst 64kb latency 200ms",
+        )
+        print(f"  [OK] SHAPING → {port}: {rate_mbps} Mbps egress (tc tbf)")
 
 
-def block_port(ssh, port):
+def block_port(ssh, port, protocol=None):
     """
-    Bloqueo de seguridad en dos capas:
-    1. OpenFlow DROP de alta prioridad (SDN nativo, el tráfico no se reenvía).
-    2. tc ingress total block (rate=1kbit) para que los bytes no lleguen al contador OVS.
-    El bridge se deriva del nombre del puerto: s1-eth2 → s1.
+    Bloqueo de seguridad.
+
+    - Sin protocol → OpenFlow DROP all in_port + tc ingress total block (kbit).
+    - Con protocol → un único flujo OpenFlow DROP scoped por (in_port, proto, dport);
+      el resto del tráfico sigue circulando.
     """
     bridge = port.split("-")[0]
+
+    of_match = _of_proto_match(protocol) if protocol else None
+    if of_match:
+        send_tmux_command(
+            ssh,
+            f"sh ovs-ofctl add-flow {bridge} priority=200,"
+            f"in_port={port},{of_match},actions=drop",
+        )
+        time.sleep(0.2)
+        print(f"  [OK] BLOCK ({protocol}) → {port}: OpenFlow DROP ({of_match})")
+        return
 
     send_tmux_command(
         ssh,
         f"sh ovs-ofctl add-flow {bridge} priority=200,in_port={port},actions=drop",
     )
     time.sleep(0.2)
-
     send_tmux_command(ssh, f"sh tc qdisc del dev {port} ingress 2>/dev/null; true")
     time.sleep(0.1)
     send_tmux_command(ssh, f"sh tc qdisc add dev {port} handle ffff: ingress")
@@ -142,10 +239,13 @@ def run_desescalado(ports_to_relax):
     """
     Desescala las restricciones de los puertos cuyo tráfico ha vuelto a la normalidad.
 
-    ports_to_relax: dict {port → current_action_str}
+    ports_to_relax: dict {port → current_action_str | {"action": ..., "protocol": ...}}
     Devuelve: dict {port → new_action_or_None}
       None  → sin restricción activa
       str   → nuevo nivel aplicado (SHAPING o POLICING)
+
+    Acepta tanto el formato antiguo (action str) como el nuevo (dict con
+    protocolo) para no romper llamadas existentes.
     """
     if not ports_to_relax:
         return {}
@@ -156,26 +256,31 @@ def run_desescalado(ports_to_relax):
     try:
         ssh = get_ssh_connection()
 
-        for port, current_action in ports_to_relax.items():
+        for port, current in ports_to_relax.items():
+            if isinstance(current, dict):
+                current_action = current.get("action")
+                protocol       = current.get("protocol")
+            else:
+                current_action = current
+                protocol       = None
             nuevo_nivel = RELAXATION.get(current_action)
+            scope = f" [proto={protocol}]" if protocol else ""
             print(
-                f"\n  --- DESESCALAR {port}: {current_action} → "
+                f"\n  --- DESESCALAR {port}{scope}: {current_action} → "
                 f"{nuevo_nivel if nuevo_nivel else 'SIN RESTRICCIÓN'} ---"
             )
 
-            # Eliminar la restricción actual
             if current_action == "BLOCK":
-                remove_block(ssh, port)
+                remove_block(ssh, port, protocol=protocol)
             elif current_action == "SHAPING":
-                remove_shaping(ssh, port)
+                remove_shaping(ssh, port, protocol=protocol)
             elif current_action == "POLICING":
-                remove_policing(ssh, port)
+                remove_policing(ssh, port, protocol=protocol)
 
-            # Aplicar el nivel inferior si corresponde
             if nuevo_nivel == "SHAPING":
-                apply_shaping(ssh, port, rate_mbps=config.TASA_POLICING_MBPS)
+                apply_shaping(ssh, port, rate_mbps=config.TASA_POLICING_MBPS, protocol=protocol)
             elif nuevo_nivel == "POLICING":
-                apply_policing(ssh, port, rate_mbps=config.TASA_POLICING_MBPS)
+                apply_policing(ssh, port, rate_mbps=config.TASA_POLICING_MBPS, protocol=protocol)
 
             resultado[port] = nuevo_nivel
 
@@ -214,19 +319,25 @@ def resolve_multiple(actions_list):
             port = item.get("target_port", "")
             rate = int(item.get("rate_mbps", 20))
             reason = item.get("reason", "Automático")
+            protocol = item.get("protocol")
+            if protocol and protocol not in config.SERVICE_DEFS:
+                # Protocolo desconocido → descartamos el scope (acción port-wide).
+                print(f"  [WARN] protocolo '{protocol}' no reconocido — aplicando port-wide.")
+                protocol = None
 
-            print(f"\n  --- {action} | puerto: {port} | motivo: {reason} ---")
+            scope = f" [proto={protocol}]" if protocol else ""
+            print(f"\n  --- {action}{scope} | puerto: {port} | motivo: {reason} ---")
 
             if not port or port.upper() == "LOCAL":
                 print("  [SKIP] Puerto inválido o LOCAL, ignorado.")
                 continue
 
             if action == "POLICING":
-                apply_policing(ssh, port, rate)
+                apply_policing(ssh, port, rate, protocol=protocol)
             elif action == "SHAPING":
-                apply_shaping(ssh, port, rate)
+                apply_shaping(ssh, port, rate, protocol=protocol)
             elif action == "BLOCK":
-                block_port(ssh, port)
+                block_port(ssh, port, protocol=protocol)
             else:
                 print(f"  [WARN] Acción desconocida '{action}', ignorada.")
 
@@ -240,62 +351,74 @@ def resolve_multiple(actions_list):
 # === AGENTE DE DECISIÓN (LLM con Tool Calling multi-acción) ==
 # =============================================================
 
+def _extract_proto(line):
+    """Lee la cláusula '[proto=<svc>]' añadida por monitor_agent._format_anomaly_lines.
+
+    Devuelve el nombre del servicio si está presente, None en caso contrario.
+    """
+    m = re.search(r"\[proto=([a-z_]+)\]", line)
+    return m.group(1) if m else None
+
+
 def _parse_alerts(raw_telemetry):
     """
-    Extrae alertas estructuradas (puerto, categoría, severidad) del texto crudo de telemetría.
-    Devuelve lista ordenada por severidad descendente, sin duplicados por puerto.
+    Extrae alertas estructuradas (puerto, categoría, severidad, protocolo) del texto
+    crudo de telemetría. Devuelve lista ordenada por severidad desc, sin duplicados.
     """
     if not raw_telemetry:
         return []
 
     alerts = []
 
-    # [ALERTA ROJA]: pérdidas. El drop_delta da el peso fino.
-    for m in re.finditer(
-        r"\[ALERTA ROJA\].*?Port\s+(s\d+-eth\d+):.*?drop_delta=(\d+)",
-        raw_telemetry,
-    ):
-        alerts.append({
-            "port":     m.group(1),
-            "category": "ALERTA ROJA",
-            "metric":   int(m.group(2)),
-            "severity": _CATEGORY_WEIGHT["ALERTA ROJA"] + int(m.group(2)),
-        })
+    for line in raw_telemetry.split("\n"):
+        proto = _extract_proto(line)
 
-    # [ESCANEO]: port scan. Peso fijo (la severidad real está en el nº de destinos).
-    for m in re.finditer(r"\[ESCANEO\].*?Port\s+(s\d+-eth\d+):", raw_telemetry):
-        alerts.append({
-            "port":     m.group(1),
-            "category": "ESCANEO",
-            "metric":   0,
-            "severity": _CATEGORY_WEIGHT["ESCANEO"],
-        })
+        m = re.search(r"\[ALERTA ROJA\].*?Port\s+(s\d+-eth\d+):.*?drop_delta=(\d+)", line)
+        if m:
+            alerts.append({
+                "port":     m.group(1),
+                "category": "ALERTA ROJA",
+                "metric":   int(m.group(2)),
+                "protocol": proto,
+                "severity": _CATEGORY_WEIGHT["ALERTA ROJA"] + int(m.group(2)),
+            })
+            continue
 
-    # [DDoS]: ataque coordinado. Peso = MB combinados.
-    for m in re.finditer(
-        r"\[DDoS\].*?Port\s+(s\d+-eth\d+):.*?([\d.]+)\s*MB\s*combinados",
-        raw_telemetry,
-    ):
-        mb = float(m.group(2))
-        alerts.append({
-            "port":     m.group(1),
-            "category": "DDoS",
-            "metric":   mb,
-            "severity": _CATEGORY_WEIGHT["DDoS"] + mb,
-        })
+        m = re.search(r"\[ESCANEO\].*?Port\s+(s\d+-eth\d+):", line)
+        if m:
+            # port_scan: protocolo no aplicable (muchos destinos heterogéneos)
+            alerts.append({
+                "port":     m.group(1),
+                "category": "ESCANEO",
+                "metric":   0,
+                "protocol": None,
+                "severity": _CATEGORY_WEIGHT["ESCANEO"],
+            })
+            continue
 
-    # [DoS]: flujo volumétrico unitario. Peso = MB del flujo.
-    for m in re.finditer(
-        r"\[DoS\].*?Port\s+(s\d+-eth\d+):.*?\(([\d.]+)\s*MB\)",
-        raw_telemetry,
-    ):
-        mb = float(m.group(2))
-        alerts.append({
-            "port":     m.group(1),
-            "category": "DoS",
-            "metric":   mb,
-            "severity": _CATEGORY_WEIGHT["DoS"] + mb,
-        })
+        m = re.search(r"\[DDoS\].*?Port\s+(s\d+-eth\d+):.*?([\d.]+)\s*MB\s*combinados", line)
+        if m:
+            mb = float(m.group(2))
+            alerts.append({
+                "port":     m.group(1),
+                "category": "DDoS",
+                "metric":   mb,
+                "protocol": proto,
+                "severity": _CATEGORY_WEIGHT["DDoS"] + mb,
+            })
+            continue
+
+        m = re.search(r"\[DoS\].*?Port\s+(s\d+-eth\d+):.*?\(([\d.]+)\s*MB\)", line)
+        if m:
+            mb = float(m.group(2))
+            alerts.append({
+                "port":     m.group(1),
+                "category": "DoS",
+                "metric":   mb,
+                "protocol": proto,
+                "severity": _CATEGORY_WEIGHT["DoS"] + mb,
+            })
+            continue
 
     # Deduplicar por puerto, conservando la categoría de mayor severidad.
     by_port = {}
@@ -310,9 +433,12 @@ def _default_action(alert, reglas_activas):
     """
     Decisión determinista para una alerta delegada (fuera del top-K del LLM).
     Aplica la política base y escala si el puerto ya tenía mitigación activa.
+
+    Si la alerta lleva 'protocol', la acción se scopa a ese servicio.
     """
     cat  = alert["category"]
     port = alert["port"]
+    proto = alert.get("protocol")
     base = DEFAULT_POLICY.get(cat, "POLICING")
 
     # Si la acción propuesta coincide con la ya activa, hay que escalar.
@@ -321,12 +447,19 @@ def _default_action(alert, reglas_activas):
         if base == previa:
             base = ESCALATION.get(previa, "BLOCK")
 
-    return {
+    reason = (
+        f"Política por defecto ({cat}{' '+proto if proto else ''} → {base}, "
+        f"severidad {alert['metric']:.1f})"
+    )
+    out = {
         "action":      base,
         "target_port": port,
         "rate_mbps":   config.TASA_POLICING_MBPS,
-        "reason":      f"Política por defecto ({cat} → {base}, severidad {alert['metric']:.1f})",
+        "reason":      reason,
     }
+    if proto:
+        out["protocol"] = proto
+    return out
 
 
 def fast_decide(raw_telemetry, reglas_activas=None):
@@ -375,10 +508,11 @@ def analyze_and_decide(report_text, raw_telemetry=None, reglas_activas=None):
         return default_actions or [{"action": "NO_ACTION"}]
 
     # --- Enumeración 1:1 para el LLM, ahora solo sobre top-K ---
-    enum_lines = "\n".join(
-        f"  {i+1}. {a['port']} [{a['category']}, severidad {a['metric']:.1f}]"
-        for i, a in enumerate(top_k)
-    )
+    def _enum_line(i, a):
+        scope = f", proto={a['protocol']}" if a.get("protocol") else ""
+        return f"  {i+1}. {a['port']} [{a['category']}{scope}, severidad {a['metric']:.1f}]"
+
+    enum_lines = "\n".join(_enum_line(i, a) for i, a in enumerate(top_k))
     enum_ctx = (
         f"PUERTOS EN ALERTA (TOP-{len(top_k)} más críticos, MAPEO 1:1 OBLIGATORIO):\n{enum_lines}\n"
         f"TOTAL: {len(top_k)} puertos. "
@@ -414,6 +548,10 @@ def analyze_and_decide(report_text, raw_telemetry=None, reglas_activas=None):
         "dropea en ingress, más agresivo pero más eficiente.\n"
         "5. Usa BLOCK para [ESCANEO] (port scan: cortar el origen) y como escalado final tras POLICING.\n"
         "6. NUNCA actúes sobre puertos 'LOCAL'. Formato obligatorio: sX-ethY (ej: s1-eth2).\n"
+        "7. PROTOCOLO: si la alerta indica '[proto=<svc>]' (ej: [proto=dns]) propaga el campo "
+        "'protocol' en tu acción para que la mitigación se limite a ese servicio en lugar de "
+        "todo el puerto. Valores válidos: http, https, http_alt, dns, ssh, sip, ftp, smtp, icmp. "
+        "Omite 'protocol' si la alerta no especifica uno.\n"
         "Siempre invoca la herramienta. Nunca respondas con texto plano."
     )
 
@@ -456,6 +594,18 @@ def analyze_and_decide(report_text, raw_telemetry=None, reglas_activas=None):
                                     "rate_mbps": {
                                         "type": "integer",
                                         "description": "Límite en Mbps para POLICING/SHAPING. Por defecto 20.",
+                                    },
+                                    "protocol": {
+                                        "type": "string",
+                                        "enum": [
+                                            "http", "https", "http_alt",
+                                            "dns", "ssh", "sip",
+                                            "ftp", "smtp", "icmp",
+                                        ],
+                                        "description": (
+                                            "Opcional. Limita la acción a un protocolo concreto "
+                                            "(ej. 'dns' bloquea solo UDP/53). Omitir = todo el tráfico."
+                                        ),
                                     },
                                     "reason": {
                                         "type": "string",

@@ -197,27 +197,32 @@ def detect_flow_anomalies(flows, host_port):
         except (json.JSONDecodeError, IOError):
             pass
 
-    fan_out_dsts  = {}   # src_ip → set(dst_ip)
-    fan_in_srcs   = {}   # dst_ip → set(src_ip)
-    fan_in_bytes  = {}   # dst_ip → total bytes
-    surge_flows   = []   # [(src, dst, bytes, pkts), ...]
+    fan_out_dsts   = {}   # src_ip → set(dst_ip)
+    fan_in_srcs    = {}   # dst_ip → set(src_ip)
+    fan_in_bytes   = {}   # dst_ip → total bytes
+    fan_in_by_svc  = {}   # dst_ip → {service: bytes}  para identificar protocolo dominante
+    surge_flows    = []   # [(src, dst, bytes, pkts, service), ...]
 
     for f in flows:
-        src = f.get("src", "")
-        dst = f.get("dst", "")
-        b   = f.get("bytes", 0)
-        pkts= f.get("pkts", 0)
+        src   = f.get("src", "")
+        dst   = f.get("dst", "")
+        b     = f.get("bytes", 0)
+        pkts  = f.get("pkts", 0)
+        proto = f.get("proto")
+        dport = f.get("dport")
+        svc   = _proto_to_service(proto, dport)
+
         fan_out_dsts.setdefault(src, set()).add(dst)
         fan_in_srcs.setdefault(dst, set()).add(src)
         fan_in_bytes[dst] = fan_in_bytes.get(dst, 0) + b
+        if svc:
+            fan_in_by_svc.setdefault(dst, {})
+            fan_in_by_svc[dst][svc] = fan_in_by_svc[dst].get(svc, 0) + b
+
         # Umbral plano: SURGE detecta un flujo único anómalo 1→1, así que el rol
-        # del puerto-origen no debe inflar el umbral. Un servidor "atacando" a
-        # un host con 150 Mbps sostenidos sigue siendo DoS volumétrico,
-        # independientemente de que el servidor sirva legítimamente a varios
-        # clientes en paralelo (eso lo cubre el filtro por rol del agregado RX,
-        # no este detector de flujo individual).
+        # del puerto-origen no debe inflar el umbral.
         if b >= config.SURGE_BYTES_THRESHOLD:
-            surge_flows.append((src, dst, b, pkts))
+            surge_flows.append((src, dst, b, pkts, svc))
 
     alerts = []
     ts = datetime.now().isoformat(timespec="seconds")
@@ -238,12 +243,19 @@ def detect_flow_anomalies(flows, host_port):
             # Filtro de FP estructural: un servidor responde a sus clientes, no escanea.
             if _port_role(src_port) == "server":
                 continue
+            # Filtro multi-subnet: un scan REAL cruza redes (DMZ + corporativa).
+            # Si todos los destinos están en ≤1 subred /24 es tráfico legítimo
+            # a un grupo de servidores cercanos, no un barrido.
+            subnets = {d.rsplit(".", 1)[0] for d in dsts}
+            if len(subnets) < config.FAN_OUT_SUBNETS_THRESHOLD:
+                continue
             alerts.append({
                 "type":    "port_scan",
                 "host":    host,
                 "host_ip": src_ip,
                 "port":    src_port,
                 "dsts":    len(dsts),
+                "subnets": len(subnets),
                 "ts":      ts,
             })
 
@@ -258,6 +270,9 @@ def detect_flow_anomalies(flows, host_port):
             if (len(srcs) >= config.FAN_IN_THRESHOLD
                     and fan_in_bytes.get(dst_ip, 0) >= fanin_floor):
                 ddos_victim_ips.add(dst_ip)
+                # Servicio dominante hacia la víctima — el que acumula más bytes.
+                by_svc = fan_in_by_svc.get(dst_ip) or {}
+                dom_svc = max(by_svc, key=by_svc.get) if by_svc else None
                 alerts.append({
                     "type":    "ddos",
                     "host":    victim_host,
@@ -265,11 +280,12 @@ def detect_flow_anomalies(flows, host_port):
                     "port":    victim_port,
                     "srcs":    len(srcs),
                     "bytes":   fan_in_bytes[dst_ip],
+                    "service": dom_svc,
                     "ts":      ts,
                 })
 
     if "dos_volumetric" in _ACTIVE_ATTACKS:
-        for src_ip, dst_ip, b, pkts in surge_flows:
+        for src_ip, dst_ip, b, pkts, svc in surge_flows:
             if dst_ip in ddos_victim_ips:
                 continue  # already counted as DDoS target, skip individual DoS
             src_host = ip_to_name.get(src_ip, src_ip)
@@ -283,14 +299,30 @@ def detect_flow_anomalies(flows, host_port):
                 "victim_ip":dst_ip,
                 "bytes":    b,
                 "pkts":     pkts,
+                "service":  svc,
                 "ts":       ts,
             })
 
     return alerts
 
 
+def _proto_to_service(ip_proto, dport):
+    """Devuelve el nombre del servicio cuyo (ip_proto, dport) encaje. None si desconocido."""
+    if ip_proto is None or dport is None:
+        return None
+    for name, defn in config.SERVICE_DEFS.items():
+        if defn["ip_proto"] == ip_proto and defn["dport"] == dport:
+            return name
+    return None
+
+
 def _format_anomaly_lines(alerts):
-    """Convierte alertas a líneas con formato 'Port sX-ethY: ...' para que el resolver las capture."""
+    """Convierte alertas a líneas con formato 'Port sX-ethY: ...' para que el resolver las capture.
+
+    Si la alerta lleva 'service' (DDoS/DoS con dominio claro), añadimos una
+    cláusula '[proto=<svc>]' al final — _parse_alerts la captura para que
+    fast_decide/LLM puedan emitir QoS scopeada al protocolo.
+    """
     lines = []
     for a in alerts:
         port = a.get("port") or "s?-eth?"
@@ -305,6 +337,8 @@ def _format_anomaly_lines(alerts):
                     f"({format_bytes(a['bytes'])}) [flujo volumétrico anómalo]")
         else:
             continue
+        if a.get("service"):
+            line += f" [proto={a['service']}]"
         lines.append(line)
     return lines
 
@@ -319,7 +353,12 @@ def format_bytes(size):
 
 
 def parse_telemetry_to_dict(raw_output):
-    """Convierte el texto sucio de dpctl en un diccionario estructurado, ignorando puertos inútiles."""
+    """Convierte el texto sucio de dpctl en un diccionario estructurado, ignorando puertos inútiles.
+
+    NOTA: ya NO se usa por defecto en collect_telemetry (que ahora va vía OVS
+    directo, ver collect_port_stats_via_ovs). Se conserva por compatibilidad
+    con tests/probes y para fallback.
+    """
     stats = {}
     current_port = None
 
@@ -364,6 +403,65 @@ def parse_telemetry_to_dict(raw_output):
     return stats
 
 
+def collect_port_stats_via_ovs(ssh):
+    """Lee rx/tx/drop por puerto OVS directamente vía SSH (sin tmux).
+
+    Mucho más fiable que `dpctl dump-ports` + tmux capture-pane: una sola
+    llamada SSH a `ovs-vsctl --columns=name,statistics list interface`
+    devuelve todas las interfaces en formato parseable.
+
+    Devuelve dict {port_name: {rx_bytes, tx_bytes, drop}} solo con puertos
+    sX-ethY (ignora interfaces internas tipo LOCAL o los uplinks de host).
+    """
+    _, stdout, _ = ssh.exec_command(
+        "sudo ovs-vsctl --columns=name,statistics list interface 2>/dev/null",
+        timeout=10,
+    )
+    raw = stdout.read().decode("utf-8", errors="replace")
+    return _parse_ovs_interface_stats(raw)
+
+
+# Forma típica de cada registro en la salida de ovs-vsctl:
+#   name                : "s1-eth1"
+#   statistics          : {collisions=0, rx_bytes=1234, rx_dropped=0,
+#                          rx_errors=0, rx_packets=12, tx_bytes=5678, ...}
+_PORT_NAME_RE = re.compile(r'^\s*name\s*:\s*"?([A-Za-z0-9_-]+)"?\s*$')
+_STATS_LINE_RE = re.compile(r"^\s*statistics\s*:\s*\{([^}]*)\}\s*$")
+_KV_RE = re.compile(r"(\w+)\s*=\s*(-?\d+)")
+
+
+def _parse_ovs_interface_stats(raw_output):
+    """Parser de la salida de `ovs-vsctl --columns=name,statistics list interface`."""
+    stats = {}
+    cur_name = None
+    for line in raw_output.split("\n"):
+        m = _PORT_NAME_RE.match(line)
+        if m:
+            name = m.group(1)
+            # Solo interfaces OVS estándar: sX-ethY. Ignoramos interfaces
+            # locales tipo "s1", "br0", etc.
+            if re.match(r"^s\d+-eth\d+$", name):
+                cur_name = name
+            else:
+                cur_name = None
+            continue
+
+        m = _STATS_LINE_RE.match(line)
+        if m and cur_name:
+            kvs = dict(_KV_RE.findall(m.group(1)))
+            rx_bytes = int(kvs.get("rx_bytes",   0))
+            tx_bytes = int(kvs.get("tx_bytes",   0))
+            rx_drop  = int(kvs.get("rx_dropped", 0))
+            tx_drop  = int(kvs.get("tx_dropped", 0))
+            stats[cur_name] = {
+                "rx_bytes": max(0, rx_bytes),
+                "tx_bytes": max(0, tx_bytes),
+                "drop":     max(0, rx_drop + tx_drop),
+            }
+            cur_name = None
+    return stats
+
+
 def calculate_delta(current_stats):
     """Calcula la diferencia entre los datos actuales y los guardados."""
     delta_stats = {}
@@ -401,13 +499,16 @@ def collect_telemetry():
     print("\n[SENSOR] Recolectando telemetría en tiempo real (Modo Delta)...")
     try:
         ssh = get_ssh_connection()
-        send_tmux_command(ssh, "dpctl dump-ports")
-        wait_for_mininet_prompt(ssh, timeout=15)
-        raw_output = capture_tmux_output(ssh)
+        # ── Recolección directa vía OVS ─────────────────────────────────────
+        # Antes mandábamos `dpctl dump-ports` a tmux y esperábamos el prompt
+        # mininet>. Cuando el pane tenía mucho ruido la espera hacía timeout y
+        # las métricas quedaban vacías. Ahora vamos directos a ovs-vsctl por
+        # SSH: una sola llamada que devuelve todas las interfaces parseadas.
+        current_data = collect_port_stats_via_ovs(ssh)
+        # raw_output lo necesitamos sólo para sacar el "Results:" de pingall
+        # (que ya casi no usamos). Lo dejamos vacío si no se invoca tmux.
+        raw_output = ""
         ssh.close()
-
-        # 1. Convertir a datos numéricos
-        current_data = parse_telemetry_to_dict(raw_output)
 
         # 2. Calcular cuánto ha cambiado
         deltas = calculate_delta(current_data)

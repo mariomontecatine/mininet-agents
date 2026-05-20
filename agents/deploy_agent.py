@@ -20,6 +20,173 @@ from agents.topology import run_visualizer
 VM_PASSWORD = "mininet"
 MODEL_NAME = config.MODEL_DEPLOY
 
+TMP_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tmp")
+os.makedirs(TMP_DIR, exist_ok=True)
+SERVER_SERVICES_FILE = os.path.join(TMP_DIR, "server_services.json")
+
+# ── Lanzadores de servicio embebidos ────────────────────────────────────────
+# Se vuelcan en /tmp/service_launchers.py dentro de la VM al iniciarse la
+# topología. Cada servidor srv* invoca uno de ellos según su tipo asignado.
+# Sin dependencias externas: Python 3 estándar.
+_SERVICE_LAUNCHERS_PY = r'''"""Lanzadores de servicio para los servidores Mininet (sin dependencias externas)."""
+import sys, socket, struct, threading
+
+
+def serve_http():
+    import http.server, socketserver, os, secrets
+    # Servimos desde /tmp/web/ con un fichero de contenido para que el tráfico
+    # HTTP del simulador tenga volumen visible. Sin esto los wget reciben sólo
+    # el listado de directorio (~200 B) y el panel de protocolos no ve HTTP.
+    os.makedirs("/tmp/web", exist_ok=True)
+    page = "/tmp/web/page.bin"
+    if not os.path.exists(page):
+        with open(page, "wb") as f:
+            f.write(secrets.token_bytes(200 * 1024))   # 200 KB pseudo-random
+    os.chdir("/tmp/web")
+    socketserver.TCPServer.allow_reuse_address = True
+    with socketserver.TCPServer(("0.0.0.0", 80), http.server.SimpleHTTPRequestHandler) as srv:
+        srv.serve_forever()
+
+
+def serve_dns():
+    """Servidor DNS minimalista. Responde 1.2.3.4 a cualquier consulta tipo A."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(("0.0.0.0", 53))
+    while True:
+        try:
+            data, addr = s.recvfrom(512)
+            if len(data) < 12:
+                continue
+            txid = data[:2]
+            flags = b"\x81\x80"
+            qd = data[4:6]
+            an = b"\x00\x01"
+            ns = b"\x00\x00"
+            ar = b"\x00\x00"
+            header = txid + flags + qd + an + ns + ar
+            q_end = 12
+            while q_end < len(data) and data[q_end] != 0:
+                q_end += data[q_end] + 1
+            q_end += 5
+            question = data[12:q_end] if q_end <= len(data) else data[12:]
+            answer = b"\xc0\x0c\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04\x01\x02\x03\x04"
+            s.sendto(header + question + answer, addr)
+        except Exception:
+            pass
+
+
+def serve_sip():
+    """Servidor SIP minimalista. Responde 200 OK a OPTIONS/INVITE/REGISTER."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(("0.0.0.0", 5060))
+    while True:
+        try:
+            data, addr = s.recvfrom(4096)
+            head = data[:9].upper()
+            if (head.startswith(b"OPTIONS ") or head.startswith(b"INVITE ")
+                    or head.startswith(b"REGISTER")):
+                s.sendto(b"SIP/2.0 200 OK\r\nContent-Length: 0\r\n\r\n", addr)
+            else:
+                s.sendto(b"SIP/2.0 400 Bad Request\r\nContent-Length: 0\r\n\r\n", addr)
+        except Exception:
+            pass
+
+
+def _ssh_handle(c):
+    try:
+        c.sendall(b"SSH-2.0-OpenSSH_8.0p1 MininetSim\r\n")
+        c.settimeout(3)
+        try:
+            c.recv(4096)
+        except Exception:
+            pass
+    finally:
+        try:
+            c.close()
+        except Exception:
+            pass
+
+
+def serve_ssh():
+    """Listener SSH simulado. Emite banner válido y cierra la conexión."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(("0.0.0.0", 22))
+    s.listen(8)
+    while True:
+        try:
+            c, _ = s.accept()
+            threading.Thread(target=_ssh_handle, args=(c,), daemon=True).start()
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    handlers = {"http": serve_http, "dns": serve_dns, "sip": serve_sip, "ssh": serve_ssh}
+    fn = handlers.get(sys.argv[1] if len(sys.argv) > 1 else "http")
+    if fn is None:
+        sys.exit(1)
+    fn()
+'''
+
+
+def assign_server_types(intent):
+    """
+    Devuelve {srv_name: service_type} para el intent dado.
+
+    Prioridad: intent.server_types (si el LLM lo emitió) > rotación por defecto
+    (DEFAULT_SERVER_TYPE_ROTATION). En topologías estándar no hay srv* → {}.
+    """
+    if intent.get("tipo") != "custom":
+        return {}
+
+    servers = [s for s in intent.get("servers", []) if s.strip()]
+    if not servers:
+        return {}
+
+    user_assigned = intent.get("server_types") or {}
+    rotation = config.DEFAULT_SERVER_TYPE_ROTATION
+
+    def _srv_idx(name):
+        m = re.search(r"(\d+)", name)
+        return int(m.group(1)) if m else 0
+
+    ordered = sorted(servers, key=_srv_idx)
+    out = {}
+    auto_i = 0
+    for srv in ordered:
+        explicit = user_assigned.get(srv)
+        if explicit in config.SERVICE_DEFS:
+            out[srv] = explicit
+        else:
+            out[srv] = rotation[auto_i % len(rotation)]
+            auto_i += 1
+    return out
+
+
+def _persist_server_services(server_types, host_ips):
+    """Guarda tmp/server_services.json para traffic_agent y dashboard.
+
+    Estructura: {srv_name: {type, ip, port, transport}}.
+    """
+    services = {}
+    for srv, stype in server_types.items():
+        svc = config.SERVICE_DEFS.get(stype, config.SERVICE_DEFS["http"])
+        services[srv] = {
+            "type":      stype,
+            "ip":        host_ips.get(srv),
+            "port":      svc["dport"],
+            "transport": svc["transport"],
+        }
+    try:
+        with open(SERVER_SERVICES_FILE, "w", encoding="utf-8") as f:
+            json.dump(services, f, ensure_ascii=False, indent=2)
+    except IOError:
+        pass
+    return services
+
 # Timeout en segundos por llamada al LLM del deploy.
 # Si el modelo se atasca, cortamos y reintentamos en vez de colgar el supervisor.
 _DEPLOY_LLM_TIMEOUT = getattr(config, "DEPLOY_LLM_TIMEOUT", 90)
@@ -57,8 +224,11 @@ def generate_network_intent(user_prompt):
         "   - PROHIBIDO: [h1,srv1], [h1,h2], [srv1,srv2]. CORRECTO: [s1,h1], [s1,srv1].\n"
         "   OBLIGATORIO: el campo 'links' debe contener TODOS los enlaces. "
         "Sin links los nodos quedan aislados.\n"
+        "   OPCIONAL: el campo 'server_types' asigna un servicio a cada srv*. "
+        "Valores soportados: http, dns, ssh, sip. Si se omite se rota por defecto.\n"
         '   Ejemplo: {"tipo": "custom", "routers": ["r1"], "switches": ["s1", "s2"], '
-        '"servers": ["srv1"], "hosts": ["h1", "h2"], '
+        '"servers": ["srv1", "srv2"], "hosts": ["h1", "h2"], '
+        '"server_types": {"srv1": "http", "srv2": "dns"}, '
         '"links": [["r1", "s1"], ["r1", "s2"], ["s1", "h1"], ["s1", "h2"], ["s2", "srv1"]]}\n'
         "   Enumera TODOS los pares de conexión, uno por línea del array."
     )
@@ -95,6 +265,14 @@ def generate_network_intent(user_prompt):
                             "type": "array",
                             "description": "OBLIGATORIO en modo custom. Lista de todos los enlaces [[nodo1, nodo2], ...].",
                             "items": {"type": "array", "items": {"type": "string"}},
+                        },
+                        "server_types": {
+                            "type": "object",
+                            "description": (
+                                "Opcional. Mapeo srv_name → tipo de servicio "
+                                "(http, dns, ssh, sip). Si se omite se asigna por rotación."
+                            ),
+                            "additionalProperties": {"type": "string"},
                         },
                     },
                     "required": ["tipo"],
@@ -641,9 +819,25 @@ def build_python_script(intent_json):
                 )
 
         if servers:
+            # Asignación tipo de servicio por servidor + persistencia local.
+            server_types = assign_server_types(intent_json)
+            _persist_server_services(server_types, host_ips)
+
+            # Embebemos el script de lanzadores Python como literal repr() y lo
+            # escribimos en la VM antes de arrancar cada servicio. Sin ficheros
+            # adicionales por SFTP — todo viaja dentro de smart_topo.py.
+            script.append("    _LAUNCHERS = " + repr(_SERVICE_LAUNCHERS_PY))
+            script.append(
+                "    with open('/tmp/service_launchers.py', 'w', encoding='utf-8') as _lf:"
+            )
+            script.append("        _lf.write(_LAUNCHERS)")
+
             for srv in servers:
+                stype = server_types.get(srv, "http")
                 script.append(
-                    f"    net.get('{srv}').cmd('python3 -m http.server 80 > /dev/null 2>&1 &')"
+                    f"    net.get('{srv}').cmd("
+                    f"'python3 /tmp/service_launchers.py {stype} "
+                    f"> /tmp/svc_{srv}.log 2>&1 &')"
                 )
 
         script.extend(["    CLI(net)", "    net.stop()"])

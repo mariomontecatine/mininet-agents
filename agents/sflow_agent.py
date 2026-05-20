@@ -28,11 +28,23 @@ from collections import deque, defaultdict
 
 WINDOW_SEC = 20
 FLUSH_SEC  = 5
-TOP_N      = 50
+TOP_N      = 300   # margen para topologías grandes (14 hosts × 4 servicios +
+                   # responses + ICMP + ataques). Con menos, los flujos
+                   # pequeños del port_scan caen fuera del top-N.
 OUTPUT     = "/tmp/sflow_flows.json"
 
 def parse_sflow_v5(data):
-    """Devuelve [(src_ip, dst_ip, bytes_scaled), ...]."""
+    """Devuelve [(src_ip, dst_ip, ip_proto, svc_port, bytes_scaled), ...].
+
+    `svc_port` es el "puerto de servicio" del flujo: el menor de (sport, dport)
+    cuando ambos son no-cero. Esto agrega bidireccionalmente request+response
+    (h1:43210→srv:80 y srv:80→h1:43210 quedan ambos con svc_port=80) y evita
+    que hping3, que randomiza el sport por paquete, fragmente un ataque en
+    miles de flujos distintos en sFlow.
+
+    ip_proto sigue los números IANA (1=ICMP, 6=TCP, 17=UDP). Cuando el
+    protocolo no es TCP/UDP, svc_port=0.
+    """
     results = []
     if len(data) < 28:
         return results
@@ -93,7 +105,21 @@ def parse_sflow_v5(data):
                             if eth_type == 0x0800 and len(hdr) >= ip_off + 20:
                                 src = ".".join(str(b) for b in hdr[ip_off+12:ip_off+16])
                                 dst = ".".join(str(b) for b in hdr[ip_off+16:ip_off+20])
-                                results.append((src, dst, frame_len * sampling_rate))
+                                ip_proto = hdr[ip_off + 9]
+                                ihl = (hdr[ip_off] & 0x0F) * 4
+                                svc_port = 0
+                                if ip_proto in (6, 17) and len(hdr) >= ip_off + ihl + 4:
+                                    sport, dport = struct.unpack_from(
+                                        ">HH", hdr, ip_off + ihl
+                                    )
+                                    if sport and dport:
+                                        svc_port = sport if sport < dport else dport
+                                    else:
+                                        svc_port = sport or dport
+                                results.append(
+                                    (src, dst, ip_proto, svc_port,
+                                     frame_len * sampling_rate)
+                                )
                     pos = rec_end
             pos = sample_end
     except Exception:
@@ -131,8 +157,8 @@ while _running:
         data, _ = sock.recvfrom(65535)
         datagrams_total += 1
         now = time.time()
-        for src, dst, nbytes in parse_sflow_v5(data):
-            events.append((now, src, dst, nbytes))
+        for src, dst, proto, svc_port, nbytes in parse_sflow_v5(data):
+            events.append((now, src, dst, proto, svc_port, nbytes))
     except socket.timeout:
         pass
     except Exception:
@@ -145,32 +171,39 @@ while _running:
         while events and events[0][0] < cutoff:
             events.popleft()
 
+        # Agregamos por (src, dst, proto, svc_port). svc_port = puerto del
+        # servicio (well-known). Junta request+response y evita la fragmentación
+        # del flood hping3 (cuyo sport varía por paquete).
         live_bytes = defaultdict(int)
         live_pkts  = defaultdict(int)
-        # Delta: solo eventos desde last_flush_ts (no solapados)
         delta_bytes = defaultdict(int)
         delta_pkts  = defaultdict(int)
-        for ts, src, dst, b in events:
-            live_bytes[(src, dst)] += b
-            live_pkts[(src, dst)]  += 1
+        for ts, src, dst, proto, svc_port, b in events:
+            key = (src, dst, proto, svc_port)
+            live_bytes[key] += b
+            live_pkts[key]  += 1
             if ts >= last_flush_ts:
-                delta_bytes[(src, dst)] += b
-                delta_pkts[(src, dst)]  += 1
+                delta_bytes[key] += b
+                delta_pkts[key]  += 1
 
-        live_ranked = sorted(live_bytes.items(), key=lambda x: x[1], reverse=True)[:TOP_N]
+        live_ranked  = sorted(live_bytes.items(),  key=lambda x: x[1], reverse=True)[:TOP_N]
         delta_ranked = sorted(delta_bytes.items(), key=lambda x: x[1], reverse=True)[:TOP_N]
 
+        # Emitimos el svc_port como "dport" — formato compatible con el resto
+        # del sistema (monitor_agent._proto_to_service usa (proto, dport)).
         snapshot = {
             "ts":          time.strftime("%Y-%m-%dT%H:%M:%S"),
             "window_sec":  WINDOW_SEC,
             "delta_sec":   FLUSH_SEC,
             "datagrams":   datagrams_total,
             "flows": [
-                {"src": k[0], "dst": k[1], "bytes": v, "pkts": live_pkts[k]}
+                {"src": k[0], "dst": k[1], "proto": k[2], "dport": k[3],
+                 "bytes": v, "pkts": live_pkts[k]}
                 for k, v in live_ranked
             ],
             "delta_flows": [
-                {"src": k[0], "dst": k[1], "bytes": v, "pkts": delta_pkts[k]}
+                {"src": k[0], "dst": k[1], "proto": k[2], "dport": k[3],
+                 "bytes": v, "pkts": delta_pkts[k]}
                 for k, v in delta_ranked
             ],
         }

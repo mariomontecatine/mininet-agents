@@ -477,6 +477,45 @@
     </div>
   </div>
 
+  <!-- ROW 3c: servicios desplegados + tráfico por protocolo -->
+  <div class="row">
+    <div class="panel" style="flex:1">
+      <div class="panel-hd">
+        <span class="panel-title">Servicios desplegados</span>
+        <span class="panel-hint" id="services-hint">esperando datos…</span>
+      </div>
+      <div class="panel-body p0">
+        <table class="tt-table">
+          <thead><tr><th>Servidor</th><th>Tipo</th><th>IP : Puerto</th><th>Transport</th></tr></thead>
+          <tbody id="services-body">
+            <tr class="empty"><td colspan="4">Sin servicios registrados todavía…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+    <div class="panel" style="flex:1.2">
+      <div class="panel-hd">
+        <span class="panel-title">Tráfico por protocolo</span>
+        <span class="panel-hint" id="proto-hint">Últimos 5 min · agregado sFlow</span>
+        <div class="btn-group" style="margin-left:auto">
+          <button class="btn-tog active" id="pw-300" onclick="setProtoWindow(300)">5m</button>
+          <button class="btn-tog"        id="pw-900" onclick="setProtoWindow(900)">15m</button>
+          <button class="btn-tog"        id="pw-3600" onclick="setProtoWindow(3600)">1h</button>
+        </div>
+      </div>
+      <div class="panel-body">
+        <div class="chart-wrap" style="position:relative;height:200px">
+          <canvas id="chart-proto"></canvas>
+          <div id="proto-empty" style="display:none;position:absolute;inset:0;
+            align-items:center;justify-content:center;
+            color:var(--dim);font-size:11px;letter-spacing:.05em;text-transform:uppercase">
+            Sin tráfico clasificado aún
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <!-- ROW 4: tráfico histórico + drops -->
   <div class="row">
     <div class="panel" style="flex:2">
@@ -545,10 +584,10 @@
       <div class="panel-body p0" style="max-height:220px;overflow-y:auto">
         <table class="qos-table">
           <thead style="position:sticky;top:0;background:var(--panel);z-index:1">
-            <tr><th>Puerto</th><th>Acción</th><th>Ciclo</th></tr>
+            <tr><th>Puerto</th><th>Acción</th><th>Protocolo</th><th>Ciclo</th></tr>
           </thead>
           <tbody id="tabla-reglas">
-            <tr class="empty"><td colspan="3">Sin restricciones activas</td></tr>
+            <tr class="empty"><td colspan="4">Sin restricciones activas</td></tr>
           </tbody>
         </table>
       </div>
@@ -1153,10 +1192,17 @@ async function updateStatus() {
     document.getElementById('val-reglas').textContent = keys.length;
 
     document.getElementById('tabla-reglas').innerHTML = keys.length === 0
-      ? '<tr class="empty"><td colspan="3">Sin restricciones activas</td></tr>'
-      : keys.map(p => '<tr><td><code>' + p + '</code></td>'
-          + '<td>' + actionTag(reglas[p].action) + '</td>'
-          + '<td style="color:var(--muted)">' + reglas[p].ciclo + '</td></tr>').join('');
+      ? '<tr class="empty"><td colspan="4">Sin restricciones activas</td></tr>'
+      : keys.map(p => {
+          const proto = reglas[p].protocol;
+          const protoCell = proto
+            ? '<code style="color:var(--cyan)">' + escHtml(proto) + '</code>'
+            : '<span style="color:var(--dim)">todo el puerto</span>';
+          return '<tr><td><code>' + p + '</code></td>'
+            + '<td>' + actionTag(reglas[p].action) + '</td>'
+            + '<td>' + protoCell + '</td>'
+            + '<td style="color:var(--muted)">' + reglas[p].ciclo + '</td></tr>';
+        }).join('');
 
     renderLog(d.log_lines || []);
 
@@ -1836,7 +1882,8 @@ async function loadRun(name) {
     document.getElementById('topology-frame').style.display = 'none';
     document.getElementById('topology-frame').src = '';
     updateStatus(); updateLiveMetrics(); updateMetrics();
-    updateFlows(); updateSecurity(); updateQosTimeline(); pollTopology();
+    updateFlows(); updateSecurity(); updateQosTimeline();
+    updateServices(); updateProtoTraffic(); pollTopology();
   } catch (e) {
     alert('Error de red: ' + e);
   }
@@ -1853,7 +1900,8 @@ async function returnToLive() {
     document.getElementById('topology-frame').style.display = 'none';
     document.getElementById('topology-frame').src = '';
     updateStatus(); updateLiveMetrics(); updateMetrics();
-    updateFlows(); updateSecurity(); updateQosTimeline(); pollTopology();
+    updateFlows(); updateSecurity(); updateQosTimeline();
+    updateServices(); updateProtoTraffic(); pollTopology();
   } catch (_) {}
 }
 
@@ -1907,6 +1955,116 @@ document.addEventListener('keydown', (e) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
+// SERVICIOS DESPLEGADOS + TRÁFICO POR PROTOCOLO
+// ═══════════════════════════════════════════════════════════════════════════
+async function updateServices() {
+  try {
+    const data = await fetch('/api/services').then(r => r.json());
+    const names = Object.keys(data || {});
+    document.getElementById('services-hint').textContent =
+      names.length ? names.length + ' servidor(es)' : 'sin servidores';
+    const body = document.getElementById('services-body');
+    if (!names.length) {
+      body.innerHTML = '<tr class="empty"><td colspan="4">Sin servicios registrados todavía…</td></tr>';
+      return;
+    }
+    names.sort((a, b) => {
+      const ai = parseInt(a.replace(/\D/g, '')) || 0;
+      const bi = parseInt(b.replace(/\D/g, '')) || 0;
+      return ai - bi;
+    });
+    body.innerHTML = names.map(n => {
+      const s = data[n] || {};
+      return '<tr>'
+        + '<td><code>' + escHtml(n) + '</code></td>'
+        + '<td><span class="sec-type-tag">' + escHtml((s.type || '?').toUpperCase()) + '</span></td>'
+        + '<td><code>' + escHtml(s.ip || '?') + ':' + (s.port ?? '?') + '</code></td>'
+        + '<td style="color:var(--muted)">' + escHtml((s.transport || '?').toUpperCase()) + '</td>'
+        + '</tr>';
+    }).join('');
+  } catch (e) { console.warn('updateServices:', e); }
+}
+
+let _protoWindow = 300;
+let _protoChart  = null;
+const _PROTO_COLORS = {
+  http: '#5794f2', https: '#73bf69', dns: '#19d3c5', ssh: '#fade2a',
+  sip:  '#b877d9', ftp:  '#ff9830', smtp: '#ff5252', icmp: '#a0a0a0',
+  iperf_tcp:  '#7080a0', iperf_dos: '#f2495c', iperf_ddos: '#f2495c',
+  http_alt:   '#5794f2',
+};
+function _protoColor(name) {
+  if (_PROTO_COLORS[name]) return _PROTO_COLORS[name];
+  return '#6e7177';
+}
+function setProtoWindow(w) {
+  _protoWindow = w;
+  document.querySelectorAll('[id^=pw-]').forEach(b => b.classList.remove('active'));
+  const el = document.getElementById('pw-' + w);
+  if (el) el.classList.add('active');
+  updateProtoTraffic();
+}
+async function updateProtoTraffic() {
+  try {
+    const data = await fetch('/api/traffic-by-protocol?window=' + _protoWindow).then(r => r.json());
+    const totals = (data && data.totals) || [];
+    const empty  = document.getElementById('proto-empty');
+    const hint   = document.getElementById('proto-hint');
+    const minutes = Math.round((data.window_sec || _protoWindow) / 60);
+    hint.textContent = 'Últimos ' + minutes + ' min · agregado sFlow';
+
+    if (!totals.length) {
+      if (_protoChart) { _protoChart.destroy(); _protoChart = null; }
+      empty.style.display = 'flex';
+      return;
+    }
+    empty.style.display = 'none';
+
+    const labels = totals.map(t => t.service);
+    const bytes  = totals.map(t => t.bytes);
+    const colors = labels.map(_protoColor);
+    const ctx    = document.getElementById('chart-proto').getContext('2d');
+
+    if (_protoChart) {
+      _protoChart.data.labels = labels;
+      _protoChart.data.datasets[0].data = bytes;
+      _protoChart.data.datasets[0].backgroundColor = colors;
+      _protoChart.update('none');
+      return;
+    }
+    _protoChart = new Chart(ctx, {
+      type: 'bar',
+      data: {
+        labels,
+        datasets: [{
+          label: 'bytes', data: bytes, backgroundColor: colors,
+          borderRadius: 2, barThickness: 14,
+        }],
+      },
+      options: {
+        indexAxis: 'y',
+        responsive: true, maintainAspectRatio: false, animation: false,
+        plugins: {
+          legend: { display: false },
+          tooltip: {
+            callbacks: {
+              label: (ctx) => humanBytes(ctx.parsed.x) + ' (' +
+                              (totals[ctx.dataIndex].pkts || 0) + ' pkts)'
+            }
+          },
+        },
+        scales: {
+          x: { ticks: { color: '#8b949e', callback: v => humanBytes(v) },
+               grid:  { color: 'rgba(255,255,255,.04)' } },
+          y: { ticks: { color: '#d9d9d9', font: { size: 11 } },
+               grid:  { display: false } },
+        },
+      },
+    });
+  } catch (e) { console.warn('updateProtoTraffic:', e); }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // INIT
 // ═══════════════════════════════════════════════════════════════════════════
 updateStatus();
@@ -1915,6 +2073,8 @@ updateMetrics();
 updateFlows();
 updateSecurity();
 updateQosTimeline();
+updateServices();
+updateProtoTraffic();
 pollTopology();
 setInterval(updateStatus,       5000);
 setInterval(updateLiveMetrics,  4000);
@@ -1922,6 +2082,8 @@ setInterval(updateMetrics,     15000);
 setInterval(updateFlows,        5000);
 setInterval(updateSecurity,     5000);
 setInterval(updateQosTimeline, 15000);
+setInterval(updateServices,    20000);
+setInterval(updateProtoTraffic, 8000);
 setInterval(pollTopology,       3000);
 </script>
 </body>

@@ -33,8 +33,8 @@ DURACION_BULK = 35  # segundos de duración de cada ráfaga iperf
 ESPERA_POST_BULK = 25  # segundos de margen tras lanzar los clientes
 
 # --- Puertos estándar por servicio (referencia central) ---
-# Lo consultan traffic_agent (DNS sintético) y futuras herramientas QoS por
-# protocolo. No alteran ningún comportamiento existente.
+# Lo consultan traffic_agent (probes sintéticos) y las herramientas QoS por
+# protocolo (resolver_agent.apply_*).
 SERVICE_PORTS = {
     "http":     80,
     "https":    443,
@@ -44,10 +44,27 @@ SERVICE_PORTS = {
     "ftp":      21,
     "sip":      5060,
     "smtp":     25,
-    "iperf":    5002,   # tráfico legítimo iperf TCP
-    "iperf_dos":  5050, # canal de los DoS UDP
-    "iperf_ddos": 5055, # canal de los DDoS UDP
 }
+
+# --- Definición completa de cada servicio (para QoS por protocolo) ---
+# ip_proto sigue los números IANA (1=ICMP, 6=TCP, 17=UDP).
+# transport es la palabra clave OpenFlow ('tcp', 'udp', 'icmp').
+SERVICE_DEFS = {
+    "http":     {"ip_proto":  6, "dport":   80, "transport": "tcp"},
+    "http_alt": {"ip_proto":  6, "dport": 8080, "transport": "tcp"},
+    "https":    {"ip_proto":  6, "dport":  443, "transport": "tcp"},
+    "dns":      {"ip_proto": 17, "dport":   53, "transport": "udp"},
+    "ssh":      {"ip_proto":  6, "dport":   22, "transport": "tcp"},
+    "sip":      {"ip_proto": 17, "dport": 5060, "transport": "udp"},
+    "ftp":      {"ip_proto":  6, "dport":   21, "transport": "tcp"},
+    "smtp":     {"ip_proto":  6, "dport":   25, "transport": "tcp"},
+    "icmp":     {"ip_proto":  1, "dport": None, "transport": "icmp"},
+}
+
+# Asignación cíclica de tipos a srv1, srv2, srv3… cuando el intent no
+# especifica server_types explícitamente. Cubre los servicios "interesantes"
+# para demos de red empresarial / campus.
+DEFAULT_SERVER_TYPE_ROTATION = ("http", "dns", "ssh", "sip")
 
 # --- Auditoría / log ---
 LOG_MAX_BYTES = 1 * 1024 * 1024  # 1 MB por fichero antes de rotar
@@ -69,7 +86,16 @@ ANOMALY_COOLDOWN = 90  # tras un ataque, descanso antes de poder inyectar otro
 ANOMALY_RNG_SEED = None  # entero → resultados reproducibles; None → estocástico
 
 # Umbrales de las heurísticas de anomalía sobre flujos sFlow
-FAN_OUT_THRESHOLD = 5  # ≥N destinos distintos desde 1 origen → port scan
+FAN_OUT_THRESHOLD = 12  # ≥N destinos distintos desde 1 origen → port scan.
+# Subido de 5 a 12: con el nuevo fondo (HTTP + DNS + SSH + SIP + ICMP +
+# hping3-bg) cada host normal alcanza 6-8 destinos distintos en la ventana
+# sFlow de 20 s, lo que disparaba port_scan continuamente como FP. El ataque
+# real de port_scan barre 16 destinos → sigue cumpliendo el umbral con holgura.
+FAN_OUT_SUBNETS_THRESHOLD = 2  # ≥N subredes /24 distintas → confirma scan
+# Un escaneo real cruza subredes (h del lab → DMZ + corporativa); el tráfico
+# legítimo de un host suele quedarse en sus 1-2 subredes (su switch + DMZ).
+# Si fan_out alcanza el umbral pero todos los destinos están en ≤1 subred,
+# no es un scan — es un cliente con muchas conexiones a un grupo de servidores.
 FAN_IN_THRESHOLD = 5  # ≥N orígenes simultáneos hacia 1 destino → DDoS (5 para evitar FP de tráfico cliente→servidor legítimo)
 FAN_IN_BYTES_THRESHOLD = 50 * 1024 * 1024  # 50 MB combinados en ventana
 SURGE_BYTES_THRESHOLD = 120 * 1024 * 1024  # 120 MB en un solo flujo → DoS volumétrico

@@ -16,9 +16,7 @@ from utils.ssh_client import (
 
 TMP_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tmp")
 os.makedirs(TMP_DIR, exist_ok=True)
-
-# Puerto reservado para tráfico intra-subnet (evita conflicto con bulk en 5001)
-_INTRA_PORT = 5555
+SERVER_SERVICES_FILE = os.path.join(TMP_DIR, "server_services.json")
 
 
 def _group_by_subnet(endpoints):
@@ -29,6 +27,34 @@ def _group_by_subnet(endpoints):
             subnet = ".".join(ip.split(".")[:3])
             groups[subnet].append((name, ip))
     return dict(groups)
+
+
+def _load_server_services():
+    """Lee tmp/server_services.json (mapping srv→tipo) si existe.
+
+    Sin este fichero (despliegues legacy / topologías estándar sin srv*) se
+    asume que cualquier srv* es HTTP — mantiene el comportamiento previo.
+    """
+    import json as _json
+    if not os.path.exists(SERVER_SERVICES_FILE):
+        return {}
+    try:
+        with open(SERVER_SERVICES_FILE, encoding="utf-8") as f:
+            return _json.load(f)
+    except (_json.JSONDecodeError, IOError):
+        return {}
+
+
+def _partition_servers_by_type(servers, service_map):
+    """Devuelve {tipo: {srv_name: ip}}. Sin mapping, todos van a 'http'."""
+    out = {"http": {}, "dns": {}, "ssh": {}, "sip": {}}
+    for name, ip in servers.items():
+        info  = service_map.get(name)
+        stype = (info or {}).get("type", "http")
+        if stype not in out:
+            stype = "http"
+        out[stype][name] = ip
+    return out
 
 
 def launch_background_traffic(endpoints):
@@ -45,194 +71,132 @@ def launch_background_traffic(endpoints):
         print("[TRAFFIC] No se detectaron hosts. No se lanza tráfico.")
         return
 
-    print("\n[TRAFFIC] Iniciando tráfico continuo en background...")
-    print(f"  Servidores web (srv*): {list(servers.keys()) or 'ninguno'}")
-    print(f"  Clientes/hosts  (h*):  {list(hosts.keys()) or 'ninguno'}")
+    # Partición de servidores por tipo (http/dns/ssh/sip).
+    service_map = _load_server_services()
+    by_type     = _partition_servers_by_type(servers, service_map)
+    http_srvs   = by_type["http"]
+    dns_srvs    = by_type["dns"]
+    ssh_srvs    = by_type["ssh"]
+    sip_srvs    = by_type["sip"]
 
-    # Agrupar por subred para asignación inteligente de servidores
+    print("\n[TRAFFIC] Iniciando tráfico continuo en background...")
+    print(f"  Servidores (srv*): {list(servers.keys()) or 'ninguno'}")
+    if service_map:
+        print(f"  HTTP : {list(http_srvs)} · DNS : {list(dns_srvs)} · "
+              f"SSH : {list(ssh_srvs)} · SIP : {list(sip_srvs)}")
+    else:
+        print("  (sin server_services.json — todos tratados como HTTP)")
+    print(f"  Clientes/hosts  (h*): {list(hosts.keys()) or 'ninguno'}")
+
+    # Agrupar por subred para asignación inteligente de servidores HTTP
     subnet_groups = _group_by_subnet({**hosts, **servers})
-    subnet_to_srvs = defaultdict(list)
+    subnet_to_http_srvs = defaultdict(list)
     for subnet, members in subnet_groups.items():
         for name, ip in members:
-            if name.startswith("srv"):
-                subnet_to_srvs[subnet].append(ip)
-    all_srv_ips = list(servers.values())
+            if name in http_srvs:
+                subnet_to_http_srvs[subnet].append(ip)
+    all_http_ips = list(http_srvs.values())
 
     try:
         ssh = get_ssh_connection()
 
-        # Limpiar residuos de sesiones anteriores
-        send_tmux_command(ssh, "sh pkill -f iperf; true")
-        time.sleep(0.2)
-        send_tmux_command(ssh, "sh pkill -f wget; true")
-        time.sleep(0.2)
-        send_tmux_command(ssh, "sh pkill -f http.server; true")
-        time.sleep(0.2)
-        # Mata pings y digs lanzados por launches anteriores. Patrón específico
-        # ('ping -c' y 'dig @') para no afectar al ping interno de Mininet.
-        send_tmux_command(ssh, "sh pkill -f 'ping -c'; true")
-        time.sleep(0.2)
-        send_tmux_command(ssh, "sh pkill -f 'dig @'; true")
+        # Limpiar residuos de sesiones anteriores. Cubrimos:
+        #  - herramientas históricas (iperf/wget/http.server)
+        #  - probes de aplicación (ping -c, dig @)
+        #  - marcadores : <nombre>_loop de los bucles bash actuales
+        #  - hping3 (fondo + ataques)
+        for pat in (
+            "iperf", "wget", "http.server", "hping3",
+            "'ping -c'", "'dig @'",
+            "sshprobe_loop", "sipprobe_loop", "icmpprobe_loop",
+            "bg_http_loop", "bg_dns_loop", "bg_ssh_loop", "bg_sip_loop",
+        ):
+            send_tmux_command(ssh, f"sh pkill -f {pat}; true")
+            time.sleep(0.15)
         time.sleep(0.5)
 
-        # ── 1. Servidores HTTP en cada srv* ────────────────────────────────────
-        if servers:
-            for srv_name in servers:
-                send_tmux_command(ssh, f"{srv_name} python3 -m http.server 8080 >/dev/null 2>&1 &")
-                time.sleep(0.1)
-            time.sleep(0.5)
-
-        # ── 2. Bucles wget ON-OFF por host ─────────────────────────────────────
-        if servers:
+        # ── 1. Bucles wget ON-OFF por host hacia los HTTP REALES (puerto 80) ──
+        # Sin auxiliar en 8080 ya: el `serve_http` del launcher (deploy_agent)
+        # crea /tmp/web/page.bin y sirve en :80. Así el tráfico HTTP se
+        # clasifica como "http" puro en el panel, no como http_alt artificial.
+        if http_srvs:
             intra_count = 0
             for i, (host_name, host_ip) in enumerate(hosts.items()):
                 host_subnet = ".".join(host_ip.split(".")[:3])
-                # Preferir servidor de la misma subred (tráfico local)
-                local_srvs = subnet_to_srvs.get(host_subnet, [])
-                target_pool = local_srvs if local_srvs else all_srv_ips
+                local_srvs = subnet_to_http_srvs.get(host_subnet, [])
+                target_pool = local_srvs if local_srvs else all_http_ips
                 target_ip = random.choice(target_pool)
                 if target_ip in local_srvs:
                     intra_count += 1
 
-                # Arranque escalonado + sleep variable (modelo ON-OFF realista)
                 initial_delay = random.randint(0, 10)
                 cmd = (
                     f'{host_name} bash -c '
                     f'"sleep {initial_delay}; '
                     f'while true; do '
-                    f'wget -q -O /dev/null http://{target_ip}:8080/ 2>/dev/null; '
-                    f'sleep $((RANDOM % 18 + 3)); '
+                    f'wget -q -O /dev/null http://{target_ip}:80/page.bin 2>/dev/null; '
+                    f'sleep $((RANDOM % 10 + 6)); '
                     f'done" &'
                 )
                 send_tmux_command(ssh, cmd)
-                time.sleep(0.05)
+                time.sleep(0.3)
 
-            print(f"[TRAFFIC] Base: {len(hosts)} cliente(s) ON-OFF → {len(servers)} servidor(es) HTTP")
+            print(f"[TRAFFIC] HTTP: {len(hosts)} cliente(s) ON-OFF → {len(http_srvs)} servidor(es) (puerto 80)")
             print(f"[TRAFFIC] De ellos, {intra_count} usan servidor en su misma subred (tráfico local)")
+        else:
+            print("[TRAFFIC] HTTP: no hay servidores HTTP — se omiten los wget loops")
 
-        # ── 3. Servidores iperf persistentes en srv* (puerto 5002) ────────────
-        #    Bucle de auto-reinicio: cuando un cliente desconecta, el servidor
-        #    vuelve a escuchar de inmediato → cola natural de conexiones.
-        session_srvs = {}   # srv_name → ip
-        for srv_name, srv_ip in servers.items():
-            cmd = (
-                f'{srv_name} bash -c '
-                f'"while true; do iperf -s -p 5002 >/dev/null 2>&1; '
-                f'sleep 0.1; done" &'
-            )
-            send_tmux_command(ssh, cmd)
-            time.sleep(0.08)
-            session_srvs[srv_name] = srv_ip
+        # NOTA: el bulk iperf TCP/5002 + iperf intra-subnet se ELIMINÓ a partir
+        # de esta versión. Generaba un "ruido" alto e indistinguible de un DoS
+        # volumétrico (10-50 Mbps por host), que disparaba constantemente las
+        # heurísticas SURGE/FAN_IN. Ahora el fondo es:
+        #   - Probes de aplicación (wget, dig, /dev/tcp, /dev/udp) — bytes reales
+        #     pero volumen muy bajo, sin choque con los umbrales de ataque.
+        #   - Streams hping3 a baja tasa hacia los puertos reales de cada
+        #     servicio — aportan "trickle" visible por protocolo en el panel.
+        #   - ICMP host↔host con ráfagas más largas y frecuencia mayor.
 
-        # ── 4. Session workers en h* (flujos asíncronos, Poisson-like) ────────
-        #    Cada host decide de forma independiente cuándo iniciar una
-        #    transferencia y con qué perfil → sin picos sincronizados.
-        session_perfiles = [
-            ("HeavyDL",  f"-b $((RANDOM % 40 + 10))M -t $((RANDOM % 25 + 10))"),  # 10-50 Mbps
-            ("MediumFT", f"-b $((RANDOM % 15 +  3))M -t $((RANDOM % 20 +  8))"),  # 3-18 Mbps
-            ("LightWeb",  "-b $((RANDOM %  5 +  1))M -t $((RANDOM % 10 +  4))"),  #  1-6 Mbps
-            ("VoIP",      "-b $((RANDOM %  1 +  1))M -t $((RANDOM % 30 + 15))"),  # ~1 Mbps
-        ]
-        srv_ips_list = list(servers.values())
-        if not srv_ips_list:
-            srv_ips_list = all_srv_ips
-
-        session_count = 0
-        for i, (host_name, host_ip) in enumerate(hosts.items()):
-            # Peso del perfil: hosts con índice bajo tienden a ser "heavy users"
-            if i < len(hosts) // 3:
-                perfil_args = session_perfiles[0][1]   # HeavyDL
-                inter_sleep = "$((RANDOM % 40 + 20))"  # 20-60 s entre sesiones
-            elif i < 2 * len(hosts) // 3:
-                perfil_args = session_perfiles[1][1]   # MediumFT
-                inter_sleep = "$((RANDOM % 60 + 30))"  # 30-90 s
-            else:
-                perfil_args = random.choice(session_perfiles[2:])[1]  # Light / VoIP
-                inter_sleep = "$((RANDOM % 80 + 40))"  # 40-120 s
-
-            # Selección aleatoria del servidor destino
-            target_ip = random.choice(srv_ips_list)
-            # Delay inicial escalonado: evita que todos empiecen a la vez
-            initial_delay = random.randint(i * 2, i * 2 + 15)
-
-            cmd = (
-                f'{host_name} bash -c '
-                f'"sleep {initial_delay}; '
-                f'while true; do '
-                f'iperf -c {target_ip} -p 5002 {perfil_args} >/dev/null 2>&1; '
-                f'sleep {inter_sleep}; '
-                f'done" &'
-            )
-            send_tmux_command(ssh, cmd)
-            time.sleep(0.05)
-            session_count += 1
-
-        # ── 5. Iperf intra-subnet (host↔host en el mismo switch) ──────────────
-        intra_pairs = 0
-        for subnet, members in subnet_groups.items():
-            same_sw_hosts = [(n, ip) for n, ip in members if n.startswith("h")]
-            if len(same_sw_hosts) < 2:
-                continue
-            for j in range(min(2, len(same_sw_hosts) - 1)):
-                src_name = same_sw_hosts[j][0]
-                dst_ip   = same_sw_hosts[j + 1][1]
-                delay    = random.randint(8, 25)
-                cmd = (
-                    f'{src_name} bash -c '
-                    f'"sleep {delay}; '
-                    f'while true; do '
-                    f'iperf -s -p {_INTRA_PORT} >/dev/null 2>&1 & SPID=$!; '
-                    f'sleep 1; '
-                    f'iperf -c {dst_ip} -p {_INTRA_PORT} -t 5 '
-                    f'-b $((RANDOM % 15 + 1))M >/dev/null 2>&1; '
-                    f'kill $SPID 2>/dev/null; '
-                    f'sleep $((RANDOM % 30 + 15)); '
-                    f'done" &'
-                )
-                send_tmux_command(ssh, cmd)
-                time.sleep(0.05)
-                intra_pairs += 1
-
-        if session_count:
-            print(f"[TRAFFIC] Session workers: {session_count} host(s) con flujos iperf asíncronos (p. 5002)")
-        if intra_pairs:
-            print(f"[TRAFFIC] Intra-subnet: {intra_pairs} par(es) iperf local (no cruzan router)")
-
-        # ── 6. Tráfico ICMP — ping periódico host↔host ────────────────────────
-        #    Volumen bajo (3 paquetes × cada 20-50s), solo aporta variedad de
-        #    protocolos y permite medir reachability vía sFlow. NO supera
-        #    umbrales de detección.
+        # ── 3. ICMP host↔host — ráfagas moderadas ─────────────────────────────
+        # ping con -s 256 → 256B + 28B cabecera ≈ 284B por paquete. 10 paquetes
+        # a 0.2 s = 2 s de ráfaga → ~1.5 KB/s por host activo.
+        #
+        # ANTES usábamos `peers=(...); target=${peers[$((RANDOM % ${#peers[@]}))]}`
+        # pero el outer-bash de Mininet expandía esas variables ANTES de pasar al
+        # inner-bash (donde peers se define), causando división por cero y abortando
+        # el comando completo. Ahora Python elige UN target fijo por host. Pérdida
+        # menor: cada host pingará siempre al mismo peer (no rota) pero el loop SÍ
+        # sobrevive y genera tráfico ICMP visible.
         icmp_count = 0
         host_items = list(hosts.items())
         if len(host_items) >= 2:
             for i, (host_name, _) in enumerate(host_items):
-                target_name, target_ip = host_items[(i + 1) % len(host_items)]
-                if target_name == host_name:
+                peers = [ip for n, ip in host_items if n != host_name]
+                if not peers:
                     continue
-                delay = random.randint(5, 30)
+                target_ip = random.choice(peers)
+                delay  = random.randint(2, 18)
                 cmd = (
                     f'{host_name} bash -c '
-                    f'"sleep {delay}; '
+                    f'": icmpprobe_loop; sleep {delay}; '
                     f'while true; do '
-                    f'ping -c 3 -W 1 -q {target_ip} >/dev/null 2>&1; '
-                    f'sleep $((RANDOM % 30 + 20)); '
+                    f'ping -c 10 -i 0.2 -s 256 -W 1 -q {target_ip} >/dev/null 2>&1; '
+                    f'sleep $((RANDOM % 12 + 8)); '
                     f'done" &'
                 )
                 send_tmux_command(ssh, cmd)
-                time.sleep(0.05)
+                time.sleep(0.3)
                 icmp_count += 1
 
-        # ── 7. Tráfico DNS sintético — queries UDP/53 hacia servidores ────────
-        #    Cada query es una llamada `dig` con timeout corto (1s). Si dig no
-        #    está instalado en la VM el comando falla silenciosamente y no
-        #    genera tráfico, pero el resto del sistema sigue funcionando.
+        # ── 7. Tráfico DNS sintético — queries UDP/53 hacia servidores DNS ────
+        #    Prefiere servidores tipados como 'dns'. Si no hay → fallback a
+        #    cualquier srv (compat con despliegues legacy sin server_services).
         dns_count = 0
-        dns_port = config.SERVICE_PORTS.get("dns", 53)
-        if servers:
+        dns_port  = config.SERVICE_PORTS.get("dns", 53)
+        dns_targets = list(dns_srvs.values()) or list(servers.values())
+        if dns_targets:
             queryers = list(hosts.keys())[:max(1, len(hosts) // 2)]
-            srv_ips_for_dns = list(servers.values())
             for host_name in queryers:
-                target_ip = random.choice(srv_ips_for_dns)
+                target_ip = random.choice(dns_targets)
                 delay = random.randint(10, 40)
                 cmd = (
                     f'{host_name} bash -c '
@@ -244,13 +208,132 @@ def launch_background_traffic(endpoints):
                     f'done" &'
                 )
                 send_tmux_command(ssh, cmd)
-                time.sleep(0.05)
+                time.sleep(0.3)
                 dns_count += 1
 
+        # ── 8. Tráfico SSH sintético — banner-grab TCP/22 vía /dev/tcp ────────
+        #    Cada probe abre conexión TCP, lee 64B de banner y cierra. Bajo
+        #    volumen, pero introduce TCP/22 en las muestras sFlow.
+        ssh_count = 0
+        ssh_port  = config.SERVICE_PORTS.get("ssh", 22)
+        if ssh_srvs and hosts:
+            ssh_targets = list(ssh_srvs.values())
+            probers = list(hosts.keys())[:max(1, len(hosts) // 2)]
+            for host_name in probers:
+                target_ip = random.choice(ssh_targets)
+                delay = random.randint(8, 35)
+                cmd = (
+                    f'{host_name} bash -c '
+                    f'": sshprobe_loop; sleep {delay}; '
+                    f'while true; do '
+                    f'timeout 2 bash -c '
+                    f'\\"exec 3<>/dev/tcp/{target_ip}/{ssh_port}; '
+                    f'head -c 64 <&3 >/dev/null 2>&1; exec 3<&-\\" >/dev/null 2>&1; '
+                    f'sleep $((RANDOM % 50 + 20)); '
+                    f'done" &'
+                )
+                send_tmux_command(ssh, cmd)
+                time.sleep(0.3)
+                ssh_count += 1
+
+        # ── 9. Tráfico SIP sintético — OPTIONS UDP/5060 vía /dev/udp ──────────
+        # send_tmux_command envuelve el comando en COMILLAS SIMPLES para tmux,
+        # así que dentro del bash -c (con comillas dobles) sólo podemos usar
+        # comillas dobles ESCAPADAS (\"...\") para argumentos internos. Las
+        # secuencias \r\n las interpreta `echo -e` en el destino.
+        sip_count = 0
+        sip_port  = config.SERVICE_PORTS.get("sip", 5060)
+        if sip_srvs and hosts:
+            sip_targets = list(sip_srvs.values())
+            probers = list(hosts.keys())[:max(1, len(hosts) // 2)]
+            for host_name in probers:
+                target_ip = random.choice(sip_targets)
+                delay = random.randint(10, 40)
+                # \\\\r\\\\n en la f-string → literal \\r\\n en bash → echo -e
+                # los convierte en CR LF al ejecutarse.
+                sip_payload = (
+                    f"OPTIONS sip:probe SIP/2.0\\r\\n"
+                    f"Via: SIP/2.0/UDP probe\\r\\n"
+                    f"From: <sip:probe@local>\\r\\n"
+                    f"To: <sip:probe@{target_ip}>\\r\\n"
+                    f"Call-ID: probe@local\\r\\n"
+                    f"CSeq: 1 OPTIONS\\r\\n"
+                    f"Content-Length: 0\\r\\n\\r\\n"
+                )
+                cmd = (
+                    f'{host_name} bash -c '
+                    f'": sipprobe_loop; sleep {delay}; '
+                    f'while true; do '
+                    f'echo -ne \\"{sip_payload}\\" '
+                    f'> /dev/udp/{target_ip}/{sip_port} 2>/dev/null; '
+                    f'sleep $((RANDOM % 50 + 25)); '
+                    f'done" &'
+                )
+                send_tmux_command(ssh, cmd)
+                time.sleep(0.3)
+                sip_count += 1
+
+        # ── 10. hping3 low-rate por protocolo — trickle visible en el panel ───
+        # Comprobamos primero si hping3 está disponible; si no, omitimos el
+        # bloque sin error (la aplicación-layer ya funciona sola).
+        try:
+            _, stdout_chk, _ = ssh.exec_command("which hping3", timeout=5)
+            hping3_ok = bool(stdout_chk.read().decode("utf-8", errors="replace").strip())
+        except Exception:
+            hping3_ok = False
+
+        bg_counts = {"http": 0, "dns": 0, "ssh": 0, "sip": 0}
+        if hping3_ok:
+            # (label, target_dict, transport_flag, dport, transport)
+            bg_targets = [
+                ("http", http_srvs, "-S",    config.SERVICE_PORTS.get("http", 80),  "tcp"),
+                ("dns",  dns_srvs,  "--udp", config.SERVICE_PORTS.get("dns", 53),   "udp"),
+                ("ssh",  ssh_srvs,  "-S",    config.SERVICE_PORTS.get("ssh", 22),   "tcp"),
+                ("sip",  sip_srvs,  "--udp", config.SERVICE_PORTS.get("sip", 5060), "udp"),
+            ]
+            host_list = list(hosts.keys())
+            for label, dst_pool, flag, dport, transport in bg_targets:
+                if not dst_pool or not host_list:
+                    continue
+                # 3 hosts hacen trickle hacia cada servicio. Ráfagas de 10 s
+                # y pausa de 15-30 s → ciclo de actividad para que el panel
+                # vea picos legítimos sin tasa plana.
+                generators = host_list[:3]
+                dst_ips = list(dst_pool.values())
+                for h in generators:
+                    target = random.choice(dst_ips)
+                    delay  = random.randint(2, 15)
+                    # -i u10000 = 100 pps · 600B = 60 KB/s ≈ 480 Kbps por host.
+                    # -c 1000 → ráfaga de 10 s. -k -s = sport fijo → en sFlow
+                    # aparece como UN solo flujo (sin esto, miles de flujos).
+                    # Un ataque va a 80 Mbps → ratio 160×, sigue siendo señal clara.
+                    cmd = (
+                        f'{h} bash -c '
+                        f'": bg_{label}_loop; sleep {delay}; '
+                        f'while true; do '
+                        f'hping3 {flag} -p {dport} -k -s 23456 '
+                        f'-i u10000 -d 600 -c 1000 '
+                        f'{target} >/dev/null 2>&1; '
+                        f'sleep $((RANDOM % 16 + 15)); '
+                        f'done" &'
+                    )
+                    send_tmux_command(ssh, cmd)
+                    time.sleep(0.3)
+                    bg_counts[label] += 1
+        else:
+            print("[TRAFFIC][WARN] hping3 no instalado → se omiten los streams de "
+                  "fondo por protocolo. Para más realismo: sudo apt install hping3")
+
         if icmp_count:
-            print(f"[TRAFFIC] ICMP: {icmp_count} host(s) con pings periódicos host↔host")
+            print(f"[TRAFFIC] ICMP: {icmp_count} host(s) con ráfagas largas host↔host")
         if dns_count:
             print(f"[TRAFFIC] DNS: {dns_count} host(s) con queries sintéticas UDP/{dns_port}")
+        if ssh_count:
+            print(f"[TRAFFIC] SSH: {ssh_count} host(s) con banner-grab TCP/{ssh_port}")
+        if sip_count:
+            print(f"[TRAFFIC] SIP: {sip_count} host(s) con OPTIONS UDP/{sip_port}")
+        if any(bg_counts.values()):
+            print(f"[TRAFFIC] hping3 background: {bg_counts}")
 
         ssh.close()
         print("[TRAFFIC] Control devuelto al supervisor. El tráfico corre en background.")
@@ -264,16 +347,14 @@ def stop_background_traffic():
     print("\n[TRAFFIC] Deteniendo procesos de tráfico en background...")
     try:
         ssh = get_ssh_connection()
-        send_tmux_command(ssh, "sh pkill -f iperf; true")
-        time.sleep(0.2)
-        send_tmux_command(ssh, "sh pkill -f wget; true")
-        time.sleep(0.2)
-        send_tmux_command(ssh, "sh pkill -f http.server; true")
-        time.sleep(0.2)
-        send_tmux_command(ssh, "sh pkill -f 'ping -c'; true")
-        time.sleep(0.2)
-        send_tmux_command(ssh, "sh pkill -f 'dig @'; true")
-        time.sleep(0.3)
+        for pat in (
+            "iperf", "wget", "http.server", "hping3",
+            "'ping -c'", "'dig @'",
+            "sshprobe_loop", "sipprobe_loop", "icmpprobe_loop",
+            "bg_http_loop", "bg_dns_loop", "bg_ssh_loop", "bg_sip_loop",
+        ):
+            send_tmux_command(ssh, f"sh pkill -f {pat}; true")
+            time.sleep(0.15)
         ssh.close()
         print("[TRAFFIC] Procesos de background terminados.")
     except Exception as e:

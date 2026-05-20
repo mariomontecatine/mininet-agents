@@ -37,6 +37,7 @@ _RUN_FILES = (
     "network_history.json",
     "port_baseline.json",
     "host_port_map.json",
+    "server_services.json",
 )
 
 app = Flask(__name__)
@@ -667,6 +668,89 @@ def api_qos_history():
     """Historial de eventos QoS para el timeline (últimos 200 eventos)."""
     history = _load_json("qos_history.json", [])
     return jsonify(history[-200:])
+
+
+@app.route("/api/services")
+def api_services():
+    """Servicios desplegados (mapping srv → {type, ip, port, transport})."""
+    services = _load_json("server_services.json", {})
+    return jsonify(services)
+
+
+# Catálogo (proto_num, dport) → service para el dashboard. Construido una vez
+# desde config para no recorrerlo en cada petición.
+_DPORT_TO_SERVICE = {
+    (defn["ip_proto"], defn["dport"]): name
+    for name, defn in __import__("utils.config", fromlist=["SERVICE_DEFS"]).SERVICE_DEFS.items()
+    if defn.get("dport") is not None
+}
+_PROTO_TO_FAMILY = {6: "tcp", 17: "udp", 1: "icmp"}
+
+
+def _classify_flow(proto, dport, sport=0):
+    """Devuelve la etiqueta de servicio del flujo.
+
+    El daemon sFlow ya emite `dport` como puerto de servicio (el menor de
+    sport/dport en el paquete original), así que request y response del mismo
+    servicio agregan al mismo (proto, dport). Cae a 'icmp' o 'otros (<familia>)'
+    como último recurso. `sport` queda como parámetro opcional por
+    compatibilidad con snapshots antiguos.
+    """
+    if proto in (None, 0):
+        return "otros"
+    name = _DPORT_TO_SERVICE.get((proto, dport))
+    if name:
+        return name
+    if sport:
+        name = _DPORT_TO_SERVICE.get((proto, sport))
+        if name:
+            return name
+    if proto == 1:
+        return "icmp"
+    fam = _PROTO_TO_FAMILY.get(proto, "ip")
+    return f"otros ({fam})"
+
+
+@app.route("/api/traffic-by-protocol")
+def api_traffic_by_protocol():
+    """Bytes/paquetes agregados por servicio sobre los últimos N segundos del histórico sFlow.
+
+    Query params:
+      window: tamaño de ventana en segundos (default 300, máx 3600).
+
+    Respuesta: {window_sec, samples, totals: [{service, bytes, pkts}, ...]}
+    """
+    try:
+        window = int(request.args.get("window", 300))
+    except (TypeError, ValueError):
+        window = 300
+    window = max(30, min(window, 3600))
+
+    history = _load_json("flows_history.json", [])
+    if not history:
+        return jsonify({"window_sec": window, "samples": 0, "totals": []})
+
+    estimated = max(1, window // 5)
+    window_entries = history[-estimated:]
+    agg_bytes = defaultdict(int)
+    agg_pkts  = defaultdict(int)
+    for entry in window_entries:
+        for f in entry.get("delta_flows", []):
+            svc = _classify_flow(
+                f.get("proto"), f.get("dport"), f.get("sport", 0),
+            )
+            agg_bytes[svc] += f.get("bytes", 0)
+            agg_pkts[svc]  += f.get("pkts", 0)
+
+    totals = sorted(
+        ({"service": s, "bytes": b, "pkts": agg_pkts[s]} for s, b in agg_bytes.items()),
+        key=lambda x: x["bytes"], reverse=True,
+    )
+    return jsonify({
+        "window_sec": window,
+        "samples":    len(window_entries),
+        "totals":     totals,
+    })
 
 
 @app.route("/api/live-metrics")

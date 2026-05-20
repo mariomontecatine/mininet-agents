@@ -23,6 +23,8 @@ from agents.deploy_agent import (
     generate_network_intent,
     build_python_script,
     deploy_unified_in_vm,
+    assign_server_types,
+    _persist_server_services,
 )
 from agents.traffic_agent import (
     get_active_endpoints,
@@ -138,7 +140,7 @@ def _save_topology_cache(user_request, intent, code):
 # QoS event log
 # -------------------------------------------------------
 
-def _write_qos_event(port, action, event_type, ciclo):
+def _write_qos_event(port, action, event_type, ciclo, protocol=None):
     """Persiste un evento QoS (apply/desescalado/remove) en qos_history.json para el dashboard."""
     qos_path = os.path.join(TMP_DIR, "qos_history.json")
     history = []
@@ -149,11 +151,12 @@ def _write_qos_event(port, action, event_type, ciclo):
         except (json.JSONDecodeError, IOError):
             pass
     history.append({
-        "ts":     datetime.now().isoformat(timespec="seconds"),
-        "cycle":  ciclo,
-        "port":   port,
-        "action": action,
-        "event":  event_type,
+        "ts":       datetime.now().isoformat(timespec="seconds"),
+        "cycle":    ciclo,
+        "port":     port,
+        "action":   action,
+        "event":    event_type,
+        "protocol": protocol,
     })
     if len(history) > 300:
         history = history[-300:]
@@ -170,18 +173,11 @@ def _write_qos_event(port, action, event_type, ciclo):
 
 def _live_collector():
     """
-    Hilo background: recolecta métricas cada 5 s.
-    Solo bloquea la conexión SSH brevemente (dpctl dump-ports).
-    El lock se libera en el bucle NOC durante las llamadas LLM,
-    por lo que el colector obtiene muestras continuas también durante el análisis.
+    Hilo background: recolecta métricas cada 5 s vía OVS directo (sin tmux).
+    Una sola llamada SSH a ovs-vsctl devuelve todas las interfaces parseables.
     """
-    from agents.monitor_agent import parse_telemetry_to_dict
-    from utils.ssh_client import (
-        get_ssh_connection,
-        send_tmux_command,
-        capture_tmux_output,
-        wait_for_mininet_prompt,
-    )
+    from agents.monitor_agent import collect_port_stats_via_ovs
+    from utils.ssh_client import get_ssh_connection
 
     live_file = os.path.join(TMP_DIR, "live_metrics.json")
     live_prev: dict = {}
@@ -195,11 +191,7 @@ def _live_collector():
 
         try:
             ssh = get_ssh_connection()
-            send_tmux_command(ssh, "dpctl dump-ports")
-            if not wait_for_mininet_prompt(ssh, timeout=8):
-                continue
-            raw     = capture_tmux_output(ssh)
-            current = parse_telemetry_to_dict(raw)
+            current = collect_port_stats_via_ovs(ssh)
 
             deltas = {}
             for port, vals in current.items():
@@ -410,13 +402,17 @@ def _flow_watcher():
                 resolve_multiple(new_fast)
             for a in new_fast:
                 p = a["target_port"]
-                _reglas_activas[p] = {"action": a["action"], "ciclo": ciclo_now}
+                proto = a.get("protocol")
+                _reglas_activas[p] = {
+                    "action": a["action"], "ciclo": ciclo_now, "protocol": proto,
+                }
                 _ciclos_limpios[p] = 0
+                proto_tag = f" [proto={proto}]" if proto else ""
                 registrar_log(
-                    f"ACCIÓN RÁPIDA [FLOW]: {a['action']} en {p}. "
+                    f"ACCIÓN RÁPIDA [FLOW]: {a['action']}{proto_tag} en {p}. "
                     f"Motivo: {a.get('reason', 'Automático')}"
                 )
-                _write_qos_event(p, a["action"], "apply", ciclo_now)
+                _write_qos_event(p, a["action"], "apply", ciclo_now, protocol=proto)
         except Exception:
             pass
 
@@ -451,6 +447,7 @@ def run_aiops_pipeline():
         "anomaly_injections.jsonl", "flow_alerts.jsonl",
         "attack_report.md", "anomaly_report.md",
         "host_port_map.json", "topology.json", "port_baseline.json",
+        "server_services.json",
         # informes y artefactos de agentes
         "ultimo_informe.txt", "ultima_rafaga_realista.txt",
         # audit log: se reinicia por sesión — para histórico usa saved_runs/
@@ -497,8 +494,13 @@ def run_aiops_pipeline():
     if use_cache:
         user_request = cache["user_request"]
         intent       = cache["intent"]
-        code         = cache["code"]
-        print(f"\n[CACHÉ] Topología cargada — se omite la generación IA.")
+        # Regeneramos siempre el script desde el intent: la caché conserva sólo
+        # la intención del usuario, no el código. Así los cambios en
+        # deploy_agent (launchers tipados, lanzadores de servicio, etc.) se
+        # aplican aunque la topología venga de un run antiguo.
+        code         = build_python_script(intent)
+        print(f"\n[CACHÉ] Topología cargada — se omite la generación IA. "
+              f"Script regenerado con build_python_script actual.")
     else:
         user_request = input(
             "Describe la topología de red (Ej: 'una red en árbol con profundidad 2 y fanout 4'):\n> "
@@ -540,6 +542,20 @@ def run_aiops_pipeline():
         registrar_log("ERROR CRÍTICO: No se detectaron endpoints.")
         return
     print(f"[INFO] Endpoints detectados: {endpoints}")
+
+    # Re-persistir mapping de servicios desplegados — la caché de topología
+    # se salta build_python_script y por tanto no lo regenera. Sin esto el
+    # dashboard y traffic_agent no ven los tipos al reutilizar topología.
+    try:
+        srv_types = assign_server_types(intent)
+        if srv_types:
+            srv_ips   = {n: endpoints.get(n) for n in srv_types}
+            services  = _persist_server_services(srv_types, srv_ips)
+            if services:
+                print(f"[INFO] Servicios desplegados: "
+                      f"{ {k: v.get('type') for k, v in services.items()} }")
+    except Exception as _e:
+        print(f"[WARN] No se pudo persistir server_services.json: {_e}")
 
     try:
         links = get_topology_links()
@@ -651,14 +667,18 @@ def run_aiops_pipeline():
                     resolve_multiple(new_fast)
                 for a in new_fast:
                     p = a["target_port"]
-                    reglas_activas[p] = {"action": a["action"], "ciclo": ciclo}
+                    proto = a.get("protocol")
+                    reglas_activas[p] = {
+                        "action": a["action"], "ciclo": ciclo, "protocol": proto,
+                    }
                     ciclos_limpios[p] = 0
                     newly_fast_ports.add(p)
+                    proto_tag = f" [proto={proto}]" if proto else ""
                     registrar_log(
-                        f"ACCIÓN RÁPIDA: {a['action']} en {p}. "
+                        f"ACCIÓN RÁPIDA: {a['action']}{proto_tag} en {p}. "
                         f"Motivo: {a.get('reason', 'Automático')}"
                     )
-                    _write_qos_event(p, a["action"], "apply", ciclo)
+                    _write_qos_event(p, a["action"], "apply", ciclo, protocol=proto)
 
             # ── B. ANÁLISIS IA: sin lock — el colector puede muestrear ────────
             print("\n[SUPERVISOR] Analizando estado de la red...")
@@ -691,11 +711,15 @@ def run_aiops_pipeline():
             acciones_reales = [a for a in (decision or []) if a.get("action") != "NO_ACTION"]
             if acciones_reales or new_fast:
                 for a in acciones_reales:
+                    proto = a.get("protocol")
+                    proto_tag = f" [proto={proto}]" if proto else ""
                     registrar_log(
-                        f"ALERTA RESUELTA: {a.get('action')} en {a.get('target_port')}. "
+                        f"ALERTA RESUELTA: {a.get('action')}{proto_tag} en {a.get('target_port')}. "
                         f"Motivo: {a.get('reason', 'Automático')}"
                     )
-                    _write_qos_event(a.get("target_port"), a.get("action"), "apply", ciclo)
+                    _write_qos_event(
+                        a.get("target_port"), a.get("action"), "apply", ciclo, protocol=proto,
+                    )
             else:
                 registrar_log("ESTADO: Red estable, sin intervenciones requeridas.")
 
@@ -715,8 +739,9 @@ def run_aiops_pipeline():
                 for a in (decision or []):
                     if a.get("action") not in ("NO_ACTION", None) and a.get("target_port"):
                         reglas_activas[a["target_port"]] = {
-                            "action": a["action"],
-                            "ciclo":  ciclo,
+                            "action":   a["action"],
+                            "ciclo":    ciclo,
+                            "protocol": a.get("protocol"),
                         }
                         ciclos_limpios[a["target_port"]] = 0
 
@@ -725,7 +750,12 @@ def run_aiops_pipeline():
                     if port not in alerted_this_cycle:
                         ciclos_limpios[port] = ciclos_limpios.get(port, 0) + 1
                         if ciclos_limpios[port] >= config.CICLOS_PARA_DESESCALAR:
-                            puertos_a_desescalar[port] = info["action"]
+                            # Pasamos el dict completo para que run_desescalado
+                            # conserve el scope (protocolo) al re-aplicar.
+                            puertos_a_desescalar[port] = {
+                                "action":   info["action"],
+                                "protocol": info.get("protocol"),
+                            }
                     else:
                         ciclos_limpios[port] = 0
 
@@ -733,16 +763,21 @@ def run_aiops_pipeline():
                     nuevas = run_desescalado(puertos_a_desescalar)
                     resumen = []   # para log consolidado en una sola línea
                     for port, nuevo_nivel in nuevas.items():
+                        proto_prev = reglas_activas.get(port, {}).get("protocol")
                         if nuevo_nivel is None:
                             del reglas_activas[port]
-                            _write_qos_event(port, None, "remove", ciclo)
+                            _write_qos_event(port, None, "remove", ciclo, protocol=proto_prev)
                             # Cooling: el watcher exigirá N=3 sobre este puerto
                             # durante los próximos 2 ciclos para evitar flapping.
                             _recently_relaxed[port] = ciclo
                             resumen.append(f"{port}→remove")
                         else:
-                            reglas_activas[port] = {"action": nuevo_nivel, "ciclo": ciclo}
-                            _write_qos_event(port, nuevo_nivel, "relax", ciclo)
+                            reglas_activas[port] = {
+                                "action":   nuevo_nivel,
+                                "ciclo":    ciclo,
+                                "protocol": proto_prev,
+                            }
+                            _write_qos_event(port, nuevo_nivel, "relax", ciclo, protocol=proto_prev)
                             resumen.append(f"{port}→{nuevo_nivel}")
                         ciclos_limpios.pop(port, None)
                     registrar_log(
