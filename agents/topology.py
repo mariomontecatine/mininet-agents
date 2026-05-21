@@ -177,7 +177,7 @@ _HTML = """\
 
     cy.fit(undefined, 60);
 
-    // Rueda = zoom suave sobre el cursor
+    // Ctrl+rueda = zoom suave; rueda sola = scroll de la página padre
     var _zoomTarget   = cy.zoom();
     var _zoomCenterX  = 0;
     var _zoomCenterY  = 0;
@@ -196,12 +196,16 @@ _HTML = """\
     }
 
     document.getElementById('cy').addEventListener('wheel', function(e) {
-      e.preventDefault();
-      var factor = e.deltaY < 0 ? 1.12 : 0.89;
-      _zoomTarget  = Math.min(cy.maxZoom(), Math.max(cy.minZoom(), _zoomTarget * factor));
-      _zoomCenterX = e.offsetX;
-      _zoomCenterY = e.offsetY;
-      if (!_zoomRafId) _zoomRafId = requestAnimationFrame(_animateZoom);
+      if (e.ctrlKey) {
+        e.preventDefault();
+        var factor = e.deltaY < 0 ? 1.12 : 0.89;
+        _zoomTarget  = Math.min(cy.maxZoom(), Math.max(cy.minZoom(), _zoomTarget * factor));
+        _zoomCenterX = e.offsetX;
+        _zoomCenterY = e.offsetY;
+        if (!_zoomRafId) _zoomRafId = requestAnimationFrame(_animateZoom);
+      } else {
+        window.parent.postMessage({ noc_scroll: e.deltaY }, '*');
+      }
     }, { passive: false });
 
     // Guardar posiciones cada vez que se mueve un nodo

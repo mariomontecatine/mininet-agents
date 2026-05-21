@@ -2167,8 +2167,8 @@ async function updateFailover() {
       ? `<span style="color:var(--dim);font-size:10px">Sonda: ${s.last_probe.replace('T', ' ')}</span>`
       : `<span style="color:var(--dim);font-size:10px">Sonda: esperando primer ciclo NOC</span>`;
 
-    const killBtn   = `<button class="fo-btn fo-btn-kill"   onclick="failoverAction('kill',  '${escHtml(name)}')">Tumbar</button>`;
-    const reviveBtn = `<button class="fo-btn fo-btn-revive" onclick="failoverAction('revive','${escHtml(name)}')">Recuperar</button>`;
+    const killBtn   = `<button class="fo-btn fo-btn-kill"   onclick="failoverAction('kill',  '${escHtml(name)}',this)">Tumbar</button>`;
+    const reviveBtn = `<button class="fo-btn fo-btn-revive" onclick="failoverAction('revive','${escHtml(name)}',this)">Recuperar</button>`;
 
     html +=
       `<div style="display:flex;flex-direction:column;gap:6px;min-width:260px;
@@ -2184,7 +2184,10 @@ async function updateFailover() {
   body.innerHTML = html;
 }
 
-async function failoverAction(action, server) {
+async function failoverAction(action, server, btn) {
+  const orig = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '…';
   try {
     const r = await fetch('/api/failover/action', {
       method: 'POST',
@@ -2192,9 +2195,18 @@ async function failoverAction(action, server) {
       body: JSON.stringify({ action, server }),
     });
     const d = await r.json();
-    if (!d.ok) alert('Error: ' + (d.error || 'desconocido'));
-    else setTimeout(updateFailover, 800);
-  } catch (e) { alert('Error de red: ' + e); }
+    if (!d.ok) {
+      btn.textContent = '✗ Error';
+      btn.style.color = 'var(--red)';
+      setTimeout(() => { btn.textContent = orig; btn.style.color = ''; btn.disabled = false; }, 2500);
+    } else {
+      btn.textContent = '✓ OK';
+      setTimeout(() => { btn.textContent = orig; btn.style.color = ''; btn.disabled = false; updateFailover(); }, 1200);
+    }
+  } catch (e) {
+    btn.textContent = '✗ Red';
+    setTimeout(() => { btn.textContent = orig; btn.style.color = ''; btn.disabled = false; }, 2500);
+  }
 }
 
 updateFailover();

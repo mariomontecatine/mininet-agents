@@ -154,9 +154,11 @@ def remove_redirect(ssh, primary_ip: str, secondary_ip: str, sec_ovs_port: str):
 
 def kill_server(ssh, server_name: str, svc_type: str):
     """Para el proceso del servidor en el host Mininet."""
+    # pkill directo en la VM: los hosts Mininet comparten el PID namespace
+    # con la VM, así que no hace falta ir a través del CLI de Mininet.
     send_tmux_command(
         ssh,
-        f"{server_name} pkill -f 'service_launchers.py {svc_type}' 2>/dev/null; true",
+        f'py net.get("{server_name}").cmd("kill -9 $(pgrep -f service_launchers.py)")',
     )
     time.sleep(0.3)
     print(f"  [FAILOVER] {server_name} ({svc_type}) apagado")
