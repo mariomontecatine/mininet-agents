@@ -744,11 +744,13 @@ def api_failover_action():
         from utils.ssh_client import get_ssh_connection, send_tmux_command
         ssh = get_ssh_connection()
         if action == "kill":
-            # subprocess.call desde el proceso Python de Mininet (root) → mata
-            # cualquier proceso sin pasar por shell ni tener problemas de quoting.
+            # fuser mata por puerto dentro del netns del host — independiente del
+            # nombre del proceso en /proc. Corre via cmd() para estar en el netns correcto.
+            port = svc_info.get("port", 80)
+            transport = svc_info.get("transport", "tcp")
             send_tmux_command(
                 ssh,
-                'py __import__("subprocess").call(["pkill", "-9", "-f", "service_launchers"])',
+                f'py net.get("{server}").cmd("fuser -k {port}/{transport} 2>/dev/null; true")',
             )
         else:
             send_tmux_command(
