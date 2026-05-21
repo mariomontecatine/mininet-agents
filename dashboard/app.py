@@ -38,6 +38,7 @@ _RUN_FILES = (
     "port_baseline.json",
     "host_port_map.json",
     "server_services.json",
+    "failover_state.json",
 )
 
 app = Flask(__name__)
@@ -520,6 +521,7 @@ def api_security():
             "elapsed":     max(0, min(now, end_planned) - start),
             "actor":       _describe_actor(inj),
             "target":      _describe_target(inj),
+            "protocol":    inj.get("victim_service"),
             "status":      status,
             "detected_by": detected_by,
             "lag":         cls["first_detection_lag_sec"],
@@ -675,6 +677,43 @@ def api_services():
     """Servicios desplegados (mapping srv → {type, ip, port, transport})."""
     services = _load_json("server_services.json", {})
     return jsonify(services)
+
+
+@app.route("/api/failover/state")
+def api_failover_state():
+    """Estado actual del sistema de failover (salud de servidores y redirecciones)."""
+    state = _load_json("failover_state.json", {"servers": {}})
+    return jsonify(state)
+
+
+@app.route("/api/failover/action", methods=["POST"])
+def api_failover_action():
+    """
+    Encola una acción de failover manual.
+    Body: {"action": "kill"|"revive", "server": "srv1"}
+    """
+    payload = request.get_json(silent=True) or {}
+    action  = payload.get("action", "")
+    server  = payload.get("server", "")
+
+    if action not in ("kill", "revive") or not server:
+        return jsonify({"ok": False, "error": "Parámetros inválidos"}), 400
+
+    req_path = os.path.join(_TMP_DIR, "failover_requests.json")
+    reqs: list = []
+    try:
+        if os.path.exists(req_path):
+            with open(req_path, encoding="utf-8") as f:
+                reqs = json.load(f)
+    except (IOError, json.JSONDecodeError):
+        pass
+    reqs.append({"action": action, "server": server, "ts": datetime.now().isoformat(timespec="seconds")})
+    try:
+        with open(req_path, "w", encoding="utf-8") as f:
+            json.dump(reqs, f)
+    except IOError as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+    return jsonify({"ok": True, "queued": {"action": action, "server": server}})
 
 
 # Catálogo (proto_num, dport) → service para el dashboard. Construido una vez
@@ -844,10 +883,10 @@ def api_inject():
         return jsonify({"ok": False,
                         "error": "type debe ser 'port_scan', 'dos_volumetric' o 'ddos'"}), 400
 
-    # Lazy import + traffic_agent para obtener endpoints
+    # Lazy import + traffic para obtener endpoints
     try:
-        from agents.attack_agent import maybe_inject_anomaly
-        from agents.traffic_agent import get_active_endpoints
+        from agents.attack_tool import maybe_inject_anomaly
+        from agents.traffic import get_active_endpoints
     except Exception as e:
         return jsonify({"ok": False, "error": f"módulos: {e}"}), 500
 
