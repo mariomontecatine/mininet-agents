@@ -3,7 +3,7 @@ Correlaciona las anomalías inyectadas con la respuesta del NOC y emite un
 informe en `tmp/attack_report.md`.
 
 Fuentes:
-  - tmp/anomaly_injections.jsonl  (qué inyectó el attack_agent)
+  - tmp/anomaly_injections.jsonl  (qué inyectó el attack_tool)
   - tmp/qos_history.json          (qué acciones aplicó el resolver)
   - tmp/flow_alerts.jsonl         (qué detectaron las heurísticas del monitor)
   - tmp/noc_audit.log             (texto del informe IA de cada ciclo)

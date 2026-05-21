@@ -167,7 +167,7 @@ def assign_server_types(intent):
 
 
 def _persist_server_services(server_types, host_ips):
-    """Guarda tmp/server_services.json para traffic_agent y dashboard.
+    """Guarda tmp/server_services.json para traffic y dashboard.
 
     Estructura: {srv_name: {type, ip, port, transport}}.
     """

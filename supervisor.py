@@ -26,7 +26,7 @@ from agents.deploy_agent import (
     assign_server_types,
     _persist_server_services,
 )
-from agents.traffic_agent import (
+from agents.traffic import (
     get_active_endpoints,
     launch_background_traffic,
     stop_background_traffic,
@@ -37,15 +37,19 @@ from agents.topology import (
 )
 from agents.monitor_agent import collect_telemetry, generate_network_report
 from agents.resolver_agent import analyze_and_decide, fast_decide, resolve_multiple, run_desescalado
-from agents.sflow_agent import (
+from agents.sflow import (
     configure_sflow_on_bridges,
     remove_sflow_from_bridges,
     start_sflow_daemon,
     stop_sflow_daemon,
     fetch_flows,
 )
-from agents.attack_agent import maybe_inject_anomaly, build_host_port_map
+from agents.attack_tool import maybe_inject_anomaly, build_host_port_map
 from agents.attack_report import generate_report as generate_anomaly_report
+from agents.failover import (
+    load_server_info, auto_select_pair, check_failover,
+    FAILOVER_STATE_FILE,
+)
 
 # -------------------------------------------------------
 # Auditoría con rotación automática
@@ -448,6 +452,8 @@ def run_aiops_pipeline():
         "attack_report.md", "anomaly_report.md",
         "host_port_map.json", "topology.json", "port_baseline.json",
         "server_services.json",
+        # failover
+        "failover_state.json", "failover_requests.json",
         # informes y artefactos de agentes
         "ultimo_informe.txt", "ultima_rafaga_realista.txt",
         # audit log: se reinicia por sesión — para histórico usa saved_runs/
@@ -545,7 +551,7 @@ def run_aiops_pipeline():
 
     # Re-persistir mapping de servicios desplegados — la caché de topología
     # se salta build_python_script y por tanto no lo regenera. Sin esto el
-    # dashboard y traffic_agent no ven los tipos al reutilizar topología.
+    # dashboard y traffic no ven los tipos al reutilizar topología.
     try:
         srv_types = assign_server_types(intent)
         if srv_types:
@@ -580,7 +586,7 @@ def run_aiops_pipeline():
     except Exception as _e:
         print(f"[WARN] No se pudo persistir topology.json: {_e}")
 
-    # Mapa host → puerto OVS: lo necesitan attack_agent y monitor_agent
+    # Mapa host → puerto OVS: lo necesitan attack_tool y monitor_agent
     try:
         host_port = build_host_port_map()
         print(f"[INFO] Host→puerto OVS: {host_port}")
@@ -618,6 +624,17 @@ def run_aiops_pipeline():
     ciclo = 1
     intervalo_actual = config.INTERVALO_BASE
 
+    # ── Failover: seleccionar par primario/secundario ─────────────────────────
+    _fo_server_info = load_server_info()
+    _fo_pair        = auto_select_pair(_fo_server_info)
+    if _fo_pair:
+        registrar_log(
+            f"FAILOVER: par seleccionado — primario={_fo_pair[0]}, secundario={_fo_pair[1]}"
+        )
+        print(f"[FAILOVER] Par: {_fo_pair[0]} (primario) → {_fo_pair[1]} (secundario)")
+    else:
+        print("[FAILOVER] No se encontró par válido (necesita 2 servidores del mismo tipo en el mismo bridge)")
+
     print_header("NOC ACTIVO — TRÁFICO CORRIENDO EN BACKGROUND")
     print(">>> Pulsa Ctrl+C en cualquier momento para detener el sistema NOC <<<\n")
 
@@ -632,9 +649,22 @@ def run_aiops_pipeline():
             print_header(f"CICLO DE SUPERVISIÓN #{ciclo}")
             registrar_log(f"--- Iniciando Ciclo #{ciclo} (intervalo={intervalo_actual}s) ---")
 
+            # ── A0. FAILOVER: sonda de salud + redirección ────────────────────
+            if _fo_pair and ciclo % config.FAILOVER_CHECK_EVERY_N == 0:
+                _fo_server_info = load_server_info()   # refresca IPs/puertos
+                fo_lines = check_failover(_fo_server_info, _fo_pair, ciclo)
+                for _fl in fo_lines:
+                    registrar_log(_fl)
+            else:
+                fo_lines = []
+
             # ── A. TELEMETRÍA: bloqueo SSH breve ─────────────────────────────
             with _live_lock:
                 telemetry = collect_telemetry()
+
+            # Incorporar líneas de failover (sonda de salud)
+            if fo_lines:
+                telemetry = (telemetry or "") + "\n" + "\n".join(fo_lines)
 
             # Incorporar alertas de flujo acumuladas por _flow_watcher
             # (ataques detectados entre ciclos, mientras el LLM bloqueaba)
@@ -654,8 +684,13 @@ def run_aiops_pipeline():
             # que aún no hayan sido tratados por _flow_watcher mid-ciclo.
             # Los puertos ya en reglas_activas (incluyendo acciones del watcher)
             # se excluyen automáticamente por la condición "not in reglas_activas".
+            #
+            # skip_drops: suprimir [ALERTA ROJA] en puertos recientemente desescalados
+            # (sus drops son acumulados del ciclo de POLICING anterior, no ataques nuevos).
+            _skip_drops = set(_recently_relaxed.keys())
             newly_fast_ports: set = set()
-            fast_actions = fast_decide(telemetry, reglas_activas)
+            fast_actions = fast_decide(telemetry, reglas_activas,
+                                       skip_alerta_roja_ports=_skip_drops)
             new_fast = [
                 a for a in fast_actions
                 if a.get("action") not in ("NO_ACTION", None)
@@ -686,11 +721,13 @@ def run_aiops_pipeline():
             print(f"\n[INFORME IA]\n{informe}")
 
             print("\n[SUPERVISOR] Evaluando intervenciones (QoS)...")
-            decision = analyze_and_decide(informe, telemetry, reglas_activas)
+            decision = analyze_and_decide(informe, telemetry, reglas_activas,
+                                          skip_alerta_roja_ports=_skip_drops)
 
             # Escalado forzado — excluye puertos que acaban de recibir fast_decide
             # en este mismo ciclo para evitar escalar inmediatamente.
             _esc = {"SHAPING": "POLICING", "POLICING": "BLOCK", "BLOCK": "BLOCK"}
+            _lvl = {"SHAPING": 1, "POLICING": 2, "BLOCK": 3}
             for a in (decision or []):
                 port   = a.get("target_port")
                 action = a.get("action")
@@ -699,7 +736,11 @@ def run_aiops_pipeline():
                     continue
                 if port and action not in ("NO_ACTION", None) and port in reglas_activas:
                     previa = reglas_activas[port]["action"]
-                    if action == previa:
+                    if _lvl.get(action, 0) < _lvl.get(previa, 0):
+                        # Acción propuesta más débil que la existente → no degradar, NO_ACTION.
+                        a["action"] = "NO_ACTION"
+                    elif action == previa:
+                        # Misma acción sin efecto → forzar escalado.
                         nueva = _esc.get(previa, "BLOCK")
                         print(f"  [ESCALADO FORZADO] {port}: {previa} → {nueva}")
                         a["action"] = nueva
@@ -834,8 +875,8 @@ def run_aiops_pipeline():
                         f"duration={inj['duration_sec']}s"
                     )
             except Exception as _e:
-                print(f"[WARN] attack_agent falló: {_e}")
-                registrar_log(f"WARN attack_agent falló: {_e}")
+                print(f"[WARN] attack_tool falló: {_e}")
+                registrar_log(f"WARN attack_tool falló: {_e}")
 
             # Sleep adaptativo: `intervalo_actual` es el período objetivo del ciclo
             # entero (telemetría + LLM + QoS). Sólo dormimos lo que falte para

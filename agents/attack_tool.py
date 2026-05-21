@@ -34,7 +34,7 @@ INJECTION_LOG  = os.path.join(TMP_DIR, "anomaly_injections.jsonl")
 HOST_PORT_FILE = os.path.join(TMP_DIR, "host_port_map.json")
 SERVICES_FILE  = os.path.join(TMP_DIR, "server_services.json")
 
-ATTACK_TYPES = ("port_scan", "dos_volumetric", "ddos")
+ATTACK_TYPES = ("dos_volumetric", "ddos")
 
 
 def _load_services():
