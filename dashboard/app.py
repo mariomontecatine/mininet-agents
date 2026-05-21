@@ -744,11 +744,11 @@ def api_failover_action():
         from utils.ssh_client import get_ssh_connection, send_tmux_command
         ssh = get_ssh_connection()
         if action == "kill":
-            # py net.get() corre como root (Mininet lo necesita) → puede matar procesos.
-            # Comillas dobles internas + simples externas → sin conflicto de quoting.
+            # subprocess.call desde el proceso Python de Mininet (root) → mata
+            # cualquier proceso sin pasar por shell ni tener problemas de quoting.
             send_tmux_command(
                 ssh,
-                f'py net.get("{server}").cmd("kill -9 $(pgrep -f service_launchers.py)")',
+                'py __import__("subprocess").call(["pkill", "-9", "-f", "service_launchers"])',
             )
         else:
             send_tmux_command(

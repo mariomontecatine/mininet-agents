@@ -158,7 +158,7 @@ def kill_server(ssh, server_name: str, svc_type: str):
     # con la VM, así que no hace falta ir a través del CLI de Mininet.
     send_tmux_command(
         ssh,
-        f'py net.get("{server_name}").cmd("kill -9 $(pgrep -f service_launchers.py)")',
+        'py __import__("subprocess").call(["pkill", "-9", "-f", "service_launchers"])',
     )
     time.sleep(0.3)
     print(f"  [FAILOVER] {server_name} ({svc_type}) apagado")
