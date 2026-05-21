@@ -177,15 +177,31 @@ _HTML = """\
 
     cy.fit(undefined, 60);
 
-    // Ctrl+rueda = zoom; rueda sola = scroll de la página padre
-    document.getElementById('cy').addEventListener('wheel', function(e) {
-      if (e.ctrlKey) {
-        e.preventDefault();
-        var factor = e.deltaY < 0 ? 1.15 : 0.87;
-        cy.zoom({ level: cy.zoom() * factor, renderedPosition: { x: e.offsetX, y: e.offsetY } });
-      } else {
-        window.parent.postMessage({ noc_scroll: e.deltaY }, '*');
+    // Rueda = zoom suave sobre el cursor
+    var _zoomTarget   = cy.zoom();
+    var _zoomCenterX  = 0;
+    var _zoomCenterY  = 0;
+    var _zoomRafId    = null;
+
+    function _animateZoom() {
+      var current = cy.zoom();
+      var diff    = _zoomTarget - current;
+      if (Math.abs(diff) < 0.001) {
+        cy.zoom({ level: _zoomTarget, renderedPosition: { x: _zoomCenterX, y: _zoomCenterY } });
+        _zoomRafId = null;
+        return;
       }
+      cy.zoom({ level: current + diff * 0.28, renderedPosition: { x: _zoomCenterX, y: _zoomCenterY } });
+      _zoomRafId = requestAnimationFrame(_animateZoom);
+    }
+
+    document.getElementById('cy').addEventListener('wheel', function(e) {
+      e.preventDefault();
+      var factor = e.deltaY < 0 ? 1.12 : 0.89;
+      _zoomTarget  = Math.min(cy.maxZoom(), Math.max(cy.minZoom(), _zoomTarget * factor));
+      _zoomCenterX = e.offsetX;
+      _zoomCenterY = e.offsetY;
+      if (!_zoomRafId) _zoomRafId = requestAnimationFrame(_animateZoom);
     }, { passive: false });
 
     // Guardar posiciones cada vez que se mueve un nodo
