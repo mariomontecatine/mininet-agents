@@ -1,6 +1,7 @@
 import sys
 import os
 import re
+import json
 import ollama
 import time
 
@@ -62,6 +63,38 @@ def _of_proto_match(protocol):
     if d.get("dport"):
         return f"{transport},tp_dst={d['dport']}"
     return transport
+
+# Niveles de agresividad para comparaciones de escalado/downgrade.
+_LEVELS = {"SHAPING": 1, "POLICING": 2, "BLOCK": 3}
+
+# ─── Rol de puerto (compartido con monitor_agent) ────────────────────────────
+_HOST_PORT_FILE = os.path.join(TMP_DIR, "host_port_map.json")
+_PORT_ROLE_CACHE: dict = {"data": None, "mtime": 0}
+
+
+def _get_port_role(port: str) -> str:
+    """Devuelve 'host', 'server' o 'trunk' para un puerto OVS. Cacheado por mtime."""
+    if not os.path.exists(_HOST_PORT_FILE):
+        return "trunk"
+    mtime = os.path.getmtime(_HOST_PORT_FILE)
+    if _PORT_ROLE_CACHE["data"] is None or mtime > _PORT_ROLE_CACHE["mtime"]:
+        try:
+            with open(_HOST_PORT_FILE, encoding="utf-8") as f:
+                hp = json.load(f)
+            port_to_host = {v: k for k, v in hp.items()}
+            roles = {}
+            for p, host in port_to_host.items():
+                if host.startswith("srv"):
+                    roles[p] = "server"
+                elif host.startswith("h"):
+                    roles[p] = "host"
+                else:
+                    roles[p] = "trunk"
+            _PORT_ROLE_CACHE["data"]  = roles
+            _PORT_ROLE_CACHE["mtime"] = mtime
+        except (json.JSONDecodeError, IOError):
+            return "trunk"
+    return _PORT_ROLE_CACHE["data"].get(port, "trunk")
 
 # Pesos de severidad por categoría — definen el orden de prioridad para el top-K.
 _CATEGORY_WEIGHT = {
@@ -360,13 +393,26 @@ def _extract_proto(line):
     return m.group(1) if m else None
 
 
-def _parse_alerts(raw_telemetry):
+def _parse_alerts(raw_telemetry, reglas_activas=None, skip_alerta_roja_ports=None):
     """
     Extrae alertas estructuradas (puerto, categoría, severidad, protocolo) del texto
     crudo de telemetría. Devuelve lista ordenada por severidad desc, sin duplicados.
+
+    reglas_activas: puertos con QoS activa — sus drops son del propio TBF/police,
+        no de un ataque nuevo. Se excluyen de [ALERTA ROJA] para evitar el bucle
+        drops→alerta→más QoS→más drops.
+    skip_alerta_roja_ports: conjunto adicional de puertos a ignorar en [ALERTA ROJA]
+        (p.ej. recientemente desescalados, con drops acumulados del ciclo anterior).
     """
     if not raw_telemetry:
         return []
+
+    # Puertos cuya [ALERTA ROJA] debe silenciarse porque sus drops son propios de la QoS.
+    _suppress = set()
+    if reglas_activas:
+        _suppress.update(reglas_activas.keys())
+    if skip_alerta_roja_ports:
+        _suppress.update(skip_alerta_roja_ports)
 
     alerts = []
 
@@ -375,8 +421,15 @@ def _parse_alerts(raw_telemetry):
 
         m = re.search(r"\[ALERTA ROJA\].*?Port\s+(s\d+-eth\d+):.*?drop_delta=(\d+)", line)
         if m:
+            port = m.group(1)
+            if port in _suppress:
+                # Drops causados por QoS propio (TBF overflow o tc police) — no actuar.
+                continue
+            if _get_port_role(port) == "trunk":
+                # Congestión en enlace backbone durante DDoS → no aplicar QoS aquí (sería FP).
+                continue
             alerts.append({
-                "port":     m.group(1),
+                "port":     port,
                 "category": "ALERTA ROJA",
                 "metric":   int(m.group(2)),
                 "protocol": proto,
@@ -441,11 +494,17 @@ def _default_action(alert, reglas_activas):
     proto = alert.get("protocol")
     base = DEFAULT_POLICY.get(cat, "POLICING")
 
-    # Si la acción propuesta coincide con la ya activa, hay que escalar.
+    # Comparar contra la restricción ya activa en este puerto.
     if reglas_activas and port in reglas_activas:
         previa = reglas_activas[port]["action"]
-        if base == previa:
+        if _LEVELS.get(base, 0) == _LEVELS.get(previa, 0):
+            # Mismo nivel → no está funcionando, escalar al siguiente.
             base = ESCALATION.get(previa, "BLOCK")
+        elif _LEVELS.get(base, 0) < _LEVELS.get(previa, 0):
+            # Acción propuesta más débil → no degradar la restricción existente.
+            return {"action": "NO_ACTION", "target_port": port,
+                    "rate_mbps": config.TASA_POLICING_MBPS,
+                    "reason": f"Restricción más agresiva ({previa}) ya activa"}
 
     reason = (
         f"Política por defecto ({cat}{' '+proto if proto else ''} → {base}, "
@@ -462,20 +521,23 @@ def _default_action(alert, reglas_activas):
     return out
 
 
-def fast_decide(raw_telemetry, reglas_activas=None):
+def fast_decide(raw_telemetry, reglas_activas=None, skip_alerta_roja_ports=None):
     """
     Decisión puramente determinista (sin LLM) para TODAS las alertas activas.
     Solo actúa sobre puertos que aún no tienen una regla aplicada — los que ya
     la tienen se dejan al LLM para que decida si escalar.
     Devuelve lista de acciones (puede estar vacía).
     """
-    alerts = _parse_alerts(raw_telemetry)
+    alerts = _parse_alerts(raw_telemetry,
+                           reglas_activas=reglas_activas,
+                           skip_alerta_roja_ports=skip_alerta_roja_ports)
     if not alerts:
         return []
     return [_default_action(a, reglas_activas) for a in alerts]
 
 
-def analyze_and_decide(report_text, raw_telemetry=None, reglas_activas=None):
+def analyze_and_decide(report_text, raw_telemetry=None, reglas_activas=None,
+                       skip_alerta_roja_ports=None):
     """
     Híbrido LLM + política determinista.
     - Las top-K alertas más críticas se envían al LLM (decisión informada).
@@ -484,7 +546,9 @@ def analyze_and_decide(report_text, raw_telemetry=None, reglas_activas=None):
     """
     print("\n[IA] Evaluando el informe (top-K LLM + política por defecto)...")
 
-    alerts = _parse_alerts(raw_telemetry)
+    alerts = _parse_alerts(raw_telemetry,
+                           reglas_activas=reglas_activas,
+                           skip_alerta_roja_ports=skip_alerta_roja_ports)
 
     # Fast-path: sin alertas ni reglas activas → NO_ACTION inmediato.
     if not alerts and not reglas_activas:

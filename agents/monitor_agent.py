@@ -70,6 +70,79 @@ def _role_multiplier(port):
 
 
 # ============================================================
+# === Protocolo dominante en un puerto (para [ALERTA ROJA]) ==
+# ============================================================
+
+_PORT_TO_IP_CACHE: dict = {"data": None, "mtime_hp": 0, "mtime_topo": 0}
+_TOPO_FILE = os.path.join(TMP_DIR, "topology.json")
+
+
+def _build_port_to_ip() -> dict:
+    """Devuelve {ovs_port: host_ip} cruzando host_port_map + topology."""
+    hp_mtime   = os.path.getmtime(HOST_PORT_FILE)  if os.path.exists(HOST_PORT_FILE)  else 0
+    topo_mtime = os.path.getmtime(_TOPO_FILE)       if os.path.exists(_TOPO_FILE)       else 0
+    c = _PORT_TO_IP_CACHE
+    if c["data"] is not None and hp_mtime == c["mtime_hp"] and topo_mtime == c["mtime_topo"]:
+        return c["data"]
+
+    result: dict = {}
+    try:
+        with open(HOST_PORT_FILE, encoding="utf-8") as f:
+            hp = json.load(f)           # {host_name: ovs_port}
+        with open(_TOPO_FILE, encoding="utf-8") as f:
+            topo = json.load(f)
+        name_to_ip = {}
+        ip_pat = r"^\d+\.\d+\.\d+\.\d+$"
+        for link in topo.get("links", []):
+            a, b = str(link.get("from", "")), str(link.get("to", ""))
+            if re.match(ip_pat, b) and not re.match(ip_pat, a):
+                name_to_ip[a] = b
+            elif re.match(ip_pat, a) and not re.match(ip_pat, b):
+                name_to_ip[b] = a
+        for name, port in hp.items():
+            ip = name_to_ip.get(name)
+            if ip:
+                result[port] = ip
+    except (json.JSONDecodeError, IOError, KeyError):
+        pass
+
+    c["data"], c["mtime_hp"], c["mtime_topo"] = result, hp_mtime, topo_mtime
+    return result
+
+
+def _dominant_proto_for_drop(port: str, flows: list) -> str | None:
+    """
+    Dado un puerto OVS con drops activos, identifica el protocolo/servicio que
+    domina el tráfico (≥50% de bytes) en los flujos sFlow del host conectado.
+
+    Devuelve el nombre del servicio (ej. 'ssh', 'http') si hay dominio claro,
+    None si no se puede determinar o el tráfico está repartido.
+    """
+    if not flows:
+        return None
+    port_to_ip = _build_port_to_ip()
+    host_ip = port_to_ip.get(port)
+    if not host_ip:
+        return None
+
+    svc_bytes: dict = {}
+    for f in flows:
+        if f.get("src") != host_ip and f.get("dst") != host_ip:
+            continue
+        svc = _proto_to_service(f.get("proto"), f.get("dport"))
+        if svc:
+            svc_bytes[svc] = svc_bytes.get(svc, 0) + f.get("bytes", 0)
+
+    if not svc_bytes:
+        return None
+    total = sum(svc_bytes.values())
+    if total == 0:
+        return None
+    dominant, dom_bytes = max(svc_bytes.items(), key=lambda x: x[1])
+    return dominant if (dom_bytes / total) >= 0.5 else None
+
+
+# ============================================================
 # === Capa C: baseline adaptativo (EMA por puerto) ===========
 # ============================================================
 
@@ -230,7 +303,7 @@ def detect_flow_anomalies(flows, host_port):
     # Scope: solo emitimos alertas de los tipos que el inyector está usando.
     # Evita ruido del baseline en heurísticas no evaluadas en esta ronda.
     try:
-        from agents.attack_agent import ATTACK_TYPES as _ACTIVE_ATTACKS
+        from agents.attack_tool import ATTACK_TYPES as _ACTIVE_ATTACKS
     except Exception:
         _ACTIVE_ATTACKS = ("port_scan", "dos_volumetric", "ddos")
 
@@ -526,6 +599,7 @@ def collect_telemetry():
                 important_lines.append(f">>> CONECTIVIDAD: {res.group(0)}")
 
         baseline = _load_baseline()
+        flows_snapshot = _load_flows() or []
 
         for port, val in deltas.items():
             if val["rx"] == 0 and val["tx"] == 0 and val["drop"] == 0:
@@ -558,7 +632,9 @@ def collect_telemetry():
             line   = f"Port {port}: rx_delta={rx_str}, tx_delta={tx_str}, drop_delta={val['drop']}"
 
             if val["drop"] > 0:
-                line = f"🔴 [ALERTA ROJA] {line} <-- ¡PÉRDIDA ACTIVA!"
+                drop_proto = _dominant_proto_for_drop(port, flows_snapshot)
+                proto_tag  = f" [proto={drop_proto}]" if drop_proto else ""
+                line = f"🔴 [ALERTA ROJA]{proto_tag} {line} <-- ¡PÉRDIDA ACTIVA!"
             if is_intense:
                 dev = max(ratio_rx, ratio_tx)
                 line = (

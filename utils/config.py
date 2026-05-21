@@ -33,7 +33,7 @@ DURACION_BULK = 35  # segundos de duración de cada ráfaga iperf
 ESPERA_POST_BULK = 25  # segundos de margen tras lanzar los clientes
 
 # --- Puertos estándar por servicio (referencia central) ---
-# Lo consultan traffic_agent (probes sintéticos) y las herramientas QoS por
+# Lo consultan traffic (probes sintéticos) y las herramientas QoS por
 # protocolo (resolver_agent.apply_*).
 SERVICE_PORTS = {
     "http":     80,
@@ -78,6 +78,11 @@ METRICS_MAX_ENTRIES = (
 # --- Dashboard web ---
 DASHBOARD_PORT = 5000
 
+# --- Failover (redundancia primario / secundario) ---
+FAILOVER_PROBE_TIMEOUT   = 2   # segundos para la sonda TCP de salud
+FAILOVER_FAIL_THRESHOLD  = 2   # sondas consecutivas fallidas → declarar servidor caído
+FAILOVER_CHECK_EVERY_N   = 1   # comprobar salud cada N ciclos NOC
+
 # --- Inyección de anomalías (motor de ataques sintéticos) ---
 ANOMALY_PROBABILITY = 0.30  # prob. por ciclo NOC de inyectar un ataque
 ANOMALY_MIN_DURATION = 30  # duración mínima de un ataque (s)
@@ -87,23 +92,18 @@ ANOMALY_RNG_SEED = None  # entero → resultados reproducibles; None → estocá
 
 # Umbrales de las heurísticas de anomalía sobre flujos sFlow
 FAN_OUT_THRESHOLD = 12  # ≥N destinos distintos desde 1 origen → port scan.
-# Subido de 5 a 12: con el nuevo fondo (HTTP + DNS + SSH + SIP + ICMP +
-# hping3-bg) cada host normal alcanza 6-8 destinos distintos en la ventana
-# sFlow de 20 s, lo que disparaba port_scan continuamente como FP. El ataque
-# real de port_scan barre 16 destinos → sigue cumpliendo el umbral con holgura.
 FAN_OUT_SUBNETS_THRESHOLD = 2  # ≥N subredes /24 distintas → confirma scan
-# Un escaneo real cruza subredes (h del lab → DMZ + corporativa); el tráfico
-# legítimo de un host suele quedarse en sus 1-2 subredes (su switch + DMZ).
-# Si fan_out alcanza el umbral pero todos los destinos están en ≤1 subred,
-# no es un scan — es un cliente con muchas conexiones a un grupo de servidores.
-FAN_IN_THRESHOLD = 5  # ≥N orígenes simultáneos hacia 1 destino → DDoS (5 para evitar FP de tráfico cliente→servidor legítimo)
-FAN_IN_BYTES_THRESHOLD = 50 * 1024 * 1024  # 50 MB combinados en ventana
-SURGE_BYTES_THRESHOLD = 120 * 1024 * 1024  # 120 MB en un solo flujo → DoS volumétrico
-# Punto medio entre el 50 MB original (ruido por bulk iperf legítimo) y el
-# 250 MB de d0df926 (perdía ataques de 30 s a 150 Mbps cuando la muestra
-# sFlow caía a caballo del ataque). Con ventana sFlow de 20 s, 120 MB pasa
-# con ~6 s de ataque a 150 Mbps; el bulk legítimo (100-160 MB) sigue rozando
-# pero no abre las puertas a todo.
+FAN_IN_THRESHOLD = 5   # ≥N orígenes simultáneos hacia 1 destino → DDoS
+FAN_IN_BYTES_THRESHOLD = 4 * 1024 * 1024   # 4 MB combinados en ventana sFlow
+# Calibrado para Mininet: hping3 en VM genera 2-10 Mbps reales (no los 40 Mbps
+# teóricos). En 20 s de ventana sFlow, 10 atacantes producen ~2 MB cada uno =
+# ~20 MB total hacia la víctima. Con el multiplicador de rol servidor (5×) el
+# floor queda en 20 MB → DDoS de 20 MB lo supera; tráfico legítimo (~4-5 MB)
+# no lo alcanza.
+SURGE_BYTES_THRESHOLD = 8 * 1024 * 1024    # 8 MB en un solo flujo → DoS volumétrico
+# Calibrado para Mininet: un flujo DoS de hping3 (-i u100 -d 1000) alcanza
+# ~5-15 MB en la ventana sFlow de 20 s con sampling=16. El tráfico legítimo
+# por par h*→srv* ronda 0.5-2 MB → threshold de 8 MB separa ruido de ataque.
 
 # --- Capa A: multiplicadores por rol de puerto ---
 # El detector aplica el umbral base × multiplier según rol topológico del puerto.
