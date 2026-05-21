@@ -681,15 +681,51 @@ def api_services():
 
 @app.route("/api/failover/state")
 def api_failover_state():
-    """Estado actual del sistema de failover (salud de servidores y redirecciones)."""
-    state = _load_json("failover_state.json", {"servers": {}})
-    return jsonify(state)
+    """
+    Estado actual del failover. Si el supervisor aún no ha escrito
+    failover_state.json, lo construye desde server_services.json para que
+    los botones aparezcan desde el primer momento.
+    """
+    state = _load_json("failover_state.json", {})
+    if state.get("servers"):
+        return jsonify(state)
+
+    # Fallback: detectar par automáticamente desde server_services.json
+    services = _load_json("server_services.json", {})
+    by_type: dict = {}
+    for name in sorted(services):
+        t = services[name].get("type")
+        if t:
+            by_type.setdefault(t, []).append(name)
+
+    pair = None
+    for names in by_type.values():
+        if len(names) >= 2:
+            pair = (names[0], names[1])
+            break
+
+    if not pair:
+        return jsonify({"servers": {}})
+
+    primary, secondary = pair
+    return jsonify({
+        "servers": {
+            primary: {
+                "status":         "unknown",
+                "fails":          0,
+                "redirected_to":  None,
+                "redirect_since": None,
+                "last_probe":     None,
+                "secondary":      secondary,
+            }
+        }
+    })
 
 
 @app.route("/api/failover/action", methods=["POST"])
 def api_failover_action():
     """
-    Encola una acción de failover manual.
+    Ejecuta inmediatamente una acción de failover manual vía SSH.
     Body: {"action": "kill"|"revive", "server": "srv1"}
     """
     payload = request.get_json(silent=True) or {}
@@ -699,6 +735,30 @@ def api_failover_action():
     if action not in ("kill", "revive") or not server:
         return jsonify({"ok": False, "error": "Parámetros inválidos"}), 400
 
+    # Obtener tipo de servicio del servidor
+    services = _load_json("server_services.json", {})
+    svc_info = services.get(server, {})
+    svc_type = svc_info.get("type", "http")
+
+    try:
+        from utils.ssh_client import get_ssh_connection, send_tmux_command
+        ssh = get_ssh_connection()
+        if action == "kill":
+            send_tmux_command(
+                ssh,
+                f"{server} pkill -f 'service_launchers.py {svc_type}' 2>/dev/null; true",
+            )
+        else:
+            send_tmux_command(
+                ssh,
+                f"{server} python3 /tmp/service_launchers.py {svc_type} "
+                f"> /tmp/svc_{server}.log 2>&1 &",
+            )
+        ssh.close()
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"SSH: {e}"}), 500
+
+    # También encolar para que el supervisor actualice el estado de failover
     req_path = os.path.join(_TMP_DIR, "failover_requests.json")
     reqs: list = []
     try:
@@ -711,9 +771,10 @@ def api_failover_action():
     try:
         with open(req_path, "w", encoding="utf-8") as f:
             json.dump(reqs, f)
-    except IOError as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-    return jsonify({"ok": True, "queued": {"action": action, "server": server}})
+    except IOError:
+        pass
+
+    return jsonify({"ok": True, "executed": {"action": action, "server": server, "type": svc_type}})
 
 
 # Catálogo (proto_num, dport) → service para el dashboard. Construido una vez

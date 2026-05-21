@@ -2141,38 +2141,42 @@ async function updateFailover() {
     return;
   }
 
-  hint.textContent = 'actualizado ' + (state.ts || '').replace('T', ' ');
+  hint.textContent = state.ts
+    ? 'NOC activo · ' + state.ts.replace('T', ' ')
+    : 'NOC no iniciado · controles disponibles';
 
   let html = '';
   for (const name of names) {
-    const s = servers[name];
-    const st = s.status || 'up';
-    let badgeCls = 'fo-up', badgeLabel = '● Online';
-    if (st === 'redirected')    { badgeCls = 'fo-redir'; badgeLabel = '⇄ Redirigiendo'; }
-    else if (st === 'failing')  { badgeCls = 'fo-down';  badgeLabel = '○ Comprobando…'; }
-    else if (st === 'down')     { badgeCls = 'fo-down';  badgeLabel = '✗ Caído'; }
+    const s  = servers[name];
+    const st = s.status || 'unknown';
 
+    let badgeCls = 'fo-up', badgeLabel = '● Online';
+    if      (st === 'unknown')    { badgeCls = 'fo-up';   badgeLabel = '○ Sin datos'; }
+    else if (st === 'redirected') { badgeCls = 'fo-redir'; badgeLabel = '⇄ Redirigiendo'; }
+    else if (st === 'failing')    { badgeCls = 'fo-down';  badgeLabel = '○ Comprobando…'; }
+    else if (st === 'down')       { badgeCls = 'fo-down';  badgeLabel = '✗ Caído'; }
+
+    const sec   = s.secondary || s.redirected_to;
     const redir = s.redirected_to
-      ? `<span style="color:var(--yellow);font-size:10px;margin-left:6px">→ ${escHtml(s.redirected_to)} (desde ciclo ${s.redirect_since})</span>`
-      : '';
+      ? `<span style="color:var(--yellow);font-size:10px;margin-left:6px">→ ${escHtml(s.redirected_to)} (ciclo ${s.redirect_since})</span>`
+      : (sec ? `<span style="color:var(--dim);font-size:10px;margin-left:6px">secundario: ${escHtml(sec)}</span>` : '');
     const fails = s.fails > 0
       ? `<span style="color:var(--dim);font-size:10px;margin-left:4px">${s.fails} fallo(s)</span>`
       : '';
     const probe = s.last_probe
-      ? `<span style="color:var(--dim);font-size:10px">Sonda: ${s.last_probe.replace('T',' ')}</span>`
-      : '';
+      ? `<span style="color:var(--dim);font-size:10px">Sonda: ${s.last_probe.replace('T', ' ')}</span>`
+      : `<span style="color:var(--dim);font-size:10px">Sonda: esperando primer ciclo NOC</span>`;
 
     const killBtn   = `<button class="fo-btn fo-btn-kill"   onclick="failoverAction('kill',  '${escHtml(name)}')">Tumbar</button>`;
     const reviveBtn = `<button class="fo-btn fo-btn-revive" onclick="failoverAction('revive','${escHtml(name)}')">Recuperar</button>`;
 
     html +=
-      `<div style="display:flex;flex-direction:column;gap:6px;min-width:240px;
+      `<div style="display:flex;flex-direction:column;gap:6px;min-width:260px;
                    padding:10px 14px;border:1px solid var(--border);border-radius:4px">` +
-        `<div style="display:flex;align-items:center;gap:8px">` +
+        `<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">` +
           `<code style="font-size:12px">${escHtml(name)}</code>` +
           `<span class="fo-badge ${badgeCls}">${badgeLabel}</span>` +
-          redir +
-          fails +
+          redir + fails +
         `</div>` +
         `<div style="display:flex;gap:6px;align-items:center">${killBtn}${reviveBtn}${probe}</div>` +
       `</div>`;
@@ -2181,8 +2185,6 @@ async function updateFailover() {
 }
 
 async function failoverAction(action, server) {
-  const label = action === 'kill' ? `Tumbar ${server}` : `Recuperar ${server}`;
-  if (!confirm(`¿${label}?`)) return;
   try {
     const r = await fetch('/api/failover/action', {
       method: 'POST',
