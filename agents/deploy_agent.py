@@ -187,15 +187,7 @@ def _persist_server_services(server_types, host_ips):
         pass
     return services
 
-# Timeout en segundos por llamada al LLM del deploy.
-# Si el modelo se atasca, cortamos y reintentamos en vez de colgar el supervisor.
-_DEPLOY_LLM_TIMEOUT = getattr(config, "DEPLOY_LLM_TIMEOUT", 90)
-
-# Cliente Ollama con timeout (mismo patrón que resolver_agent).
-_ollama_deploy_client = ollama.Client(
-    host="http://localhost:11434",
-    timeout=_DEPLOY_LLM_TIMEOUT,
-)
+_ollama_deploy_client = ollama.Client(host="http://localhost:11434")
 
 
 def generate_network_intent(user_prompt):
@@ -291,7 +283,7 @@ def generate_network_intent(user_prompt):
     for intento in range(1, 4):
         try:
             print(f"[IA] Intento {intento}/3 con {MODEL_NAME} "
-                  f"(timeout={_DEPLOY_LLM_TIMEOUT}s, mensajes={len(messages)})...")
+                  f"(mensajes={len(messages)})...")
             t0 = time.time()
             response = _ollama_deploy_client.chat(
                 model=MODEL_NAME,
