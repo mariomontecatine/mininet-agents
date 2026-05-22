@@ -26,7 +26,6 @@ TASA_POLICING_MBPS = 20  # límite por defecto en POLICING y SHAPING
 # --- Resolver: split LLM/política ---
 RESOLVER_LLM_TOPK = 3  # nº de alertas más críticas que decide el LLM; el resto va a política por defecto
 RESOLVER_LLM_TIMEOUT = 45  # segundos máx por llamada al LLM antes de hacer fallback
-DEPLOY_LLM_TIMEOUT = 90  # segundos máx por llamada al LLM de despliegue (solo al arrancar)
 
 # --- Tráfico bulk (simulación de usuarios reales) ---
 DURACION_BULK = 35  # segundos de duración de cada ráfaga iperf
@@ -80,8 +79,8 @@ DASHBOARD_PORT = 5000
 
 # --- Failover (redundancia primario / secundario) ---
 FAILOVER_PROBE_TIMEOUT   = 2   # segundos para la sonda TCP de salud
-FAILOVER_FAIL_THRESHOLD  = 2   # sondas consecutivas fallidas → declarar servidor caído
-FAILOVER_CHECK_EVERY_N   = 1   # comprobar salud cada N ciclos NOC
+FAILOVER_FAIL_THRESHOLD  = 1   # sondas consecutivas fallidas → declarar servidor caído
+FAILOVER_POLL_INTERVAL   = 2   # segundos entre sondas (hilo dedicado, no atado al ciclo NOC)
 
 # --- Inyección de anomalías (motor de ataques sintéticos) ---
 ANOMALY_PROBABILITY = 0.30  # prob. por ciclo NOC de inyectar un ataque

@@ -47,7 +47,8 @@ from agents.sflow import (
 from agents.attack_tool import maybe_inject_anomaly, build_host_port_map
 from agents.attack_report import generate_report as generate_anomaly_report
 from agents.failover import (
-    load_server_info, auto_select_pair, check_failover,
+    load_server_info, auto_select_pair,
+    start_failover_loop, stop_failover_loop, drain_llm_messages, set_log_callback,
     FAILOVER_STATE_FILE,
 )
 
@@ -453,7 +454,7 @@ def run_aiops_pipeline():
         "host_port_map.json", "topology.json", "port_baseline.json",
         "server_services.json",
         # failover
-        "failover_state.json", "failover_requests.json",
+        "failover_state.json", "failover_requests.json", "failover_history.jsonl",
         # informes y artefactos de agentes
         "ultimo_informe.txt", "ultima_rafaga_realista.txt",
         # audit log: se reinicia por sesión — para histórico usa saved_runs/
@@ -624,7 +625,7 @@ def run_aiops_pipeline():
     ciclo = 1
     intervalo_actual = config.INTERVALO_BASE
 
-    # ── Failover: seleccionar par primario/secundario ─────────────────────────
+    # ── Failover: seleccionar par primario/secundario y arrancar hilo dedicado ──
     _fo_server_info = load_server_info()
     _fo_pair        = auto_select_pair(_fo_server_info)
     if _fo_pair:
@@ -632,6 +633,11 @@ def run_aiops_pipeline():
             f"FAILOVER: par seleccionado — primario={_fo_pair[0]}, secundario={_fo_pair[1]}"
         )
         print(f"[FAILOVER] Par: {_fo_pair[0]} (primario) → {_fo_pair[1]} (secundario)")
+        # El hilo de failover sondea cada FAILOVER_POLL_INTERVAL segundos
+        # — independiente del ciclo NOC, así reacciona en segundos. Los
+        # eventos los escribe directamente al audit log vía registrar_log.
+        set_log_callback(registrar_log)
+        start_failover_loop(_fo_pair, lambda: _current_ciclo)
     else:
         print("[FAILOVER] No se encontró par válido (necesita 2 servidores del mismo tipo en el mismo bridge)")
 
@@ -649,20 +655,16 @@ def run_aiops_pipeline():
             print_header(f"CICLO DE SUPERVISIÓN #{ciclo}")
             registrar_log(f"--- Iniciando Ciclo #{ciclo} (intervalo={intervalo_actual}s) ---")
 
-            # ── A0. FAILOVER: sonda de salud + redirección ────────────────────
-            if _fo_pair and ciclo % config.FAILOVER_CHECK_EVERY_N == 0:
-                _fo_server_info = load_server_info()   # refresca IPs/puertos
-                fo_lines = check_failover(_fo_server_info, _fo_pair, ciclo)
-                for _fl in fo_lines:
-                    registrar_log(_fl)
-            else:
-                fo_lines = []
+            # ── A0. FAILOVER: el hilo dedicado sondea cada FAILOVER_POLL_INTERVAL
+            # segundos. Aquí solo drenamos los veredictos asíncronos del LLM
+            # para que aparezcan en la entrada del monitor.
+            fo_lines = drain_llm_messages() if _fo_pair else []
 
             # ── A. TELEMETRÍA: bloqueo SSH breve ─────────────────────────────
             with _live_lock:
                 telemetry = collect_telemetry()
 
-            # Incorporar líneas de failover (sonda de salud)
+            # Incorporar veredictos del LLM de failover
             if fo_lines:
                 telemetry = (telemetry or "") + "\n" + "\n".join(fo_lines)
 
@@ -899,6 +901,7 @@ def run_aiops_pipeline():
     except KeyboardInterrupt:
         print_header("SUPERVISOR DETENIDO POR EL USUARIO")
         registrar_log("=== APAGADO DEL SISTEMA (Intervención manual) ===")
+        stop_failover_loop()
         stop_background_traffic()
         try:
             from utils.ssh_client import get_ssh_connection
