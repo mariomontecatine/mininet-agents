@@ -722,6 +722,27 @@ def api_failover_state():
     })
 
 
+@app.route("/api/failover/history")
+def api_failover_history():
+    """Historial completo de eventos del par primario/secundario
+    (down / recover / llm). Lo escribe failover._append_history()."""
+    path = os.path.join(_TMP_DIR, "failover_history.jsonl")
+    events: list = []
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    events.append(json.loads(line))
+                except json.JSONDecodeError:
+                    pass
+    except FileNotFoundError:
+        pass
+    return jsonify({"events": events})
+
+
 @app.route("/api/failover/action", methods=["POST"])
 def api_failover_action():
     """
@@ -744,13 +765,11 @@ def api_failover_action():
         from utils.ssh_client import get_ssh_connection, send_tmux_command
         ssh = get_ssh_connection()
         if action == "kill":
-            # fuser mata por puerto dentro del netns del host — independiente del
-            # nombre del proceso en /proc. Corre via cmd() para estar en el netns correcto.
             port = svc_info.get("port", 80)
             transport = svc_info.get("transport", "tcp")
             send_tmux_command(
                 ssh,
-                f'py net.get("{server}").cmd("fuser -k {port}/{transport} 2>/dev/null; true")',
+                f'py net.get("{server}").cmd("fuser -k {port}/{transport} 2>/dev/null")',
             )
         else:
             send_tmux_command(

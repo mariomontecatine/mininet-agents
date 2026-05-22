@@ -542,6 +542,11 @@
       <div class="panel-body" id="fo-body" style="display:flex;align-items:center;gap:24px;flex-wrap:wrap;min-height:48px">
         <span style="color:var(--dim);font-size:11px">Sin par de failover configurado.</span>
       </div>
+      <div class="panel-hd" style="border-top:1px solid var(--border);margin-top:8px;padding-top:8px">
+        <span class="panel-title" style="font-size:12px">Timeline de caídas y recuperaciones</span>
+        <span class="panel-hint" id="fo-tl-hint">—</span>
+      </div>
+      <div class="panel-body" id="fo-timeline" style="min-height:80px;font-size:11px"></div>
     </div>
   </div>
 
@@ -2210,6 +2215,66 @@ async function failoverAction(action, server, btn) {
 }
 
 updateFailover();
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FAILOVER TIMELINE — historial de caídas, recuperaciones y veredictos del LLM
+// ═══════════════════════════════════════════════════════════════════════════
+async function updateFailoverTimeline() {
+  let data;
+  try {
+    data = await fetch('/api/failover/history').then(r => r.json());
+  } catch { return; }
+  const el   = document.getElementById('fo-timeline');
+  const hint = document.getElementById('fo-tl-hint');
+  const evs  = (data.events || []);
+  if (!evs.length) {
+    hint.textContent = 'sin eventos aún';
+    el.innerHTML = '<span style="color:var(--dim);font-size:11px">No ha habido caídas en esta sesión.</span>';
+    return;
+  }
+  const downs    = evs.filter(e => e.type === 'down').length;
+  const recovers = evs.filter(e => e.type === 'recover').length;
+  const llms     = evs.filter(e => e.type === 'llm');
+  const conf     = llms.filter(e => e.status === 'confirm').length;
+  const div      = llms.filter(e => e.status === 'diverge').length;
+  hint.textContent =
+    `${downs} caída(s) · ${recovers} recuperación(es) · LLM: ${conf} confirmadas, ${div} divergentes`;
+
+  // Línea temporal compacta: cada evento es un chip con color e info breve.
+  // Se ordena del más reciente al más antiguo y se muestran los últimos 60.
+  const last = evs.slice(-60).reverse();
+  const palette = {
+    down:    { bg:'rgba(220,80,80,0.18)',  fg:'var(--red)',    glyph:'✗' },
+    recover: { bg:'rgba(80,200,120,0.18)', fg:'var(--green)',  glyph:'↺' },
+    llm:     { bg:'rgba(120,160,220,0.18)',fg:'var(--blue)',   glyph:'•' },
+  };
+  const rows = last.map(ev => {
+    const p = palette[ev.type] || { bg:'#222', fg:'var(--dim)', glyph:'•' };
+    let body = '';
+    if (ev.type === 'down') {
+      body = `<b>${escHtml(ev.primary)}</b> caído → redirigido a <b>${escHtml(ev.secondary || '?')}</b> (ciclo ${ev.ciclo})`;
+    } else if (ev.type === 'recover') {
+      body = `<b>${escHtml(ev.primary)}</b> recuperado · redirección eliminada (ciclo ${ev.ciclo})`;
+    } else if (ev.type === 'llm') {
+      const tag = ev.status === 'confirm' ? `confirma '${escHtml(ev.det)}'`
+              : ev.status === 'diverge'   ? `discrepa: LLM '${escHtml(ev.llm)}' vs acción '${escHtml(ev.det)}'`
+              :                              `sin respuesta`;
+      body = `LLM ${tag} · ${ev.dt}s${ev.reason ? ' · ' + escHtml(ev.reason) : ''}`;
+    } else {
+      body = escHtml(JSON.stringify(ev));
+    }
+    const ts = (ev.ts || '').replace('T', ' ');
+    return `<div style="display:flex;gap:8px;padding:3px 0;border-bottom:1px solid rgba(255,255,255,0.04)">
+              <span style="background:${p.bg};color:${p.fg};border-radius:3px;padding:1px 6px;font-size:10px;flex-shrink:0">${p.glyph} ${ev.type}</span>
+              <code style="color:var(--dim);font-size:10px;flex-shrink:0">${ts}</code>
+              <span>${body}</span>
+            </div>`;
+  });
+  el.innerHTML = rows.join('');
+}
+
+updateFailoverTimeline();
+setInterval(updateFailoverTimeline, 3000);
 </script>
 </body>
 </html>
