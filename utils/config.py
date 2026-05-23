@@ -92,17 +92,18 @@ ANOMALY_RNG_SEED = None  # entero → resultados reproducibles; None → estocá
 # Umbrales de las heurísticas de anomalía sobre flujos sFlow
 FAN_OUT_THRESHOLD = 12  # ≥N destinos distintos desde 1 origen → port scan.
 FAN_OUT_SUBNETS_THRESHOLD = 2  # ≥N subredes /24 distintas → confirma scan
-FAN_IN_THRESHOLD = 5   # ≥N orígenes simultáneos hacia 1 destino → DDoS
-FAN_IN_BYTES_THRESHOLD = 4 * 1024 * 1024   # 4 MB combinados en ventana sFlow
-# Calibrado para Mininet: hping3 en VM genera 2-10 Mbps reales (no los 40 Mbps
-# teóricos). En 20 s de ventana sFlow, 10 atacantes producen ~2 MB cada uno =
-# ~20 MB total hacia la víctima. Con el multiplicador de rol servidor (5×) el
-# floor queda en 20 MB → DDoS de 20 MB lo supera; tráfico legítimo (~4-5 MB)
-# no lo alcanza.
-SURGE_BYTES_THRESHOLD = 8 * 1024 * 1024    # 8 MB en un solo flujo → DoS volumétrico
-# Calibrado para Mininet: un flujo DoS de hping3 (-i u100 -d 1000) alcanza
-# ~5-15 MB en la ventana sFlow de 20 s con sampling=16. El tráfico legítimo
-# por par h*→srv* ronda 0.5-2 MB → threshold de 8 MB separa ruido de ataque.
+FAN_IN_THRESHOLD = 6   # ≥N orígenes simultáneos hacia 1 destino → DDoS
+FAN_IN_BYTES_THRESHOLD = 12 * 1024 * 1024  # 12 MB combinados en ventana sFlow
+# Calibrado para reducir falsos positivos: el bulk legítimo observado llega a
+# ~3.8 MB de fan-in (2 srcs) y ~2.7 MB con 5 srcs concurrentes. Con threshold
+# de 12 MB + multiplicador de rol servidor (5×) el floor queda en 60 MB hacia
+# un srv*, separando holgadamente el tráfico de usuarios reales de los ataques
+# (DDoS hping3 más intenso → 150-300 MB agregados hacia la víctima).
+SURGE_BYTES_THRESHOLD = 20 * 1024 * 1024   # 20 MB en un solo flujo → DoS volumétrico
+# Calibrado para reducir falsos positivos: el flujo único legítimo más grande
+# observado es ~2.5 MB en 20 s. Threshold de 20 MB deja 8× de margen.
+# El DoS volumétrico tras la subida de intensidad (-i u50 -d 1400) genera
+# 25-40 MB por flujo en la misma ventana → cruza claramente el umbral.
 
 # --- Capa A: multiplicadores por rol de puerto ---
 # El detector aplica el umbral base × multiplier según rol topológico del puerto.
@@ -115,5 +116,6 @@ PORT_ROLE_MULTIPLIER = {
 
 # --- Capa C: baseline adaptativo (EMA por puerto) ---
 BASELINE_EMA_ALPHA = 0.25  # peso del valor actual en la EMA. ~4-5 ciclos efectivos.
-BASELINE_ALERT_K = 4.0  # delta actual > k × EMA → considerar anomalía
+BASELINE_ALERT_K = 6.0  # delta actual > k × EMA → considerar anomalía. 6× evita
+                        # falsos positivos por picos transitorios del bulk iperf.
 BASELINE_WARMUP = 3  # ciclos de aprendizaje antes de empezar a alertar

