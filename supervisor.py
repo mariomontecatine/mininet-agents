@@ -392,12 +392,18 @@ def _flow_watcher():
                 continue
 
             # Acción inmediata: fast_decide sobre las líneas recién detectadas.
+            # `fast_decide` (vía `_default_action`) ya respeta los puertos que
+            # tienen una regla más agresiva: en ese caso devuelve NO_ACTION.
+            # Si la nueva alerta justifica un escalado, devuelve la acción más
+            # fuerte. NO filtramos aquí por `target_port in _reglas_activas`
+            # porque eso bloqueaba escalados legítimos (causa observada del
+            # bug "DoS detectado pero no resuelto" cuando el puerto del
+            # atacante ya tenía SHAPING de un FP previo).
             fake_telemetry = "\n".join(lines)
             fast_actions = fast_decide(fake_telemetry, _reglas_activas)
             new_fast = [
                 a for a in fast_actions
                 if a.get("action") not in ("NO_ACTION", None)
-                and a.get("target_port") not in _reglas_activas
             ]
             if not new_fast:
                 continue
@@ -408,13 +414,15 @@ def _flow_watcher():
             for a in new_fast:
                 p = a["target_port"]
                 proto = a.get("protocol")
+                was_active = p in _reglas_activas
                 _reglas_activas[p] = {
                     "action": a["action"], "ciclo": ciclo_now, "protocol": proto,
                 }
                 _ciclos_limpios[p] = 0
                 proto_tag = f" [proto={proto}]" if proto else ""
+                tag = "[FLOW-ESC]" if was_active else "[FLOW]"
                 registrar_log(
-                    f"ACCIÓN RÁPIDA [FLOW]: {a['action']}{proto_tag} en {p}. "
+                    f"ACCIÓN RÁPIDA {tag}: {a['action']}{proto_tag} en {p}. "
                     f"Motivo: {a.get('reason', 'Automático')}"
                 )
                 _write_qos_event(p, a["action"], "apply", ciclo_now, protocol=proto)

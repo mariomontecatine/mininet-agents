@@ -240,6 +240,25 @@ def _record_flow_alert(rec):
         pass
 
 
+# Víctimas DDoS recientes — memoria deslizante: dst_ip → epoch_last_seen.
+# Sin este estado el dedup DDoS↔DoS volumétrico solo funciona dentro de un
+# mismo snapshot. Entre snapshots, si en uno los srcs caen bajo el threshold
+# DDoS pero los flujos individuales aún cruzan SURGE, se contaban como DoS
+# individuales (los "fantasma" del usuario). Con esta memoria de 60s
+# silenciamos esos DoS hacia víctimas DDoS activas.
+_RECENT_DDOS_VICTIMS: dict = {}
+_DDOS_VICTIM_TTL = 60.0
+
+
+def _gc_ddos_victims(now=None):
+    """Elimina víctimas DDoS cuyo TTL expiró."""
+    now = now if now is not None else time.time()
+    expired = [ip for ip, ts in _RECENT_DDOS_VICTIMS.items()
+               if now - ts > _DDOS_VICTIM_TTL]
+    for ip in expired:
+        del _RECENT_DDOS_VICTIMS[ip]
+
+
 def detect_flow_anomalies(flows, host_port):
     """
     Heurísticas sobre el snapshot live de flujos sFlow.
@@ -249,6 +268,10 @@ def detect_flow_anomalies(flows, host_port):
       - port_scan      : fan_out ≥ FAN_OUT_THRESHOLD
       - ddos_fanin     : fan_in  ≥ FAN_IN_THRESHOLD AND bytes ≥ FAN_IN_BYTES_THRESHOLD
       - dos_volumetric : un flujo individual ≥ SURGE_BYTES_THRESHOLD
+
+    Las víctimas DDoS detectadas se memorizan 60s para suprimir DoS
+    volumétricos hacia ellas (evita doble conteo del mismo ataque distribuido
+    cuando la coordinación temporal del DDoS oscila por debajo del threshold).
     """
     if not flows:
         return []
@@ -332,6 +355,9 @@ def detect_flow_anomalies(flows, host_port):
                 "ts":      ts,
             })
 
+    now_epoch = time.time()
+    _gc_ddos_victims(now_epoch)
+
     ddos_victim_ips: set = set()
     if "ddos" in _ACTIVE_ATTACKS:
         for dst_ip, srcs in fan_in_srcs.items():
@@ -343,6 +369,7 @@ def detect_flow_anomalies(flows, host_port):
             if (len(srcs) >= config.FAN_IN_THRESHOLD
                     and fan_in_bytes.get(dst_ip, 0) >= fanin_floor):
                 ddos_victim_ips.add(dst_ip)
+                _RECENT_DDOS_VICTIMS[dst_ip] = now_epoch
                 # Servicio dominante hacia la víctima — el que acumula más bytes.
                 by_svc = fan_in_by_svc.get(dst_ip) or {}
                 dom_svc = max(by_svc, key=by_svc.get) if by_svc else None
@@ -359,8 +386,14 @@ def detect_flow_anomalies(flows, host_port):
 
     if "dos_volumetric" in _ACTIVE_ATTACKS:
         for src_ip, dst_ip, b, pkts, svc in surge_flows:
+            # Dedup intra-snapshot (DDoS detectado en este mismo paso).
             if dst_ip in ddos_victim_ips:
-                continue  # already counted as DDoS target, skip individual DoS
+                continue
+            # Dedup inter-snapshot: víctima DDoS reciente (≤60s). Evita los
+            # "DoS fantasma" cuando los srcs de un DDoS oscilan por debajo del
+            # threshold pero siguen mandando flujos volumétricos individuales.
+            if dst_ip in _RECENT_DDOS_VICTIMS:
+                continue
             src_host = ip_to_name.get(src_ip, src_ip)
             dst_host = ip_to_name.get(dst_ip, dst_ip)
             alerts.append({
