@@ -455,6 +455,8 @@ def run_aiops_pipeline():
         "server_services.json",
         # failover
         "failover_state.json", "failover_requests.json", "failover_history.jsonl",
+        # QoS por intent del usuario
+        "qos_intent_state.json",
         # informes y artefactos de agentes
         "ultimo_informe.txt", "ultima_rafaga_realista.txt",
         # audit log: se reinicia por sesión — para histórico usa saved_runs/

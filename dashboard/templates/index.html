@@ -271,6 +271,63 @@
     .fo-btn-kill  { border-color:var(--red);    color:var(--red); }
     .fo-btn-revive{ border-color:#50c878;        color:#50c878; }
 
+    /* ── QoS intent chat ── */
+    .qi-bar { display:flex; gap:8px; flex-wrap:wrap; align-items:center;
+              margin-bottom:10px; }
+    .qi-bar label { color:var(--muted); font-size:11px; letter-spacing:.05em;
+                    text-transform:uppercase; }
+    .qi-bar select, .qi-bar input[type="number"] {
+      background:var(--panel-hd); color:var(--text); border:1px solid var(--border);
+      border-radius:3px; padding:4px 8px; font:inherit; font-size:12px;
+    }
+    .qi-input { display:flex; gap:8px; flex-wrap:wrap; }
+    .qi-input textarea {
+      flex:1; min-width:280px; min-height:54px;
+      background:var(--panel-hd); color:var(--text);
+      border:1px solid var(--border); border-radius:3px;
+      padding:8px 10px; font:inherit; font-size:12px; line-height:1.5;
+      resize:vertical;
+    }
+    .qi-actions { display:flex; flex-direction:column; gap:4px; }
+    .qi-msg {
+      font-size:11px; margin-top:8px; padding:6px 10px; border-radius:3px;
+      border:1px solid var(--border); display:none;
+    }
+    .qi-msg.ok   { display:block; color:var(--green); border-color:rgba(115,191,105,.3); background:rgba(115,191,105,.06); }
+    .qi-msg.err  { display:block; color:var(--red);   border-color:rgba(242,73,92,.3);   background:rgba(242,73,92,.06); }
+    .qi-msg.info { display:block; color:var(--muted); }
+    .qi-plan {
+      margin-top:10px; padding:10px 12px; border:1px solid var(--border);
+      border-radius:3px; background:rgba(255,255,255,.02);
+    }
+    .qi-plan h4 {
+      font-size:11px; font-weight:600; color:var(--text);
+      text-transform:uppercase; letter-spacing:.06em; margin-bottom:6px;
+    }
+    .qi-plan-meta { font-size:11px; color:var(--muted); margin-bottom:8px; }
+    .qi-plan-meta b { color:var(--text); }
+    .qi-table { width:100%; border-collapse:collapse; font-size:11px; }
+    .qi-table th, .qi-table td {
+      text-align:left; padding:5px 8px; border-bottom:1px solid var(--border);
+    }
+    .qi-table th { color:var(--muted); font-weight:600; text-transform:uppercase;
+                   letter-spacing:.05em; font-size:10px; }
+    .qi-tier { font-size:9px; padding:2px 6px; border-radius:2px; text-transform:uppercase;
+               letter-spacing:.05em; font-weight:600; }
+    .qi-tier.interactive { background:rgba(80,200,120,.15); color:var(--green); }
+    .qi-tier.streaming   { background:rgba(87,148,242,.15); color:var(--blue); }
+    .qi-tier.bulk        { background:rgba(250,170,42,.15); color:var(--orange); }
+    .qi-tier.best_effort { background:rgba(110,113,119,.15); color:var(--muted); }
+    .qi-suggest {
+      display:flex; gap:6px; flex-wrap:wrap; margin-top:6px;
+    }
+    .qi-suggest button {
+      background:transparent; border:1px solid var(--border); color:var(--muted);
+      font:inherit; font-size:10px; padding:3px 8px; border-radius:12px;
+      cursor:pointer; transition:.15s;
+    }
+    .qi-suggest button:hover { border-color:var(--blue); color:var(--blue); }
+
     /* ── Heatmap ── */
     #heatmap-canvas { display: block; width: 100%; cursor: crosshair; }
     #heatmap-tooltip {
@@ -547,6 +604,42 @@
         <span class="panel-hint" id="fo-tl-hint">—</span>
       </div>
       <div class="panel-body" id="fo-timeline" style="min-height:80px;font-size:11px"></div>
+    </div>
+  </div>
+
+  <!-- ROW 3e: QoS declarativa por intent del usuario -->
+  <div class="row">
+    <div class="panel">
+      <div class="panel-hd">
+        <span class="panel-title">QoS por intent · &quot;qué voy a usar&quot;</span>
+        <span class="panel-hint" id="qi-hint">describe en lenguaje natural qué apps usarás y se reparte el ancho de banda</span>
+      </div>
+      <div class="panel-body">
+        <div class="qi-bar">
+          <label for="qi-host">Host</label>
+          <select id="qi-host"><option value="">(auto)</option></select>
+          <label for="qi-mbps">Línea (Mbps)</label>
+          <input id="qi-mbps" type="number" min="1" max="1000" step="1" value="50" style="width:80px">
+        </div>
+        <div class="qi-input">
+          <textarea id="qi-text" placeholder="Ej: Voy a ver YouTube en 4K, hacer una llamada VoIP y descargar una distribución de Linux."></textarea>
+          <div class="qi-actions">
+            <button class="icon-btn primary" onclick="qiApply()" id="qi-btn-apply">Aplicar</button>
+            <button class="icon-btn"          onclick="qiPreview()" id="qi-btn-preview">Previsualizar</button>
+            <button class="icon-btn danger"   onclick="qiClear()" id="qi-btn-clear">Limpiar</button>
+          </div>
+        </div>
+        <div class="qi-suggest" id="qi-suggest"></div>
+        <div class="qi-msg" id="qi-msg"></div>
+        <div class="qi-plan" id="qi-plan" style="display:none">
+          <h4>Plan QoS activo</h4>
+          <div class="qi-plan-meta" id="qi-plan-meta"></div>
+          <table class="qi-table">
+            <thead><tr><th>App</th><th>Servicio</th><th>Tier</th><th>Class</th><th>Min</th><th>Max</th></tr></thead>
+            <tbody id="qi-plan-body"></tbody>
+          </table>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -2275,6 +2368,165 @@ async function updateFailoverTimeline() {
 
 updateFailoverTimeline();
 setInterval(updateFailoverTimeline, 3000);
+
+// ═══════════════════════════════════════════════════════════════════════════
+// QoS INTENT — chat NL → plan estructurado → tc en el puerto del host
+// ═══════════════════════════════════════════════════════════════════════════
+let _qiCatalog = null;
+
+const QI_SUGGESTIONS = [
+  "Voy a ver YouTube en 4K, hacer una llamada VoIP y descargar una distribución de Linux.",
+  "Priorizar VoIP y DNS, navegación web normal, descargas en segundo plano.",
+  "Quiero streaming de vídeo fluido y poder navegar sin esperas.",
+];
+
+function qiMsg(kind, text) {
+  const m = document.getElementById('qi-msg');
+  m.className = 'qi-msg ' + (kind || 'info');
+  m.textContent = text || '';
+}
+
+async function qiLoadCatalog() {
+  try {
+    const d = await fetch('/api/qos-intent/catalog').then(r => r.json());
+    _qiCatalog = d;
+    const hostSel = document.getElementById('qi-host');
+    const cur = hostSel.value;
+    hostSel.innerHTML = '<option value="">(auto)</option>'
+      + (d.hosts || []).map(h => `<option value="${escHtml(h)}">${escHtml(h)}</option>`).join('');
+    if (cur && (d.hosts || []).includes(cur)) hostSel.value = cur;
+
+    const apps = Object.keys(d.apps || {});
+    document.getElementById('qi-hint').textContent =
+      apps.length
+        ? `apps soportadas: ${apps.join(', ')}`
+        : 'arranca el supervisor para detectar hosts';
+
+    const sug = document.getElementById('qi-suggest');
+    sug.innerHTML = QI_SUGGESTIONS.map(t =>
+      `<button onclick="qiUseSuggestion(this)">${escHtml(t)}</button>`
+    ).join('');
+  } catch (e) {
+    qiMsg('err', 'No se pudo cargar el catálogo: ' + e);
+  }
+}
+
+function qiUseSuggestion(btn) {
+  document.getElementById('qi-text').value = btn.textContent;
+  document.getElementById('qi-text').focus();
+}
+
+function qiRenderPlan(plan) {
+  const wrap = document.getElementById('qi-plan');
+  if (!plan) { wrap.style.display = 'none'; return; }
+  wrap.style.display = 'block';
+  const cap = plan.capped ? ' <span style="color:var(--orange)">(mínimos escalados al ancho de línea)</span>' : '';
+  let parsed = '';
+  if (plan.parsed_by === 'llm') {
+    parsed = ' · <span style="color:var(--cyan);font-size:10px;text-transform:uppercase;letter-spacing:.05em">parser LLM</span>';
+  } else if (plan.parsed_by === 'heuristic') {
+    parsed = ' · <span style="color:var(--yellow);font-size:10px;text-transform:uppercase;letter-spacing:.05em">parser heurístico</span>';
+  }
+  const fbReason = plan.fallback_reason
+    ? `<div style="font-size:10px;color:var(--muted);margin-top:4px">${escHtml(plan.fallback_reason)}</div>`
+    : '';
+  document.getElementById('qi-plan-meta').innerHTML =
+    `Host: <b>${escHtml(plan.target_host)}</b> · `
+    + `puerto OVS: <b>${escHtml(plan.target_port)}</b> · `
+    + `línea: <b>${plan.total_mbps} Mbps</b>${cap}${parsed}${fbReason}`;
+  const rows = (plan.apps || []).map(a => {
+    const max = (a.max_mbps == null) ? '∞' : (a.max_mbps + ' Mbps');
+    return `<tr>
+      <td><b>${escHtml(a.app)}</b><div style="font-size:10px;color:var(--dim)">${escHtml(a.description || '')}</div></td>
+      <td><code>${escHtml(a.service)}</code> <span style="color:var(--dim)">${escHtml(a.transport || '')}/${a.dport}</span></td>
+      <td><span class="qi-tier ${escHtml(a.tier)}">${escHtml(a.tier)}</span></td>
+      <td><code>${escHtml(a.classid)}</code></td>
+      <td>${a.min_mbps} Mbps</td>
+      <td>${max}</td>
+    </tr>`;
+  });
+  document.getElementById('qi-plan-body').innerHTML =
+    rows.join('') || '<tr><td colspan="6" style="color:var(--dim)">—</td></tr>';
+}
+
+async function qiRefreshState() {
+  try {
+    const d = await fetch('/api/qos-intent/state').then(r => r.json());
+    qiRenderPlan(d.state);
+  } catch {}
+}
+
+function _qiPayload() {
+  const text = document.getElementById('qi-text').value.trim();
+  const host = document.getElementById('qi-host').value || null;
+  const mbps = Number(document.getElementById('qi-mbps').value) || 50;
+  return { text, host, total_mbps: mbps };
+}
+
+function _qiSetBusy(on) {
+  for (const id of ['qi-btn-apply', 'qi-btn-preview', 'qi-btn-clear']) {
+    document.getElementById(id).disabled = on;
+  }
+}
+
+async function qiPreview() {
+  const p = _qiPayload();
+  if (!p.text) { qiMsg('err', 'Escribe primero qué vas a usar.'); return; }
+  _qiSetBusy(true);
+  qiMsg('info', 'Pensando con el LLM…');
+  try {
+    const r = await fetch('/api/qos-intent/preview', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(p),
+    });
+    const d = await r.json();
+    if (!d.ok) { qiMsg('err', d.error || 'Error desconocido'); return; }
+    qiRenderPlan(d.plan);
+    qiMsg('ok', 'Plan generado. Pulsa Aplicar si te convence.');
+  } catch (e) {
+    qiMsg('err', 'Red: ' + e);
+  } finally { _qiSetBusy(false); }
+}
+
+async function qiApply() {
+  const p = _qiPayload();
+  if (!p.text) { qiMsg('err', 'Escribe primero qué vas a usar.'); return; }
+  _qiSetBusy(true);
+  qiMsg('info', 'Generando plan y aplicando tc…');
+  try {
+    const r = await fetch('/api/qos-intent/apply', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(p),
+    });
+    const d = await r.json();
+    if (!d.ok) { qiMsg('err', d.error || 'Error desconocido'); return; }
+    qiRenderPlan(d.plan);
+    qiMsg('ok', '✓ Plan aplicado en ' + d.plan.target_port);
+  } catch (e) {
+    qiMsg('err', 'Red: ' + e);
+  } finally { _qiSetBusy(false); }
+}
+
+async function qiClear() {
+  _qiSetBusy(true);
+  qiMsg('info', 'Limpiando QoS user-intent…');
+  try {
+    const r = await fetch('/api/qos-intent/clear', { method: 'POST' });
+    const d = await r.json();
+    if (!d.ok) { qiMsg('err', d.error || 'Error'); return; }
+    qiRenderPlan(null);
+    qiMsg('ok', d.cleared ? '✓ QoS user-intent eliminado.' : 'No había plan activo.');
+  } catch (e) {
+    qiMsg('err', 'Red: ' + e);
+  } finally { _qiSetBusy(false); }
+}
+
+qiLoadCatalog();
+qiRefreshState();
+setInterval(qiLoadCatalog,  15000);
+setInterval(qiRefreshState, 10000);
 </script>
 </body>
 </html>

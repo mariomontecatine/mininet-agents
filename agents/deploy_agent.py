@@ -216,12 +216,19 @@ def generate_network_intent(user_prompt):
         "   - PROHIBIDO: [h1,srv1], [h1,h2], [srv1,srv2]. CORRECTO: [s1,h1], [s1,srv1].\n"
         "   OBLIGATORIO: el campo 'links' debe contener TODOS los enlaces. "
         "Sin links los nodos quedan aislados.\n"
-        "   OPCIONAL: el campo 'server_types' asigna un servicio a cada srv*. "
-        "Valores soportados: http, dns, ssh, sip. Si se omite se rota por defecto.\n"
+        "   OBLIGATORIO si el usuario menciona el tipo de algún servidor: "
+        "incluye el campo 'server_types' con el mapping srv_name → tipo.\n"
+        "   Valores soportados: http, dns, ssh, sip. Sinónimos a reconocer:\n"
+        "     - 'web', 'http', 'apache', 'nginx', 'página', 'servidor web'      → http\n"
+        "     - 'dns', 'resolución', 'nameserver', 'bind'                       → dns\n"
+        "     - 'ssh', 'shell', 'terminal', 'acceso remoto'                     → ssh\n"
+        "     - 'sip', 'voip', 'voz', 'teléfono', 'llamadas'                    → sip\n"
+        "   Si el usuario no menciona el tipo de un srv*, omítelo y se rotará por defecto.\n"
         '   Ejemplo: {"tipo": "custom", "routers": ["r1"], "switches": ["s1", "s2"], '
-        '"servers": ["srv1", "srv2"], "hosts": ["h1", "h2"], '
-        '"server_types": {"srv1": "http", "srv2": "dns"}, '
-        '"links": [["r1", "s1"], ["r1", "s2"], ["s1", "h1"], ["s1", "h2"], ["s2", "srv1"]]}\n'
+        '"servers": ["srv1", "srv2", "srv3", "srv4"], "hosts": ["h1", "h2"], '
+        '"server_types": {"srv1": "http", "srv2": "dns", "srv3": "sip", "srv4": "ssh"}, '
+        '"links": [["r1", "s1"], ["r1", "s2"], ["s1", "h1"], ["s1", "h2"], '
+        '["s2", "srv1"], ["s2", "srv2"], ["s2", "srv3"], ["s2", "srv4"]]}\n'
         "   Enumera TODOS los pares de conexión, uno por línea del array."
     )
 

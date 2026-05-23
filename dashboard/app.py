@@ -39,6 +39,7 @@ _RUN_FILES = (
     "host_port_map.json",
     "server_services.json",
     "failover_state.json",
+    "qos_intent_state.json",
 )
 
 app = Flask(__name__)
@@ -992,6 +993,107 @@ def api_inject():
         "duration": rec.get("duration_sec"),
         "ts_start": rec.get("ts_start"),
     }})
+
+
+# ── QoS por intent del usuario ──────────────────────────────────────────────
+
+@app.route("/api/qos-intent/catalog", methods=["GET"])
+def api_qos_intent_catalog():
+    """Devuelve el catálogo de apps soportadas + hosts disponibles."""
+    from agents import apps_catalog
+    return jsonify({
+        "apps":  apps_catalog.APPLICATIONS,
+        "hosts": sorted(_load_json("host_port_map.json", {}).keys()),
+    })
+
+
+@app.route("/api/qos-intent/state", methods=["GET"])
+def api_qos_intent_state():
+    """Plan QoS user-intent actualmente aplicado (o null si no hay)."""
+    from agents import qos_intent
+    return jsonify({"state": qos_intent.load_state()})
+
+
+@app.route("/api/qos-intent/preview", methods=["POST"])
+def api_qos_intent_preview():
+    """Convierte un texto NL a plan estructurado SIN aplicarlo.
+
+    Body: {"text": "...", "host"?: "h1", "total_mbps"?: 50}
+    """
+    payload = request.get_json(silent=True) or {}
+    text = (payload.get("text") or "").strip()
+    if not text:
+        return jsonify({"ok": False, "error": "Texto vacío"}), 400
+    host  = payload.get("host")
+    total = payload.get("total_mbps") or 50.0
+    try:
+        from agents import qos_intent
+        plan = qos_intent.parse_qos_intent_llm(text,
+                                               default_host=host,
+                                               default_total_mbps=float(total))
+        return jsonify({"ok": True, "plan": plan})
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"{type(e).__name__}: {e}"}), 500
+
+
+@app.route("/api/qos-intent/apply", methods=["POST"])
+def api_qos_intent_apply():
+    """Aplica un plan QoS user-intent. Acepta o bien un plan ya estructurado
+    o un texto NL — en ese caso se parsea con el LLM antes de aplicar.
+
+    Body: {"plan": {...}}  ó  {"text": "...", "host"?: "h1", "total_mbps"?: 50}
+    """
+    from agents import qos_intent
+
+    payload = request.get_json(silent=True) or {}
+    plan    = payload.get("plan")
+    if not plan:
+        text = (payload.get("text") or "").strip()
+        if not text:
+            return jsonify({"ok": False,
+                            "error": "Indica 'plan' o 'text'."}), 400
+        try:
+            plan = qos_intent.parse_qos_intent_llm(
+                text,
+                default_host=payload.get("host"),
+                default_total_mbps=float(payload.get("total_mbps") or 50.0),
+            )
+        except ValueError as e:
+            return jsonify({"ok": False, "error": str(e)}), 400
+        except Exception as e:
+            return jsonify({"ok": False,
+                            "error": f"LLM: {type(e).__name__}: {e}"}), 500
+    else:
+        # Validamos y normalizamos el plan vía build_qos_plan (idempotente).
+        try:
+            plan = qos_intent.build_qos_plan(
+                plan.get("target_host"),
+                plan.get("apps") or [],
+                plan.get("total_mbps") or 50.0,
+            )
+        except ValueError as e:
+            return jsonify({"ok": False, "error": str(e)}), 400
+
+    try:
+        applied = qos_intent.apply_qos_plan(plan)
+    except Exception as e:
+        return jsonify({"ok": False,
+                        "error": f"tc: {type(e).__name__}: {e}"}), 500
+    return jsonify({"ok": True, "plan": applied})
+
+
+@app.route("/api/qos-intent/clear", methods=["POST"])
+def api_qos_intent_clear():
+    """Elimina el plan QoS user-intent en curso (si lo hay)."""
+    from agents import qos_intent
+    try:
+        prev = qos_intent.clear_qos_intent()
+    except Exception as e:
+        return jsonify({"ok": False,
+                        "error": f"{type(e).__name__}: {e}"}), 500
+    return jsonify({"ok": True, "cleared": prev})
 
 
 # ── runs guardados ────────────────────────────────────────────────────────────
