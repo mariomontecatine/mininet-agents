@@ -184,11 +184,12 @@ def test_apply_emits_htb_root_and_classes(host_port_map, tmp_path, monkeypatch):
     assert "flowid 1:20" in joined  # youtube
     assert "flowid 1:30" in joined  # linux_iso
 
-    # Estado persistido.
+    # Estado persistido como dict {puerto: plan}.
     assert os.path.exists(qos_intent.STATE_FILE)
     saved = json.load(open(qos_intent.STATE_FILE))
-    assert saved["target_host"] == "h1"
-    assert len(saved["apps"]) == 3
+    assert "s1-eth2" in saved
+    assert saved["s1-eth2"]["target_host"] == "h1"
+    assert len(saved["s1-eth2"]["apps"]) == 3
 
 
 def test_apply_is_idempotent_clears_root_first(host_port_map, tmp_path, monkeypatch):
@@ -212,6 +213,80 @@ def test_clear_qos_intent_removes_state(host_port_map, tmp_path, monkeypatch):
     assert os.path.exists(qos_intent.STATE_FILE)
     qos_intent.clear_qos_intent()
     assert not os.path.exists(qos_intent.STATE_FILE)
+
+
+def test_multiple_plans_coexist(host_port_map, tmp_path, monkeypatch):
+    """Planes en hosts distintos coexisten (no se sobrescriben)."""
+    monkeypatch.setattr(qos_intent, "STATE_FILE",  str(tmp_path / "state.json"))
+    monkeypatch.setattr(qos_intent, "QOS_HISTORY", str(tmp_path / "qos.json"))
+    _patch_ssh(monkeypatch)
+    qos_intent.apply_qos_plan(qos_intent.build_qos_plan("h1", [{"app": "voip"}], 50))
+    qos_intent.apply_qos_plan(qos_intent.build_qos_plan("h2", [{"app": "youtube"}], 50))
+    plans = qos_intent.load_active_plans()
+    hosts = {p["target_host"] for p in plans}
+    assert hosts == {"h1", "h2"}
+
+
+def test_apply_same_host_merges_apps(host_port_map, tmp_path, monkeypatch):
+    """Aplicar otra app al mismo host acumula servicios en vez de reemplazar."""
+    monkeypatch.setattr(qos_intent, "STATE_FILE",  str(tmp_path / "state.json"))
+    monkeypatch.setattr(qos_intent, "QOS_HISTORY", str(tmp_path / "qos.json"))
+    _patch_ssh(monkeypatch)
+    qos_intent.apply_qos_plan(qos_intent.build_qos_plan("h1", [{"app": "voip"}], 50))
+    merged = qos_intent.apply_qos_plan(qos_intent.build_qos_plan("h1", [{"app": "youtube"}], 50))
+    app_ids = {a["app"] for a in merged["apps"]}
+    assert app_ids == {"voip", "youtube"}
+    # Solo un plan por puerto.
+    assert len(qos_intent.load_active_plans()) == 1
+
+
+def test_merge_new_app_same_service_wins(host_port_map, tmp_path, monkeypatch):
+    """Si la app nueva usa el mismo servicio que una vieja, la vieja se descarta."""
+    monkeypatch.setattr(qos_intent, "STATE_FILE",  str(tmp_path / "state.json"))
+    monkeypatch.setattr(qos_intent, "QOS_HISTORY", str(tmp_path / "qos.json"))
+    _patch_ssh(monkeypatch)
+    # youtube y web_browsing usan servicios distintos (https vs http) → coexisten.
+    qos_intent.apply_qos_plan(qos_intent.build_qos_plan("h1", [{"app": "youtube"}], 50))
+    merged = qos_intent.apply_qos_plan(qos_intent.build_qos_plan("h1", [{"app": "web_browsing"}], 50))
+    app_ids = {a["app"] for a in merged["apps"]}
+    assert app_ids == {"youtube", "web_browsing"}
+
+
+def test_clear_selective_by_host(host_port_map, tmp_path, monkeypatch):
+    """clear con target limpia solo ese host; los demás siguen."""
+    monkeypatch.setattr(qos_intent, "STATE_FILE",  str(tmp_path / "state.json"))
+    monkeypatch.setattr(qos_intent, "QOS_HISTORY", str(tmp_path / "qos.json"))
+    _patch_ssh(monkeypatch)
+    qos_intent.apply_qos_plan(qos_intent.build_qos_plan("h1", [{"app": "voip"}], 50))
+    qos_intent.apply_qos_plan(qos_intent.build_qos_plan("h2", [{"app": "youtube"}], 50))
+    cleared = qos_intent.clear_qos_intent(target="h1")
+    assert len(cleared) == 1
+    remaining = qos_intent.load_active_plans()
+    assert len(remaining) == 1 and remaining[0]["target_host"] == "h2"
+
+
+def test_extract_args_from_text():
+    """El parser de texto plano rescata un JSON embebido en la respuesta LLM."""
+    txt = ('Claro, aquí tienes el plan:\n```json\n'
+           '{"target_host": "h1", "total_mbps": 50, "apps": [{"app": "voip"}]}\n```')
+    args = qos_intent._extract_args_from_text(txt)
+    assert args is not None
+    assert args["target_host"] == "h1"
+    assert args["apps"][0]["app"] == "voip"
+
+
+def test_llm_only_mode_raises_instead_of_heuristic(host_port_map, tmp_path, monkeypatch):
+    """Con llm_only=True, un fallo del LLM lanza error en vez de usar keywords."""
+    monkeypatch.setattr(qos_intent, "STATE_FILE",  str(tmp_path / "state.json"))
+    monkeypatch.setattr(qos_intent, "QOS_HISTORY", str(tmp_path / "qos.json"))
+
+    class _Boom:
+        def chat(self, *a, **kw):
+            raise TimeoutError("read timed out")
+    monkeypatch.setattr(qos_intent, "_ollama_client", _Boom())
+
+    with pytest.raises(ValueError, match="LLM-only"):
+        qos_intent.parse_qos_intent_llm("VoIP", default_host="h1", llm_only=True)
 
 
 # ─── Endpoints Flask (smoke) ─────────────────────────────────────────────────

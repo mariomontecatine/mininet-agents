@@ -4,7 +4,7 @@
 
 # --- Modelos LLM (Ollama) ---
 MODEL_MONITOR = "qwen2.5:3b"  # análisis de telemetría (ciclo rápido, modelo ligero)
-MODEL_DEPLOY = "qwen2.5:3b"  # diseño de topología (solo al arrancar)
+MODEL_DEPLOY = "qwen2.5:7b"  # diseño de topología (solo al arrancar)
 MODEL_RESOLVER = "qwen2.5:3b"  # decisiones de QoS/seguridad
 
 # --- Ciclo NOC (segundos) ---
@@ -27,6 +27,19 @@ TASA_POLICING_MBPS = 20  # límite por defecto en POLICING y SHAPING
 RESOLVER_LLM_TOPK = 3  # nº de alertas más críticas que decide el LLM; el resto va a política por defecto
 RESOLVER_LLM_TIMEOUT = 45  # segundos máx por llamada al LLM antes de hacer fallback
 
+# --- QoS por intent (chat del dashboard) ---
+# Modelo usado para traducir NL→plan QoS. qwen2.5:3b es flojo con tool calling;
+# qwen2.5:7b acierta mucho más (a costa de tardar más). Para una prueba de
+# concepto donde quieres ver la precisión real del LLM, usa 7b.
+MODEL_QOS_INTENT = "qwen2.5:7b"
+# Timeout generoso: priorizamos que el LLM responda sobre la velocidad. El
+# fallback heurístico solo salta si el modelo agota este tiempo o devuelve algo
+# imposible de parsear.
+QOS_INTENT_LLM_TIMEOUT = 600
+# Si True, NUNCA se usa el fallback heurístico: si el LLM falla, se devuelve un
+# error claro en vez de adivinar por keywords. Útil para evaluar el LLM puro.
+QOS_INTENT_LLM_ONLY = False
+
 # --- Tráfico bulk (simulación de usuarios reales) ---
 DURACION_BULK = 35  # segundos de duración de cada ráfaga iperf
 ESPERA_POST_BULK = 25  # segundos de margen tras lanzar los clientes
@@ -35,29 +48,29 @@ ESPERA_POST_BULK = 25  # segundos de margen tras lanzar los clientes
 # Lo consultan traffic (probes sintéticos) y las herramientas QoS por
 # protocolo (resolver_agent.apply_*).
 SERVICE_PORTS = {
-    "http":     80,
-    "https":    443,
-    "http_alt": 8080,   # el python -m http.server escucha aquí en los srv*
-    "dns":      53,
-    "ssh":      22,
-    "ftp":      21,
-    "sip":      5060,
-    "smtp":     25,
+    "http": 80,
+    "https": 443,
+    "http_alt": 8080,  # el python -m http.server escucha aquí en los srv*
+    "dns": 53,
+    "ssh": 22,
+    "ftp": 21,
+    "sip": 5060,
+    "smtp": 25,
 }
 
 # --- Definición completa de cada servicio (para QoS por protocolo) ---
 # ip_proto sigue los números IANA (1=ICMP, 6=TCP, 17=UDP).
 # transport es la palabra clave OpenFlow ('tcp', 'udp', 'icmp').
 SERVICE_DEFS = {
-    "http":     {"ip_proto":  6, "dport":   80, "transport": "tcp"},
-    "http_alt": {"ip_proto":  6, "dport": 8080, "transport": "tcp"},
-    "https":    {"ip_proto":  6, "dport":  443, "transport": "tcp"},
-    "dns":      {"ip_proto": 17, "dport":   53, "transport": "udp"},
-    "ssh":      {"ip_proto":  6, "dport":   22, "transport": "tcp"},
-    "sip":      {"ip_proto": 17, "dport": 5060, "transport": "udp"},
-    "ftp":      {"ip_proto":  6, "dport":   21, "transport": "tcp"},
-    "smtp":     {"ip_proto":  6, "dport":   25, "transport": "tcp"},
-    "icmp":     {"ip_proto":  1, "dport": None, "transport": "icmp"},
+    "http": {"ip_proto": 6, "dport": 80, "transport": "tcp"},
+    "http_alt": {"ip_proto": 6, "dport": 8080, "transport": "tcp"},
+    "https": {"ip_proto": 6, "dport": 443, "transport": "tcp"},
+    "dns": {"ip_proto": 17, "dport": 53, "transport": "udp"},
+    "ssh": {"ip_proto": 6, "dport": 22, "transport": "tcp"},
+    "sip": {"ip_proto": 17, "dport": 5060, "transport": "udp"},
+    "ftp": {"ip_proto": 6, "dport": 21, "transport": "tcp"},
+    "smtp": {"ip_proto": 6, "dport": 25, "transport": "tcp"},
+    "icmp": {"ip_proto": 1, "dport": None, "transport": "icmp"},
 }
 
 # Asignación cíclica de tipos a srv1, srv2, srv3… cuando el intent no
@@ -78,9 +91,11 @@ METRICS_MAX_ENTRIES = (
 DASHBOARD_PORT = 5000
 
 # --- Failover (redundancia primario / secundario) ---
-FAILOVER_PROBE_TIMEOUT   = 2   # segundos para la sonda TCP de salud
-FAILOVER_FAIL_THRESHOLD  = 1   # sondas consecutivas fallidas → declarar servidor caído
-FAILOVER_POLL_INTERVAL   = 2   # segundos entre sondas (hilo dedicado, no atado al ciclo NOC)
+FAILOVER_PROBE_TIMEOUT = 2  # segundos para la sonda TCP de salud
+FAILOVER_FAIL_THRESHOLD = 1  # sondas consecutivas fallidas → declarar servidor caído
+FAILOVER_POLL_INTERVAL = (
+    2  # segundos entre sondas (hilo dedicado, no atado al ciclo NOC)
+)
 
 # --- Inyección de anomalías (motor de ataques sintéticos) ---
 ANOMALY_PROBABILITY = 0.30  # prob. por ciclo NOC de inyectar un ataque
@@ -92,14 +107,14 @@ ANOMALY_RNG_SEED = None  # entero → resultados reproducibles; None → estocá
 # Umbrales de las heurísticas de anomalía sobre flujos sFlow
 FAN_OUT_THRESHOLD = 12  # ≥N destinos distintos desde 1 origen → port scan.
 FAN_OUT_SUBNETS_THRESHOLD = 2  # ≥N subredes /24 distintas → confirma scan
-FAN_IN_THRESHOLD = 6   # ≥N orígenes simultáneos hacia 1 destino → DDoS
+FAN_IN_THRESHOLD = 6  # ≥N orígenes simultáneos hacia 1 destino → DDoS
 FAN_IN_BYTES_THRESHOLD = 12 * 1024 * 1024  # 12 MB combinados en ventana sFlow
 # Calibrado para reducir falsos positivos: el bulk legítimo observado llega a
 # ~3.8 MB de fan-in (2 srcs) y ~2.7 MB con 5 srcs concurrentes. Con threshold
 # de 12 MB + multiplicador de rol servidor (5×) el floor queda en 60 MB hacia
 # un srv*, separando holgadamente el tráfico de usuarios reales de los ataques
 # (DDoS hping3 más intenso → 150-300 MB agregados hacia la víctima).
-SURGE_BYTES_THRESHOLD = 20 * 1024 * 1024   # 20 MB en un solo flujo → DoS volumétrico
+SURGE_BYTES_THRESHOLD = 20 * 1024 * 1024  # 20 MB en un solo flujo → DoS volumétrico
 # Calibrado para reducir falsos positivos: el flujo único legítimo más grande
 # observado es ~2.5 MB en 20 s. Threshold de 20 MB deja 8× de margen.
 # El DoS volumétrico tras la subida de intensidad (-i u50 -d 1400) genera
@@ -117,5 +132,5 @@ PORT_ROLE_MULTIPLIER = {
 # --- Capa C: baseline adaptativo (EMA por puerto) ---
 BASELINE_EMA_ALPHA = 0.25  # peso del valor actual en la EMA. ~4-5 ciclos efectivos.
 BASELINE_ALERT_K = 6.0  # delta actual > k × EMA → considerar anomalía. 6× evita
-                        # falsos positivos por picos transitorios del bulk iperf.
+# falsos positivos por picos transitorios del bulk iperf.
 BASELINE_WARMUP = 3  # ciclos de aprendizaje antes de empezar a alertar

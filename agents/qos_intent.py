@@ -37,12 +37,14 @@ HOST_PORT_FILE  = os.path.join(TMP_DIR, "host_port_map.json")
 QOS_HISTORY     = os.path.join(TMP_DIR, "qos_history.json")
 SERVER_SERVICES = os.path.join(TMP_DIR, "server_services.json")
 
-MODEL_NAME = config.MODEL_RESOLVER
+MODEL_NAME = getattr(config, "MODEL_QOS_INTENT", config.MODEL_RESOLVER)
 
-# Timeout más generoso que el resolver: el system prompt es grande (catálogo
-# + reglas) y qwen2.5:3b puede tardar 30-60s en su primera respuesta. Si aún
-# así expira, hay un fallback heurístico por keywords más abajo.
-_QOS_LLM_TIMEOUT = 120
+# Timeout generoso (config.QOS_INTENT_LLM_TIMEOUT). Priorizamos que el LLM
+# conteste sobre la velocidad — esto es una prueba de concepto donde interesa
+# medir la precisión real del modelo, no la latencia. El fallback heurístico
+# solo entra si el LLM agota el tiempo o devuelve algo imposible de parsear, y
+# se puede desactivar del todo con config.QOS_INTENT_LLM_ONLY.
+_QOS_LLM_TIMEOUT = getattr(config, "QOS_INTENT_LLM_TIMEOUT", 600)
 
 _ollama_client = ollama.Client(host="http://localhost:11434",
                                timeout=_QOS_LLM_TIMEOUT)
@@ -170,22 +172,48 @@ def _write_qos_event(port, event_type, app_id=None, tier=None, classid=None):
         pass
 
 
-def _save_state(plan):
+# ─── Estado multi-plan ───────────────────────────────────────────────────────
+# qos_intent_state.json guarda AHORA un dict {target_port: plan}. Así pueden
+# coexistir varios planes a la vez (uno por host/puerto). Aplicar un plan a un
+# puerto que ya tiene uno FUSIONA las apps en vez de reemplazarlas.
+#
+# Compat: si el fichero trae el formato antiguo (un único plan plano con
+# 'target_port'), lo migramos a {port: plan} al leerlo.
+
+def _load_plans() -> dict:
+    """Devuelve {target_port: plan}. Migra el formato antiguo si hace falta."""
+    if not os.path.exists(STATE_FILE):
+        return {}
+    try:
+        with open(STATE_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+    except (IOError, json.JSONDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    # Formato antiguo: un solo plan con target_port a nivel raíz.
+    if "target_port" in data and "apps" in data:
+        return {data["target_port"]: data}
+    return data
+
+
+def _save_plans(plans: dict):
     try:
         with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(plan, f, ensure_ascii=False, indent=2)
+            json.dump(plans, f, ensure_ascii=False, indent=2)
     except IOError:
         pass
 
 
+def load_active_plans() -> list:
+    """Lista de planes activos (para el dashboard)."""
+    return list(_load_plans().values())
+
+
 def load_state():
-    if not os.path.exists(STATE_FILE):
-        return None
-    try:
-        with open(STATE_FILE, encoding="utf-8") as f:
-            return json.load(f)
-    except (IOError, json.JSONDecodeError):
-        return None
+    """Compat: devuelve el primer plan activo o None (API antigua)."""
+    plans = load_active_plans()
+    return plans[0] if plans else None
 
 
 def _clear_state():
@@ -310,40 +338,29 @@ def _tc_proto_match(ip_proto, dport):
     return " ".join(parts)
 
 
-def apply_qos_plan(plan):
-    """Traduce el plan a comandos tc y los ejecuta sobre el puerto del host.
+def _emit_tc_for_plan(ssh, plan):
+    """Emite el árbol HTB completo de un plan sobre su puerto. No toca estado.
 
-    Idempotente: borra cualquier qdisc raíz previo antes de construir el árbol.
-    Persiste el estado en STATE_FILE y deja eventos en qos_history.json para
-    que el dashboard los muestre en el timeline.
+    Idempotente: borra el qdisc raíz previo y reconstruye con TODAS las apps
+    del plan (clases por tier + un filtro u32 por app).
     """
-    port    = plan["target_port"]
-    total   = plan["total_mbps"]
-    apps    = plan["apps"]
+    port  = plan["target_port"]
+    total = plan["total_mbps"]
+    apps  = plan["apps"]
 
-    # Default tier: best_effort. Las apps sin filtro caen aquí, igual que el
-    # resto de tráfico del puerto. Si ninguna app es best_effort, se crea
-    # vacía con rate mínima para no romper la jerarquía.
     tiers_in_plan = {a["tier"] for a in apps}
     if "best_effort" not in tiers_in_plan:
         tiers_in_plan.add("best_effort")
-
-    ssh = get_ssh_connection()
 
     # Limpia qdisc previo (idempotencia).
     send_tmux_command(ssh, f"sh tc qdisc del dev {port} root 2>/dev/null; true")
     time.sleep(0.2)
 
     # Raíz HTB, default → best_effort (1:40).
-    send_tmux_command(
-        ssh, f"sh tc qdisc add dev {port} root handle 1: htb default 40"
-    )
+    send_tmux_command(ssh, f"sh tc qdisc add dev {port} root handle 1: htb default 40")
     time.sleep(0.1)
 
-    # Crea las clases para los tiers presentes en el plan. Cada tier obtiene
-    # una "rate garantizada" igual a la suma de mínimos de sus apps (o un
-    # mínimo simbólico de 0.5 Mbps si no hay apps) y ceil = total_mbps para
-    # permitir borrow.
+    # Una clase por tier: rate = suma de mínimos de sus apps (≥0.5), ceil = línea.
     tier_rates = {t: 0.0 for t in tiers_in_plan}
     for a in apps:
         tier_rates[a["tier"]] += a["min_mbps"]
@@ -362,7 +379,6 @@ def apply_qos_plan(plan):
         )
         time.sleep(0.05)
 
-    # Un filtro u32 por app: matchea (ip_proto, dport) → flowid del tier.
     for a in apps:
         match = _tc_proto_match(a["ip_proto"], a["dport"])
         send_tmux_command(
@@ -371,38 +387,100 @@ def apply_qos_plan(plan):
             f"{match} flowid {a['classid']}",
         )
         time.sleep(0.05)
-        _write_qos_event(
-            port, "intent_apply",
-            app_id=a["app"], tier=a["tier"], classid=a["classid"],
-        )
+        _write_qos_event(port, "intent_apply",
+                         app_id=a["app"], tier=a["tier"], classid=a["classid"])
 
+
+def _merge_apps(existing_apps, new_apps):
+    """Fusiona apps de un plan existente con las nuevas; las nuevas ganan.
+
+    Una app vieja se descarta si colisiona con una nueva por app_id o por
+    servicio (mismo dport) — así el HTB nunca tiene dos filtros para el mismo
+    servicio. Devuelve lista de dicts {app, min_mbps, max_mbps} reaplicable.
+    """
+    new_ids      = {a["app"] for a in new_apps}
+    new_services = {a["service"] for a in new_apps}
+    merged = []
+    for a in existing_apps:
+        if a["app"] in new_ids or a["service"] in new_services:
+            continue
+        merged.append({"app": a["app"], "min_mbps": a["min_mbps"], "max_mbps": a["max_mbps"]})
+    for a in new_apps:
+        merged.append({"app": a["app"], "min_mbps": a["min_mbps"], "max_mbps": a["max_mbps"]})
+    return merged
+
+
+def apply_qos_plan(plan):
+    """Aplica un plan al puerto de su host. Si el puerto YA tenía un plan,
+    fusiona las apps (las nuevas ganan) y reconstruye el árbol completo, de
+    modo que planes de hosts distintos coexisten y aplicar al mismo host
+    acumula servicios en vez de reemplazarlos.
+
+    Devuelve el plan efectivamente aplicado (fusionado si procede).
+    """
+    port = plan["target_port"]
+    host = plan["target_host"]
+
+    plans = _load_plans()
+    if port in plans:
+        merged_apps = _merge_apps(plans[port].get("apps", []), plan["apps"])
+        # Reconstruye (revalida + recalcula capping con la línea más reciente).
+        merged = build_qos_plan(host, merged_apps, plan["total_mbps"])
+        merged["parsed_by"] = plan.get("parsed_by")
+        merged["merged_from"] = len(plans[port].get("apps", []))
+        plan = merged
+
+    ssh = get_ssh_connection()
+    _emit_tc_for_plan(ssh, plan)
     ssh.close()
-    _save_state(plan)
+
+    plans[port] = plan
+    _save_plans(plans)
     return plan
 
 
-def clear_qos_intent():
-    """Elimina el HTB user-intent y borra el estado persistente.
+def clear_qos_intent(target=None):
+    """Elimina planes user-intent.
 
-    Devuelve el plan que estaba activo (o None si no había nada).
+    target=None      → limpia TODOS los planes activos.
+    target='h1'      → limpia solo el del host h1.
+    target='s1-eth2' → limpia solo el de ese puerto OVS.
+
+    Devuelve la lista de planes eliminados (vacía si no había nada).
     """
-    plan = load_state()
-    if not plan:
-        return None
-    port = plan.get("target_port")
-    if not port:
-        _clear_state()
-        return plan
+    plans = _load_plans()
+    if not plans:
+        return []
+
+    if target is None:
+        ports = list(plans.keys())
+    else:
+        port = target if target in plans else _resolve_host_port(target)
+        ports = [port] if port in plans else []
+
+    if not ports:
+        return []
+
+    ssh = None
     try:
         ssh = get_ssh_connection()
-        send_tmux_command(ssh, f"sh tc qdisc del dev {port} root 2>/dev/null; true")
-        ssh.close()
     except Exception as _e:
-        # No fallar el clear por SSH caída: igualmente borramos estado local.
         print(f"[QoS-INTENT] WARN clear vía SSH falló: {_e}")
-    _write_qos_event(port, "intent_clear")
-    _clear_state()
-    return plan
+
+    cleared = []
+    for port in ports:
+        if ssh:
+            send_tmux_command(ssh, f"sh tc qdisc del dev {port} root 2>/dev/null; true")
+        _write_qos_event(port, "intent_clear")
+        cleared.append(plans.pop(port))
+    if ssh:
+        ssh.close()
+
+    if plans:
+        _save_plans(plans)
+    else:
+        _clear_state()
+    return cleared
 
 
 # ─── LLM: NL → JSON estructurado ─────────────────────────────────────────────
@@ -451,21 +529,57 @@ _TOOL_SCHEMA = [
 ]
 
 
-def parse_qos_intent_llm(user_text, default_host=None, default_total_mbps=50.0):
-    """Convierte NL → plan estructurado.
+def _extract_args_from_text(text):
+    """Intenta sacar {target_host?, total_mbps?, apps:[...]} de texto plano.
 
-    Intenta primero con Ollama tool calling; si el modelo no responde a
-    tiempo o falla, cae a parse_qos_intent_heuristic (keywords) sin levantar
-    excepción. El plan resultante lleva el campo `parsed_by`:
-      - "llm"        → el modelo emitió el tool call
-      - "heuristic"  → fallback por keywords
+    Algunos modelos pequeños no emiten tool_call y devuelven el JSON dentro de
+    la respuesta (a veces en un bloque ```json). Buscamos el primer objeto JSON
+    que contenga la clave "apps". Devuelve el dict o None.
     """
+    if not text:
+        return None
+    # 1) Bloques ```json ... ``` o ``` ... ```
+    candidates = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    # 2) Cualquier objeto {...} con "apps" dentro (búsqueda con balance simple)
+    if not candidates:
+        candidates = re.findall(r"(\{[^{}]*\"apps\"[^{}]*\[.*?\][^{}]*\})", text, re.DOTALL)
+    for cand in candidates:
+        try:
+            data = json.loads(cand)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(data, dict) and data.get("apps"):
+            return data
+    return None
+
+
+def parse_qos_intent_llm(user_text, default_host=None, default_total_mbps=50.0,
+                         llm_only=None):
+    """Convierte NL → plan estructurado usando el LLM como motor principal.
+
+    Orden de resolución:
+      1. tool_call de Ollama (lo ideal).
+      2. JSON embebido en la respuesta de texto (modelos que ignoran tools=).
+      3. Fallback heurístico por keywords — SOLO si llm_only es False.
+
+    El plan resultante lleva `parsed_by`: "llm", "llm_text" o "heuristic".
+
+    llm_only: si True, nunca usa el heurístico (lanza ValueError si el LLM
+    falla). Por defecto toma config.QOS_INTENT_LLM_ONLY.
+    """
+    if llm_only is None:
+        llm_only = getattr(config, "QOS_INTENT_LLM_ONLY", False)
+
     available_hosts = sorted(_load_host_port_map().keys())
     catalog_lines   = apps_catalog.describe_catalog()
-
-    fallback_host = _resolve_default_host(default_host)
+    fallback_host   = _resolve_default_host(default_host)
 
     def _from_heuristic(reason):
+        if llm_only:
+            raise ValueError(
+                f"{reason} (Modo LLM-only activado: no se usa el reconocimiento "
+                "por palabras clave. Reintenta o revisa el modelo en config.)"
+            )
         apps = parse_qos_intent_heuristic(user_text)
         if not apps:
             raise ValueError(
@@ -475,6 +589,16 @@ def parse_qos_intent_llm(user_text, default_host=None, default_total_mbps=50.0):
         plan = build_qos_plan(fallback_host, apps, default_total_mbps)
         plan["parsed_by"] = "heuristic"
         plan["fallback_reason"] = reason
+        return plan
+
+    def _build_from_args(args, source):
+        target_host = args.get("target_host") or fallback_host
+        if not target_host and available_hosts:
+            target_host = available_hosts[0]
+        total = args.get("total_mbps") or default_total_mbps
+        apps  = args.get("apps") or []
+        plan = build_qos_plan(target_host, apps, total)
+        plan["parsed_by"] = source
         return plan
 
     system_prompt = (
@@ -498,7 +622,8 @@ def parse_qos_intent_llm(user_text, default_host=None, default_total_mbps=50.0):
         "mapearían al mismo servicio, elige la más adecuada.\n"
         "4. Si el usuario no da números, omite min_mbps/max_mbps (se usarán los "
         "del catálogo).\n"
-        "5. LLAMA SIEMPRE a build_qos_plan. NO respondas en texto plano."
+        "5. LLAMA a build_qos_plan. Si por algún motivo no puedes, responde con "
+        "el JSON {\"target_host\":..., \"total_mbps\":..., \"apps\":[{\"app\":...}]}."
     )
 
     try:
@@ -512,34 +637,26 @@ def parse_qos_intent_llm(user_text, default_host=None, default_total_mbps=50.0):
             options={"temperature": 0},
         )
     except Exception as e:
-        # Timeout, connection refused, etc. → cae al fallback heurístico.
-        return _from_heuristic(
-            f"El LLM no respondió ({type(e).__name__}). Usé reconocimiento "
-            "por palabras clave."
-        )
+        return _from_heuristic(f"El LLM no respondió ({type(e).__name__}).")
 
     msg = response.get("message", {}) or {}
+
+    # 1) tool_call
     tool_calls = msg.get("tool_calls") or []
-    if not tool_calls:
-        return _from_heuristic(
-            "El LLM no llamó a la herramienta. Usé reconocimiento por palabras clave."
-        )
+    if tool_calls:
+        args = tool_calls[0]["function"].get("arguments") or {}
+        try:
+            return _build_from_args(args, "llm")
+        except ValueError as ve:
+            return _from_heuristic(f"El LLM dio un plan inválido ({ve}).")
 
-    args = tool_calls[0]["function"].get("arguments") or {}
-    target_host = args.get("target_host") or fallback_host
-    if not target_host and available_hosts:
-        target_host = available_hosts[0]
-    total = args.get("total_mbps") or default_total_mbps
-    apps  = args.get("apps") or []
+    # 2) JSON embebido en texto plano
+    args = _extract_args_from_text(msg.get("content") or "")
+    if args:
+        try:
+            return _build_from_args(args, "llm_text")
+        except ValueError as ve:
+            return _from_heuristic(f"El LLM dio un plan inválido en texto ({ve}).")
 
-    try:
-        plan = build_qos_plan(target_host, apps, total)
-        plan["parsed_by"] = "llm"
-        return plan
-    except ValueError as ve:
-        # El LLM devolvió algo válido pero no parseable (apps inventadas,
-        # conflictos…). Intentamos rescatarlo con el fallback.
-        return _from_heuristic(
-            f"El LLM dio un plan inválido ({ve}). Usé reconocimiento por "
-            "palabras clave."
-        )
+    # 3) Heurístico (si está permitido)
+    return _from_heuristic("El LLM no llamó a la herramienta ni devolvió JSON.")
