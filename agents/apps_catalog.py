@@ -106,6 +106,15 @@ TIER_PRIORITY = {
     "best_effort":  3,
 }
 
+# Etiquetas en español para mostrar en el dashboard (las claves internas se
+# mantienen en inglés para no romper la lógica de tc/clases ni el LLM).
+TIER_LABEL = {
+    "interactive":  "interactivo",
+    "streaming":    "streaming",
+    "bulk":         "descargas",
+    "best_effort":  "normal",
+}
+
 
 def list_apps():
     """Lista las claves del catálogo (para enseñar al LLM y para el frontend)."""

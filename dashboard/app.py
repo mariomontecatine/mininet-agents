@@ -1002,16 +1002,22 @@ def api_qos_intent_catalog():
     """Devuelve el catálogo de apps soportadas + hosts disponibles."""
     from agents import apps_catalog
     return jsonify({
-        "apps":  apps_catalog.APPLICATIONS,
-        "hosts": sorted(_load_json("host_port_map.json", {}).keys()),
+        "apps":        apps_catalog.APPLICATIONS,
+        "hosts":       sorted(_load_json("host_port_map.json", {}).keys()),
+        "tier_labels": apps_catalog.TIER_LABEL,
     })
 
 
 @app.route("/api/qos-intent/state", methods=["GET"])
 def api_qos_intent_state():
-    """Plan QoS user-intent actualmente aplicado (o null si no hay)."""
+    """Planes QoS user-intent actualmente aplicados.
+
+    `plans`: lista de todos los planes activos (uno por host/puerto).
+    `state`: primer plan (compat con clientes antiguos).
+    """
     from agents import qos_intent
-    return jsonify({"state": qos_intent.load_state()})
+    plans = qos_intent.load_active_plans()
+    return jsonify({"plans": plans, "state": plans[0] if plans else None})
 
 
 @app.route("/api/qos-intent/preview", methods=["POST"])
@@ -1086,14 +1092,20 @@ def api_qos_intent_apply():
 
 @app.route("/api/qos-intent/clear", methods=["POST"])
 def api_qos_intent_clear():
-    """Elimina el plan QoS user-intent en curso (si lo hay)."""
+    """Elimina planes QoS user-intent.
+
+    Body opcional {"target": "h1"} limpia solo ese host/puerto; sin body
+    limpia TODOS los planes activos.
+    """
     from agents import qos_intent
+    payload = request.get_json(silent=True) or {}
+    target  = payload.get("target")
     try:
-        prev = qos_intent.clear_qos_intent()
+        cleared = qos_intent.clear_qos_intent(target=target)
     except Exception as e:
         return jsonify({"ok": False,
                         "error": f"{type(e).__name__}: {e}"}), 500
-    return jsonify({"ok": True, "cleared": prev})
+    return jsonify({"ok": True, "cleared": cleared, "count": len(cleared)})
 
 
 # ── runs guardados ────────────────────────────────────────────────────────────

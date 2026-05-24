@@ -328,6 +328,36 @@
     }
     .qi-suggest button:hover { border-color:var(--blue); color:var(--blue); }
 
+    /* leyenda desplegable */
+    .qi-help { margin-top:10px; font-size:11px; color:var(--muted); }
+    .qi-help summary { cursor:pointer; color:var(--blue); font-size:11px;
+                       letter-spacing:.03em; user-select:none; }
+    .qi-help summary:hover { text-decoration:underline; }
+    .qi-help-body { padding:8px 4px 2px; line-height:1.6; }
+    .qi-help-body ul { margin:6px 0 6px 18px; }
+    .qi-help-body li { margin-bottom:3px; }
+    .qi-help-body b { color:var(--text); }
+    .qi-help-body code { color:var(--cyan); }
+
+    /* planes activos (uno por host) */
+    .qi-plans-empty { color:var(--dim); font-size:11px; font-style:italic;
+                      padding:14px 0; text-align:center; }
+    .qi-plan-card {
+      margin-top:10px; border:1px solid var(--border); border-radius:4px;
+      background:rgba(255,255,255,.02);
+    }
+    .qi-plan-card .hd {
+      display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+      padding:8px 12px; border-bottom:1px solid var(--border);
+    }
+    .qi-plan-card .hd .host { font-size:13px; font-weight:600; color:var(--text); }
+    .qi-plan-card .hd .spacer { flex:1; }
+    .qi-plan-card .hd .clear-one {
+      background:transparent; border:1px solid var(--border); color:var(--muted);
+      font:inherit; font-size:10px; padding:3px 9px; border-radius:2px; cursor:pointer;
+    }
+    .qi-plan-card .hd .clear-one:hover { border-color:var(--red); color:var(--red); }
+
     /* ── Heatmap ── */
     #heatmap-canvas { display: block; width: 100%; cursor: crosshair; }
     #heatmap-tooltip {
@@ -616,28 +646,44 @@
       </div>
       <div class="panel-body">
         <div class="qi-bar">
-          <label for="qi-host">Host</label>
+          <label for="qi-host" title="A qué host se le aplica la QoS (su cable de red)">Host</label>
           <select id="qi-host"><option value="">(auto)</option></select>
-          <label for="qi-mbps">Línea (Mbps)</label>
-          <input id="qi-mbps" type="number" min="1" max="1000" step="1" value="50" style="width:80px">
+          <label for="qi-mbps" title="Ancho de banda total del enlace del host: el techo que se reparte entre servicios">Línea (Mbps)</label>
+          <input id="qi-mbps" type="number" min="1" max="1000" step="1" value="50" style="width:80px"
+                 title="Ancho de banda total del enlace del host: el techo que se reparte entre servicios">
         </div>
         <div class="qi-input">
-          <textarea id="qi-text" placeholder="Ej: Voy a ver YouTube en 4K, hacer una llamada VoIP y descargar una distribución de Linux."></textarea>
+          <textarea id="qi-text" placeholder="Ej: priorizar YouTube en 4K  ·  pulsa un ejemplo de abajo o escribe tú mismo (un servicio cada vez)"></textarea>
           <div class="qi-actions">
             <button class="icon-btn primary" onclick="qiApply()" id="qi-btn-apply">Aplicar</button>
             <button class="icon-btn"          onclick="qiPreview()" id="qi-btn-preview">Previsualizar</button>
-            <button class="icon-btn danger"   onclick="qiClear()" id="qi-btn-clear">Limpiar</button>
+            <button class="icon-btn danger"   onclick="qiClear()" id="qi-btn-clear">Limpiar todo</button>
           </div>
         </div>
         <div class="qi-suggest" id="qi-suggest"></div>
         <div class="qi-msg" id="qi-msg"></div>
-        <div class="qi-plan" id="qi-plan" style="display:none">
-          <h4>Plan QoS activo</h4>
-          <div class="qi-plan-meta" id="qi-plan-meta"></div>
-          <table class="qi-table">
-            <thead><tr><th>App</th><th>Servicio</th><th>Tier</th><th>Class</th><th>Min</th><th>Max</th></tr></thead>
-            <tbody id="qi-plan-body"></tbody>
-          </table>
+
+        <details class="qi-help">
+          <summary>¿Qué significan línea, tier, clase, min y max?</summary>
+          <div class="qi-help-body">
+            <p>Piensa en el cable del host como una <b>tubería</b> de agua que se reparte entre tus servicios.</p>
+            <ul>
+              <li><b>Línea (Mbps)</b> — el grosor total de la tubería: el ancho de banda del enlace del host. Es el techo de todo.</li>
+              <li><b>Tier</b> — la categoría de prioridad del tráfico:
+                <span class="qi-tier interactive">interactivo</span> (VoIP/DNS/SSH, prioridad máxima),
+                <span class="qi-tier streaming">streaming</span> (YouTube/web),
+                <span class="qi-tier bulk">descargas</span> (ISO/FTP) y
+                <span class="qi-tier best_effort">normal</span> (el resto). En congestión, el de prioridad alta pasa antes.</li>
+              <li><b>Clase</b> — el carril técnico de <code>tc</code> donde cae cada tier (1:10, 1:20, 1:30, 1:40).</li>
+              <li><b>Min</b> — ancho de banda <b>garantizado</b> a ese servicio aunque todo lo demás sature.</li>
+              <li><b>Max</b> — lo <b>máximo</b> que puede usar si hay tubería libre (∞ = toda la línea).</li>
+            </ul>
+            <p>Puedes aplicar varios planes a la vez: en hosts distintos coexisten; en el mismo host se acumulan los servicios.</p>
+          </div>
+        </details>
+
+        <div id="qi-plans-wrap">
+          <div class="qi-plans-empty" id="qi-plans-empty">No hay ningún plan QoS aplicado todavía.</div>
         </div>
       </div>
     </div>
@@ -2370,14 +2416,25 @@ updateFailoverTimeline();
 setInterval(updateFailoverTimeline, 3000);
 
 // ═══════════════════════════════════════════════════════════════════════════
-// QoS INTENT — chat NL → plan estructurado → tc en el puerto del host
+// QoS INTENT — chat NL → plan (LLM) → tc en el puerto del host
 // ═══════════════════════════════════════════════════════════════════════════
 let _qiCatalog = null;
+// Etiquetas de tier en español (se rellenan desde /api/qos-intent/catalog;
+// fallback local por si el catálogo aún no cargó).
+let _qiTierLabels = {
+  interactive: 'interactivo', streaming: 'streaming',
+  bulk: 'descargas', best_effort: 'normal',
+};
+function _qiTierLabel(t) { return _qiTierLabels[t] || t; }
 
+// Ejemplos de UN SOLO servicio cada uno — no saturamos al LLM con varios.
 const QI_SUGGESTIONS = [
-  "Voy a ver YouTube en 4K, hacer una llamada VoIP y descargar una distribución de Linux.",
-  "Priorizar VoIP y DNS, navegación web normal, descargas en segundo plano.",
-  "Quiero streaming de vídeo fluido y poder navegar sin esperas.",
+  "Priorizar YouTube en 4K",
+  "Hacer una llamada VoIP",
+  "Priorizar el DNS",
+  "Descargar una distribución de Linux",
+  "Navegación web fluida",
+  "Sesión SSH al servidor",
 ];
 
 function qiMsg(kind, text) {
@@ -2390,6 +2447,7 @@ async function qiLoadCatalog() {
   try {
     const d = await fetch('/api/qos-intent/catalog').then(r => r.json());
     _qiCatalog = d;
+    if (d.tier_labels) _qiTierLabels = d.tier_labels;
     const hostSel = document.getElementById('qi-host');
     const cur = hostSel.value;
     hostSel.innerHTML = '<option value="">(auto)</option>'
@@ -2416,43 +2474,77 @@ function qiUseSuggestion(btn) {
   document.getElementById('qi-text').focus();
 }
 
-function qiRenderPlan(plan) {
-  const wrap = document.getElementById('qi-plan');
-  if (!plan) { wrap.style.display = 'none'; return; }
-  wrap.style.display = 'block';
-  const cap = plan.capped ? ' <span style="color:var(--orange)">(mínimos escalados al ancho de línea)</span>' : '';
-  let parsed = '';
-  if (plan.parsed_by === 'llm') {
-    parsed = ' · <span style="color:var(--cyan);font-size:10px;text-transform:uppercase;letter-spacing:.05em">parser LLM</span>';
-  } else if (plan.parsed_by === 'heuristic') {
-    parsed = ' · <span style="color:var(--yellow);font-size:10px;text-transform:uppercase;letter-spacing:.05em">parser heurístico</span>';
-  }
-  const fbReason = plan.fallback_reason
-    ? `<div style="font-size:10px;color:var(--muted);margin-top:4px">${escHtml(plan.fallback_reason)}</div>`
+// Badge del parser que produjo el plan.
+function _qiParsedBadge(plan) {
+  if (plan.parsed_by === 'llm')
+    return ' · <span style="color:var(--cyan);font-size:10px;text-transform:uppercase;letter-spacing:.05em">LLM (tool)</span>';
+  if (plan.parsed_by === 'llm_text')
+    return ' · <span style="color:var(--cyan);font-size:10px;text-transform:uppercase;letter-spacing:.05em">LLM (texto)</span>';
+  if (plan.parsed_by === 'heuristic')
+    return ' · <span style="color:var(--yellow);font-size:10px;text-transform:uppercase;letter-spacing:.05em">heurístico</span>';
+  return '';
+}
+
+// Construye la tarjeta HTML de un plan. `opts.preview` añade el badge amarillo;
+// `opts.clearable` añade el botón de limpiar ese host concreto.
+function qiPlanCard(plan, opts = {}) {
+  const cap = plan.capped ? ' <span style="color:var(--orange)">(mínimos escalados a la línea)</span>' : '';
+  const previewTag = opts.preview
+    ? '<span style="background:rgba(250,222,42,.15);color:var(--yellow);font-size:10px;font-weight:600;padding:2px 8px;border-radius:3px;text-transform:uppercase;letter-spacing:.05em">previsualización</span>'
     : '';
-  document.getElementById('qi-plan-meta').innerHTML =
-    `Host: <b>${escHtml(plan.target_host)}</b> · `
-    + `puerto OVS: <b>${escHtml(plan.target_port)}</b> · `
-    + `línea: <b>${plan.total_mbps} Mbps</b>${cap}${parsed}${fbReason}`;
+  const fbReason = plan.fallback_reason
+    ? `<div style="font-size:10px;color:var(--muted);margin-top:4px;padding:0 12px 8px">${escHtml(plan.fallback_reason)}</div>`
+    : '';
+  const clearBtn = opts.clearable
+    ? `<button class="clear-one" onclick="qiClear('${escHtml(plan.target_host)}')">Quitar ${escHtml(plan.target_host)}</button>`
+    : '';
   const rows = (plan.apps || []).map(a => {
     const max = (a.max_mbps == null) ? '∞' : (a.max_mbps + ' Mbps');
     return `<tr>
       <td><b>${escHtml(a.app)}</b><div style="font-size:10px;color:var(--dim)">${escHtml(a.description || '')}</div></td>
       <td><code>${escHtml(a.service)}</code> <span style="color:var(--dim)">${escHtml(a.transport || '')}/${a.dport}</span></td>
-      <td><span class="qi-tier ${escHtml(a.tier)}">${escHtml(a.tier)}</span></td>
+      <td><span class="qi-tier ${escHtml(a.tier)}">${escHtml(_qiTierLabel(a.tier))}</span></td>
       <td><code>${escHtml(a.classid)}</code></td>
       <td>${a.min_mbps} Mbps</td>
       <td>${max}</td>
     </tr>`;
-  });
-  document.getElementById('qi-plan-body').innerHTML =
-    rows.join('') || '<tr><td colspan="6" style="color:var(--dim)">—</td></tr>';
+  }).join('');
+  return `<div class="qi-plan-card">
+    <div class="hd">
+      ${previewTag}
+      <span class="host">${escHtml(plan.target_host)}</span>
+      <span style="color:var(--muted);font-size:11px">${escHtml(plan.target_port)} · línea ${plan.total_mbps} Mbps${cap}${_qiParsedBadge(plan)}</span>
+      <span class="spacer"></span>
+      ${clearBtn}
+    </div>
+    <table class="qi-table">
+      <thead><tr><th>App</th><th>Servicio</th><th>Tier</th><th>Class</th><th>Min</th><th>Max</th></tr></thead>
+      <tbody>${rows || '<tr><td colspan="6" style="color:var(--dim)">—</td></tr>'}</tbody>
+    </table>
+    ${fbReason}
+  </div>`;
 }
+
+// Pinta la lista de planes ACTIVOS (desde el server). Si hay un preview en
+// curso, lo muestra arriba con su badge.
+function qiRenderPlans(plans, previewPlan) {
+  const wrap = document.getElementById('qi-plans-wrap');
+  let html = '';
+  if (previewPlan) html += qiPlanCard(previewPlan, { preview: true });
+  (plans || []).forEach(p => { html += qiPlanCard(p, { clearable: true }); });
+  // Sin depender de un elemento "empty" persistente (innerHTML lo destruiría):
+  // generamos el mensaje vacío inline cuando no hay nada que mostrar.
+  wrap.innerHTML = html
+    || '<div class="qi-plans-empty">No hay ningún plan QoS aplicado todavía.</div>';
+}
+
+// preview en pantalla (no aplicado). Mientras exista, el polling no lo borra.
+let _qiPreview = null;
 
 async function qiRefreshState() {
   try {
     const d = await fetch('/api/qos-intent/state').then(r => r.json());
-    qiRenderPlan(d.state);
+    qiRenderPlans(d.plans || [], _qiPreview);
   } catch {}
 }
 
@@ -2471,19 +2563,19 @@ function _qiSetBusy(on) {
 
 async function qiPreview() {
   const p = _qiPayload();
-  if (!p.text) { qiMsg('err', 'Escribe primero qué vas a usar.'); return; }
+  if (!p.text) { qiMsg('err', 'Escribe o elige un servicio primero.'); return; }
   _qiSetBusy(true);
-  qiMsg('info', 'Pensando con el LLM…');
+  qiMsg('info', 'Consultando al LLM… (puede tardar, el modelo decide el plan)');
   try {
     const r = await fetch('/api/qos-intent/preview', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(p),
     });
     const d = await r.json();
     if (!d.ok) { qiMsg('err', d.error || 'Error desconocido'); return; }
-    qiRenderPlan(d.plan);
-    qiMsg('ok', 'Plan generado. Pulsa Aplicar si te convence.');
+    _qiPreview = d.plan;
+    qiRefreshState();
+    qiMsg('ok', 'Previsualización lista. Pulsa Aplicar para activarla.');
   } catch (e) {
     qiMsg('err', 'Red: ' + e);
   } finally { _qiSetBusy(false); }
@@ -2491,37 +2583,51 @@ async function qiPreview() {
 
 async function qiApply() {
   const p = _qiPayload();
-  if (!p.text) { qiMsg('err', 'Escribe primero qué vas a usar.'); return; }
+  if (!p.text) { qiMsg('err', 'Escribe o elige un servicio primero.'); return; }
   _qiSetBusy(true);
-  qiMsg('info', 'Generando plan y aplicando tc…');
+  qiMsg('info', 'Consultando al LLM y aplicando tc en la VM…');
   try {
     const r = await fetch('/api/qos-intent/apply', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(p),
     });
     const d = await r.json();
     if (!d.ok) { qiMsg('err', d.error || 'Error desconocido'); return; }
-    qiRenderPlan(d.plan);
-    qiMsg('ok', '✓ Plan aplicado en ' + d.plan.target_port);
+    _qiPreview = null;
+    const m = d.plan.merged_from ? ' (fusionado con el plan previo del host)' : '';
+    qiMsg('ok', `✓ Plan aplicado en ${d.plan.target_host} (${d.plan.target_port})${m}`);
+    qiRefreshState();
   } catch (e) {
     qiMsg('err', 'Red: ' + e);
   } finally { _qiSetBusy(false); }
 }
 
-async function qiClear() {
+// target opcional: host concreto ('h1') o nada para limpiar todos.
+async function qiClear(target) {
   _qiSetBusy(true);
-  qiMsg('info', 'Limpiando QoS user-intent…');
+  qiMsg('info', target ? `Quitando QoS de ${target}…` : 'Limpiando todos los planes…');
   try {
-    const r = await fetch('/api/qos-intent/clear', { method: 'POST' });
+    const body = target ? JSON.stringify({ target }) : '{}';
+    const r = await fetch('/api/qos-intent/clear', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body,
+    });
     const d = await r.json();
     if (!d.ok) { qiMsg('err', d.error || 'Error'); return; }
-    qiRenderPlan(null);
-    qiMsg('ok', d.cleared ? '✓ QoS user-intent eliminado.' : 'No había plan activo.');
+    if (!target) _qiPreview = null;
+    qiMsg('ok', d.count ? `✓ ${d.count} plan(es) eliminado(s).` : 'No había planes que limpiar.');
+    qiRefreshState();
   } catch (e) {
     qiMsg('err', 'Red: ' + e);
   } finally { _qiSetBusy(false); }
 }
+
+// Cambiar el texto/host/línea descarta la previsualización obsoleta.
+function _qiInvalidatePreview() {
+  if (_qiPreview) { _qiPreview = null; qiRefreshState(); }
+}
+document.getElementById('qi-text').addEventListener('input', _qiInvalidatePreview);
+document.getElementById('qi-host').addEventListener('change', _qiInvalidatePreview);
+document.getElementById('qi-mbps').addEventListener('input', _qiInvalidatePreview);
 
 qiLoadCatalog();
 qiRefreshState();
