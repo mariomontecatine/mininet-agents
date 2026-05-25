@@ -1010,13 +1010,15 @@ def api_qos_intent_catalog():
 
 @app.route("/api/qos-intent/state", methods=["GET"])
 def api_qos_intent_state():
-    """Planes QoS user-intent actualmente aplicados.
+    """Planes QoS user-intent del directorio activo (live tmp/ o saved run).
 
-    `plans`: lista de todos los planes activos (uno por host/puerto).
-    `state`: primer plan (compat con clientes antiguos).
+    Lee qos_intent_state.json desde _active_dir() para que al ver un run
+    guardado se muestre la QoS que había en ese snapshot, no la de la sesión
+    en vivo. `plans`: lista de planes; `state`: primero (compat).
     """
     from agents import qos_intent
-    plans = qos_intent.load_active_plans()
+    data  = _load_json("qos_intent_state.json", {})
+    plans = list(qos_intent.normalize_plans(data).values())
     return jsonify({"plans": plans, "state": plans[0] if plans else None})
 
 

@@ -180,6 +180,20 @@ def _write_qos_event(port, event_type, app_id=None, tier=None, classid=None):
 # Compat: si el fichero trae el formato antiguo (un único plan plano con
 # 'target_port'), lo migramos a {port: plan} al leerlo.
 
+def normalize_plans(data) -> dict:
+    """Normaliza el contenido de qos_intent_state.json a {target_port: plan}.
+
+    Acepta el formato actual (dict por puerto) y el antiguo (un único plan
+    plano con 'target_port'). Reutilizable por el dashboard para leer el
+    estado de un run guardado sin tocar la ruta fija de tmp/.
+    """
+    if not isinstance(data, dict):
+        return {}
+    if "target_port" in data and "apps" in data:   # formato antiguo
+        return {data["target_port"]: data}
+    return data
+
+
 def _load_plans() -> dict:
     """Devuelve {target_port: plan}. Migra el formato antiguo si hace falta."""
     if not os.path.exists(STATE_FILE):
@@ -189,12 +203,7 @@ def _load_plans() -> dict:
             data = json.load(f)
     except (IOError, json.JSONDecodeError):
         return {}
-    if not isinstance(data, dict):
-        return {}
-    # Formato antiguo: un solo plan con target_port a nivel raíz.
-    if "target_port" in data and "apps" in data:
-        return {data["target_port"]: data}
-    return data
+    return normalize_plans(data)
 
 
 def _save_plans(plans: dict):

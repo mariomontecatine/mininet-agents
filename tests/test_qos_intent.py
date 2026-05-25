@@ -376,7 +376,10 @@ def test_llm_falls_back_on_timeout(host_port_map, tmp_path, monkeypatch):
 
 def test_endpoints_register(host_port_map, tmp_path, monkeypatch):
     """Comprueba que la app Flask expone los nuevos endpoints sin ejecutar SSH."""
-    monkeypatch.setattr(qos_intent, "STATE_FILE",  str(tmp_path / "state.json"))
+    # El endpoint /state lee qos_intent_state.json desde _active_dir() (=_TMP_DIR
+    # en live); apply escribe en qos_intent.STATE_FILE. Ambos deben apuntar al
+    # mismo fichero dentro de tmp_path para que el test sea coherente.
+    monkeypatch.setattr(qos_intent, "STATE_FILE",  str(tmp_path / "qos_intent_state.json"))
     monkeypatch.setattr(qos_intent, "QOS_HISTORY", str(tmp_path / "qos.json"))
     _patch_ssh(monkeypatch)
 
@@ -416,3 +419,39 @@ def test_endpoints_register(host_port_map, tmp_path, monkeypatch):
     r = client.post("/api/qos-intent/clear")
     assert r.status_code == 200
     assert r.get_json()["ok"] is True
+
+
+def test_state_reads_from_active_run(host_port_map, tmp_path, monkeypatch):
+    """Al ver un run guardado, /state muestra la QoS de ESE snapshot, no la live."""
+    import json as _json
+    from dashboard import app as dash_app
+
+    # tmp/ live: sin QoS
+    live_dir = tmp_path / "tmp"
+    live_dir.mkdir()
+    monkeypatch.setattr(dash_app, "_TMP_DIR", str(live_dir))
+
+    # saved run con un qos_intent_state.json (formato {puerto: plan})
+    run_dir = tmp_path / "saved" / "demo"
+    run_dir.mkdir(parents=True)
+    monkeypatch.setattr(dash_app, "_SAVED_RUNS_DIR", str(tmp_path / "saved"))
+    saved_plan = {"s1-eth2": {"target_host": "h1", "target_port": "s1-eth2",
+                              "total_mbps": 50, "apps": [{"app": "voip", "tier": "interactive",
+                              "classid": "1:10", "ip_proto": 17, "dport": 5060,
+                              "min_mbps": 1.0, "max_mbps": 4.0, "service": "sip"}]}}
+    (run_dir / "qos_intent_state.json").write_text(_json.dumps(saved_plan), encoding="utf-8")
+
+    client = dash_app.app.test_client()
+
+    # En live no hay nada.
+    assert client.get("/api/qos-intent/state").get_json()["plans"] == []
+
+    # Cargar el run y comprobar que /state devuelve su QoS.
+    r = client.post("/api/runs/load", json={"name": "demo"})
+    assert r.status_code == 200, r.get_data(as_text=True)
+    plans = client.get("/api/qos-intent/state").get_json()["plans"]
+    assert len(plans) == 1 and plans[0]["target_host"] == "h1"
+
+    # Volver a live: vacío otra vez.
+    client.post("/api/runs/live")
+    assert client.get("/api/qos-intent/state").get_json()["plans"] == []
