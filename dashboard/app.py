@@ -1037,6 +1037,8 @@ def api_qos_intent_preview():
         plan = qos_intent.parse_qos_intent_llm(text,
                                                default_host=host,
                                                default_total_mbps=float(total))
+        # Adjuntamos los comandos tc que se aplicarían (preview no los emite).
+        plan["tc_commands"] = qos_intent.build_tc_commands(plan)
         return jsonify({"ok": True, "plan": plan})
     except ValueError as e:
         return jsonify({"ok": False, "error": str(e)}), 400

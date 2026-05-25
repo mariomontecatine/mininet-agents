@@ -358,6 +358,28 @@
     }
     .qi-plan-card .hd .clear-one:hover { border-color:var(--red); color:var(--red); }
 
+    /* comandos tc dentro de cada tarjeta */
+    .qi-tc { margin:0 12px 10px; font-size:11px; }
+    .qi-tc summary { cursor:pointer; color:var(--blue); font-size:11px; user-select:none;
+                     padding:4px 0; }
+    .qi-tc summary:hover { text-decoration:underline; }
+    .qi-tc-body { display:flex; gap:14px; flex-wrap:wrap; align-items:flex-start; }
+    .qi-tc-pre {
+      flex:1; min-width:280px; margin:6px 0 0;
+      background:#0d0f12; border:1px solid var(--border); border-radius:4px;
+      padding:8px 10px; overflow-x:auto;
+      font-family:'JetBrains Mono','Cascadia Code','Fira Code',monospace;
+      font-size:10.5px; line-height:1.5; white-space:pre;
+    }
+    .qi-tc-note { color:var(--green); opacity:.75; }
+    .qi-tc-cmd  { color:var(--text); margin-bottom:6px; white-space:pre-wrap; word-break:break-all; }
+    .qi-tc-gloss { flex:0 0 280px; font-size:10.5px; color:var(--muted); margin-top:6px; }
+    .qi-tc-gloss-h { color:var(--text); font-weight:600; text-transform:uppercase;
+                     letter-spacing:.05em; font-size:10px; margin-bottom:4px; }
+    .qi-tc-gloss ul { margin:0 0 0 4px; list-style:none; }
+    .qi-tc-gloss li { margin-bottom:4px; line-height:1.5; }
+    .qi-tc-gloss code { color:var(--cyan); }
+
     /* ── Heatmap ── */
     #heatmap-canvas { display: block; width: 100%; cursor: crosshair; }
     #heatmap-tooltip {
@@ -653,7 +675,7 @@
                  title="Ancho de banda total del enlace del host: el techo que se reparte entre servicios">
         </div>
         <div class="qi-input">
-          <textarea id="qi-text" placeholder="Ej: priorizar YouTube en 4K  ·  pulsa un ejemplo de abajo o escribe tú mismo (un servicio cada vez)"></textarea>
+          <textarea id="qi-text" placeholder="Ej: priorizar YouTube en 4K"></textarea>
           <div class="qi-actions">
             <button class="icon-btn primary" onclick="qiApply()" id="qi-btn-apply">Aplicar</button>
             <button class="icon-btn"          onclick="qiPreview()" id="qi-btn-preview">Previsualizar</button>
@@ -2522,13 +2544,58 @@ function qiPlanCard(plan, opts = {}) {
       <tbody>${rows || '<tr><td colspan="6" style="color:var(--dim)">—</td></tr>'}</tbody>
     </table>
     ${fbReason}
+    ${qiTcBlock(plan.tc_commands, (opts.preview ? 'preview:' : 'applied:') + plan.target_host)}
   </div>`;
+}
+
+// Glosario de los parámetros tc que aparecen en los comandos generados.
+const QI_TC_GLOSSARY = [
+  ['qdisc htb',  'disciplina de cola jerárquica: reparte la línea en carriles con garantía + préstamo.'],
+  ['default 40', 'el tráfico sin filtro va al carril 1:40 (tier normal).'],
+  ['classid 1:N','identificador del carril (1:10 interactivo, 1:20 streaming, 1:30 descargas, 1:40 normal).'],
+  ['rate',       'ancho de banda GARANTIZADO al carril aunque todo lo demás sature.'],
+  ['ceil',       'techo: lo MÁXIMO que el carril puede usar si hay línea libre.'],
+  ['prio',       'prioridad del carril (0 = más alta). En congestión, el de prio baja cede antes.'],
+  ['filter u32', 'clasificador: mira cabeceras del paquete para decidir su carril.'],
+  ['match ip protocol', 'casa por protocolo IP (6=TCP, 17=UDP, 1=ICMP).'],
+  ['match ip dport',    'casa por puerto de destino (p.ej. 443=HTTPS, 5060=SIP).'],
+  ['flowid 1:N', 'destino: a qué carril (clase) se manda el tráfico que casa el filtro.'],
+];
+
+// Bloque desplegable con los comandos tc + glosario. `key` identifica el
+// <details> de forma estable para poder restaurar su estado abierto tras
+// regenerar la lista (ver qiRenderPlans).
+function qiTcBlock(tcCommands, key) {
+  if (!tcCommands || !tcCommands.length) return '';
+  const lines = tcCommands.map(c => {
+    const cmd  = escHtml(c.cmd || c);
+    const note = c.note ? `<div class="qi-tc-note"># ${escHtml(c.note)}</div>` : '';
+    return `${note}<div class="qi-tc-cmd">${cmd}</div>`;
+  }).join('');
+  const gloss = QI_TC_GLOSSARY.map(([k, v]) =>
+    `<li><code>${escHtml(k)}</code> — ${escHtml(v)}</li>`
+  ).join('');
+  return `<details class="qi-tc" data-tc-key="${escHtml(key || '')}">
+    <summary>Ver los ${tcCommands.length} comandos tc generados</summary>
+    <div class="qi-tc-body">
+      <pre class="qi-tc-pre">${lines}</pre>
+      <div class="qi-tc-gloss">
+        <div class="qi-tc-gloss-h">Parámetros principales</div>
+        <ul>${gloss}</ul>
+      </div>
+    </div>
+  </details>`;
 }
 
 // Pinta la lista de planes ACTIVOS (desde el server). Si hay un preview en
 // curso, lo muestra arriba con su badge.
 function qiRenderPlans(plans, previewPlan) {
   const wrap = document.getElementById('qi-plans-wrap');
+  // Recordar qué desplegables de comandos tc estaban abiertos para no cerrarlos
+  // al regenerar el DOM (el polling reconstruye innerHTML cada pocos segundos).
+  const openKeys = new Set(
+    [...wrap.querySelectorAll('details.qi-tc[open]')].map(d => d.dataset.tcKey)
+  );
   let html = '';
   if (previewPlan) html += qiPlanCard(previewPlan, { preview: true });
   (plans || []).forEach(p => { html += qiPlanCard(p, { clearable: true }); });
@@ -2536,6 +2603,10 @@ function qiRenderPlans(plans, previewPlan) {
   // generamos el mensaje vacío inline cuando no hay nada que mostrar.
   wrap.innerHTML = html
     || '<div class="qi-plans-empty">No hay ningún plan QoS aplicado todavía.</div>';
+  // Reabrir los que estaban abiertos.
+  wrap.querySelectorAll('details.qi-tc').forEach(d => {
+    if (openKeys.has(d.dataset.tcKey)) d.open = true;
+  });
 }
 
 // preview en pantalla (no aplicado). Mientras exista, el polling no lo borra.
@@ -2565,7 +2636,7 @@ async function qiPreview() {
   const p = _qiPayload();
   if (!p.text) { qiMsg('err', 'Escribe o elige un servicio primero.'); return; }
   _qiSetBusy(true);
-  qiMsg('info', 'Consultando al LLM… (puede tardar, el modelo decide el plan)');
+  qiMsg('info', 'Consultando al LLM…');
   try {
     const r = await fetch('/api/qos-intent/preview', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },

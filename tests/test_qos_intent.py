@@ -265,6 +265,38 @@ def test_clear_selective_by_host(host_port_map, tmp_path, monkeypatch):
     assert len(remaining) == 1 and remaining[0]["target_host"] == "h2"
 
 
+def test_build_tc_commands_structure(host_port_map):
+    """build_tc_commands devuelve los comandos exactos + notas legibles."""
+    plan = qos_intent.build_qos_plan(
+        "h1", [{"app": "voip"}, {"app": "youtube"}], 50)
+    cmds = qos_intent.build_tc_commands(plan)
+    txt = "\n".join(c["cmd"] for c in cmds)
+    # Cada comando trae nota explicativa.
+    assert all(c.get("note") for c in cmds)
+    # Estructura HTB esperada.
+    assert "tc qdisc del dev s1-eth2 root" in txt
+    assert "tc qdisc add dev s1-eth2 root handle 1: htb default 40" in txt
+    # Clase raíz 1:1 = línea total (techo agregado).
+    assert "classid 1:1 htb rate 50.00mbit ceil 50.00mbit" in txt
+    # Los carriles cuelgan de 1:1, no de la qdisc directamente.
+    assert "parent 1:1 classid 1:10" in txt
+    assert "parent 1:1 classid 1:20" in txt
+    # Filtros por dport de cada app (sip 5060, https 443).
+    assert "match ip dport 5060 0xffff" in txt
+    assert "match ip dport 443 0xffff" in txt
+    assert "flowid 1:10" in txt and "flowid 1:20" in txt
+
+
+def test_apply_attaches_tc_commands(host_port_map, tmp_path, monkeypatch):
+    """El plan aplicado lleva tc_commands persistidos para mostrarlos."""
+    monkeypatch.setattr(qos_intent, "STATE_FILE",  str(tmp_path / "state.json"))
+    monkeypatch.setattr(qos_intent, "QOS_HISTORY", str(tmp_path / "qos.json"))
+    _patch_ssh(monkeypatch)
+    applied = qos_intent.apply_qos_plan(qos_intent.build_qos_plan("h1", [{"app": "voip"}], 50))
+    assert applied.get("tc_commands")
+    assert any("htb default 40" in c["cmd"] for c in applied["tc_commands"])
+
+
 def test_extract_args_from_text():
     """El parser de texto plano rescata un JSON embebido en la respuesta LLM."""
     txt = ('Claro, aquí tienes el plan:\n```json\n'

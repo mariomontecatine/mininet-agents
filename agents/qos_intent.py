@@ -338,11 +338,14 @@ def _tc_proto_match(ip_proto, dport):
     return " ".join(parts)
 
 
-def _emit_tc_for_plan(ssh, plan):
-    """Emite el árbol HTB completo de un plan sobre su puerto. No toca estado.
+def build_tc_commands(plan):
+    """Devuelve la lista EXACTA de comandos tc que aplicarían el plan.
 
-    Idempotente: borra el qdisc raíz previo y reconstruye con TODAS las apps
-    del plan (clases por tier + un filtro u32 por app).
+    Es la única fuente de verdad: _emit_tc_for_plan los ejecuta y la interfaz
+    los muestra. El prefijo "sh " es el comando de la CLI de Mininet para
+    ejecutarlos en el shell de la VM (los puertos OVS viven en el root netns).
+
+    Cada entrada es {"cmd": <str>, "note": <explicación corta en español>}.
     """
     port  = plan["target_port"]
     total = plan["total_mbps"]
@@ -352,15 +355,6 @@ def _emit_tc_for_plan(ssh, plan):
     if "best_effort" not in tiers_in_plan:
         tiers_in_plan.add("best_effort")
 
-    # Limpia qdisc previo (idempotencia).
-    send_tmux_command(ssh, f"sh tc qdisc del dev {port} root 2>/dev/null; true")
-    time.sleep(0.2)
-
-    # Raíz HTB, default → best_effort (1:40).
-    send_tmux_command(ssh, f"sh tc qdisc add dev {port} root handle 1: htb default 40")
-    time.sleep(0.1)
-
-    # Una clase por tier: rate = suma de mínimos de sus apps (≥0.5), ceil = línea.
     tier_rates = {t: 0.0 for t in tiers_in_plan}
     for a in apps:
         tier_rates[a["tier"]] += a["min_mbps"]
@@ -368,25 +362,66 @@ def _emit_tc_for_plan(ssh, plan):
         if rate <= 0:
             tier_rates[t] = 0.5
 
+    cmds = []
+    cmds.append({
+        "cmd": f"sh tc qdisc del dev {port} root 2>/dev/null; true",
+        "note": "Borra cualquier QoS previa en el puerto (idempotencia).",
+    })
+    cmds.append({
+        "cmd": f"sh tc qdisc add dev {port} root handle 1: htb default 40",
+        "note": ("Crea el árbol HTB raíz. El tráfico sin filtro cae en la clase "
+                 "1:40 (tier 'normal')."),
+    })
+    # Clase raíz 1:1 = la línea total. Todas los carriles cuelgan de ella, así
+    # que su ceil impone el techo agregado (la suma nunca pasa de la línea) y
+    # los carriles se prestan entre sí el ancho libre (el préstamo HTB es del
+    # padre común).
+    cmds.append({
+        "cmd": (f"sh tc class add dev {port} parent 1: classid 1:1 htb "
+                f"rate {total:.2f}mbit ceil {total:.2f}mbit"),
+        "note": (f"Clase raíz = la línea total ({total:.2f} Mbps). Techo agregado: "
+                 "la suma de los carriles nunca lo supera, y entre ellos se "
+                 "prestan el ancho que sobre."),
+    })
     for tier in sorted(tiers_in_plan, key=lambda t: apps_catalog.TIER_PRIORITY[t]):
         classid = apps_catalog.TIER_CLASSID[tier]
         prio    = apps_catalog.TIER_PRIORITY[tier]
         rate    = tier_rates[tier]
-        send_tmux_command(
-            ssh,
-            f"sh tc class add dev {port} parent 1: classid {classid} htb "
-            f"rate {rate:.2f}mbit ceil {total:.2f}mbit prio {prio}",
-        )
-        time.sleep(0.05)
-
+        label   = apps_catalog.TIER_LABEL.get(tier, tier)
+        cmds.append({
+            "cmd": (f"sh tc class add dev {port} parent 1:1 classid {classid} htb "
+                    f"rate {rate:.2f}mbit ceil {total:.2f}mbit prio {prio}"),
+            "note": (f"Carril '{label}': garantiza {rate:.2f} Mbps, puede subir hasta "
+                     f"{total:.2f} Mbps si hay hueco. prio {prio} = "
+                     f"{'máxima' if prio == 0 else 'prioridad ' + str(prio)}."),
+        })
     for a in apps:
         match = _tc_proto_match(a["ip_proto"], a["dport"])
-        send_tmux_command(
-            ssh,
-            f"sh tc filter add dev {port} parent 1: protocol ip prio 1 u32 "
-            f"{match} flowid {a['classid']}",
-        )
-        time.sleep(0.05)
+        proto_name = {6: "TCP", 17: "UDP", 1: "ICMP"}.get(a["ip_proto"], str(a["ip_proto"]))
+        cmds.append({
+            "cmd": (f"sh tc filter add dev {port} parent 1: protocol ip prio 1 u32 "
+                    f"{match} flowid {a['classid']}"),
+            "note": (f"{a['app']}: envía el tráfico {proto_name} puerto {a['dport']} "
+                     f"al carril {a['classid']} ({apps_catalog.TIER_LABEL.get(a['tier'], a['tier'])})."),
+        })
+    return cmds
+
+
+def _emit_tc_for_plan(ssh, plan):
+    """Emite el árbol HTB completo de un plan sobre su puerto. No toca estado.
+
+    Idempotente: borra el qdisc raíz previo y reconstruye con TODAS las apps
+    del plan (clases por tier + un filtro u32 por app). Usa build_tc_commands
+    como fuente única de los comandos.
+    """
+    port  = plan["target_port"]
+    cmds  = build_tc_commands(plan)
+    for i, entry in enumerate(cmds):
+        send_tmux_command(ssh, entry["cmd"])
+        # El borrado inicial necesita más margen; el resto va rápido.
+        time.sleep(0.2 if i == 0 else 0.05)
+    # Eventos para el timeline (uno por app).
+    for a in plan["apps"]:
         _write_qos_event(port, "intent_apply",
                          app_id=a["app"], tier=a["tier"], classid=a["classid"])
 
@@ -429,6 +464,10 @@ def apply_qos_plan(plan):
         merged["parsed_by"] = plan.get("parsed_by")
         merged["merged_from"] = len(plans[port].get("apps", []))
         plan = merged
+
+    # Adjuntamos los comandos tc al plan para que la interfaz los muestre y se
+    # persistan junto al estado.
+    plan["tc_commands"] = build_tc_commands(plan)
 
     ssh = get_ssh_connection()
     _emit_tc_for_plan(ssh, plan)
