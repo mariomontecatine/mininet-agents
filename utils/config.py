@@ -55,6 +55,7 @@ SERVICE_PORTS = {
     "ssh": 22,
     "ftp": 21,
     "sip": 5060,
+    "rtp": 16384,  # puerto RTP "pinneado" (media de voz/vídeo en tiempo real)
     "smtp": 25,
 }
 
@@ -68,6 +69,7 @@ SERVICE_DEFS = {
     "dns": {"ip_proto": 17, "dport": 53, "transport": "udp"},
     "ssh": {"ip_proto": 6, "dport": 22, "transport": "tcp"},
     "sip": {"ip_proto": 17, "dport": 5060, "transport": "udp"},
+    "rtp": {"ip_proto": 17, "dport": 16384, "transport": "udp"},
     "ftp": {"ip_proto": 6, "dport": 21, "transport": "tcp"},
     "smtp": {"ip_proto": 6, "dport": 25, "transport": "tcp"},
     "icmp": {"ip_proto": 1, "dport": None, "transport": "icmp"},

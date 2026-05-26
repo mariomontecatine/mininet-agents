@@ -42,7 +42,7 @@ def test_resolve_service_returns_service_def():
     svc = apps_catalog.resolve_service("voip")
     assert svc is not None
     assert svc["transport"] == "udp"
-    assert svc["dport"] == 5060
+    assert svc["dport"] == 16384   # voip prioriza el media RTP (puerto pinneado)
 
 
 def test_describe_catalog_lists_all_apps():
@@ -76,7 +76,7 @@ def test_build_plan_simple(host_port_map):
     apps_by_id = {a["app"]: a for a in plan["apps"]}
     assert apps_by_id["voip"]["tier"]    == "interactive"
     assert apps_by_id["voip"]["classid"] == "1:10"
-    assert apps_by_id["voip"]["dport"]   == 5060
+    assert apps_by_id["voip"]["dport"]   == 16384
     assert apps_by_id["youtube"]["classid"]   == "1:20"
     assert apps_by_id["linux_iso"]["classid"] == "1:30"
 
@@ -175,8 +175,8 @@ def test_apply_emits_htb_root_and_classes(host_port_map, tmp_path, monkeypatch):
     # Una class por tier presente (3 explícitos + best_effort por defecto).
     class_count = sum(1 for c in sent if "tc class add" in c)
     assert class_count >= 4
-    # Filtros u32 con dport del servicio (sip 5060, https 443, http_alt 8080).
-    assert "match ip dport 5060 0xffff" in joined
+    # Filtros u32 con dport del servicio (rtp 16384, https 443, http_alt 8080).
+    assert "match ip dport 16384 0xffff" in joined
     assert "match ip dport 443 0xffff" in joined
     assert "match ip dport 8080 0xffff" in joined
     # flowid apuntando a las clases correctas.
@@ -281,8 +281,8 @@ def test_build_tc_commands_structure(host_port_map):
     # Los carriles cuelgan de 1:1, no de la qdisc directamente.
     assert "parent 1:1 classid 1:10" in txt
     assert "parent 1:1 classid 1:20" in txt
-    # Filtros por dport de cada app (sip 5060, https 443).
-    assert "match ip dport 5060 0xffff" in txt
+    # Filtros por dport de cada app (rtp 16384, https 443).
+    assert "match ip dport 16384 0xffff" in txt
     assert "match ip dport 443 0xffff" in txt
     assert "flowid 1:10" in txt and "flowid 1:20" in txt
 

@@ -24,8 +24,8 @@ from utils import config
 # el filtro u32 por (ip_proto, dport) los pueda separar en clases HTB.
 APPLICATIONS = {
     "voip": {
-        "description":  "Llamadas de voz/vídeo en tiempo real (SIP/RTP). Latencia baja, BW pequeño.",
-        "service":      "sip",
+        "description":  "Llamadas de voz/vídeo en tiempo real (media RTP). Latencia baja, BW pequeño.",
+        "service":      "rtp",   # priorizamos el MEDIA RTP (audio), que es lo que define la calidad
         "tier":         "interactive",
         "priority":     0,
         "min_mbps":     1.0,
