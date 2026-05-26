@@ -711,6 +711,37 @@
     </div>
   </div>
 
+  <!-- ROW 3f: router central + prueba VoIP + identificación de tráfico -->
+  <div class="row">
+    <div class="panel" style="flex:1">
+      <div class="panel-hd">
+        <span class="panel-title">Router central &amp; prueba VoIP</span>
+        <span class="panel-hint">priorizar VoIP donde el tráfico se concentra y comprobar el antes/después</span>
+      </div>
+      <div class="panel-body">
+        <div id="cl-info" style="font-size:12px;color:var(--muted);margin-bottom:10px">
+          Calculando el router central…
+        </div>
+        <div class="qi-bar">
+          <label for="vt-mbps" title="A cuánto se limita el enlace troncal para forzar saturación">Troncal (Mbps)</label>
+          <input id="vt-mbps" type="number" min="1" max="100" step="1" value="10" style="width:70px">
+          <button class="icon-btn primary" id="vt-btn" onclick="vtRun()">Probar llamada (antes/después)</button>
+        </div>
+        <div class="qi-msg" id="vt-msg"></div>
+        <div id="vt-result"></div>
+      </div>
+    </div>
+    <div class="panel" style="flex:1">
+      <div class="panel-hd">
+        <span class="panel-title">Identificación de tráfico</span>
+        <span class="panel-hint">qué hace cada host, inferido de los flujos sFlow (por puerto, sin DPI)</span>
+      </div>
+      <div class="panel-body">
+        <div id="ti-wrap" style="font-size:12px;color:var(--dim)">Sin datos de flujos todavía.</div>
+      </div>
+    </div>
+  </div>
+
   <!-- ROW 4: tráfico histórico + drops -->
   <div class="row">
     <div class="panel" style="flex:2">
@@ -2514,6 +2545,9 @@ function qiPlanCard(plan, opts = {}) {
   const previewTag = opts.preview
     ? '<span style="background:rgba(250,222,42,.15);color:var(--yellow);font-size:10px;font-weight:600;padding:2px 8px;border-radius:3px;text-transform:uppercase;letter-spacing:.05em">previsualización</span>'
     : '';
+  const scopeTag = (plan.scope === 'network')
+    ? '<span title="Se aplica en el troncal del router central de la red" style="background:rgba(87,148,242,.18);color:#5794f2;font-size:10px;font-weight:600;padding:2px 8px;border-radius:3px;text-transform:uppercase;letter-spacing:.05em">red · router central</span>'
+    : '';
   const fbReason = plan.fallback_reason
     ? `<div style="font-size:10px;color:var(--muted);margin-top:4px;padding:0 12px 8px">${escHtml(plan.fallback_reason)}</div>`
     : '';
@@ -2533,7 +2567,7 @@ function qiPlanCard(plan, opts = {}) {
   }).join('');
   return `<div class="qi-plan-card">
     <div class="hd">
-      ${previewTag}
+      ${previewTag}${scopeTag}
       <span class="host">${escHtml(plan.target_host)}</span>
       <span style="color:var(--muted);font-size:11px">${escHtml(plan.target_port)} · línea ${plan.total_mbps} Mbps${cap}${_qiParsedBadge(plan)}</span>
       <span class="spacer"></span>
@@ -2704,6 +2738,152 @@ qiLoadCatalog();
 qiRefreshState();
 setInterval(qiLoadCatalog,  15000);
 setInterval(qiRefreshState, 10000);
+
+// ── Router central ──────────────────────────────────────────────────────────
+async function clRefresh() {
+  try {
+    const d = await fetch('/api/central-link').then(r => r.json());
+    const c = d.central;
+    const el = document.getElementById('cl-info');
+    if (!c) { el.innerHTML = 'Aún no se ha detectado el router central (despliega la red).'; return; }
+    const hb = (c.hosts_behind || {})[c.shaping_port] || 0;
+    el.innerHTML = `Troncal central detectado: <b>${escHtml(c.trunk_link.join(' ↔ '))}</b> ·
+      switch central <b>${escHtml(c.central_switch)}</b> ·
+      QoS de red se aplica en <code>${escHtml(c.shaping_port)}</code>
+      (egress hacia ${escHtml((c.neighbors||{})[c.shaping_port]||'?')}, ${hb} hosts detrás).`;
+  } catch {}
+}
+
+// ── Identificación de tráfico ─────────────────────────────────────────────────
+async function tiRefresh() {
+  try {
+    const d = await fetch('/api/traffic-id').then(r => r.json());
+    const wrap = document.getElementById('ti-wrap');
+    if (!d.ok || !d.hosts || !Object.keys(d.hosts).length) {
+      wrap.innerHTML = 'Sin datos de flujos todavía.'; return;
+    }
+    const det = (d.detected_apps || []).length
+      ? `<div style="margin-bottom:8px">Apps detectadas en la red: ${
+          d.detected_apps.map(a => `<span class="qi-tier interactive" style="margin-right:4px">${escHtml(a)}</span>`).join('')}</div>`
+      : '';
+    let rows = '';
+    for (const [host, he] of Object.entries(d.hosts).slice(0, 12)) {
+      const apps = Object.entries(he.apps).map(([label, ae]) => {
+        const kb = Math.round((ae.bytes || 0) / 1024);
+        const isApp = label !== 'otro';
+        return `<span class="qi-tier ${isApp ? 'interactive' : 'best_effort'}" title="${kb} KB"
+                 style="margin-right:4px">${escHtml(label)}</span>`;
+      }).join('');
+      rows += `<tr><td><b>${escHtml(host)}</b></td><td>${apps}</td></tr>`;
+    }
+    wrap.innerHTML = det + `<table class="qi-table"><thead><tr><th>Host</th><th>Tráfico observado</th></tr></thead>
+      <tbody>${rows}</tbody></table>`;
+  } catch {}
+}
+
+// ── Prueba VoIP antes/después ─────────────────────────────────────────────────
+function _vtMosLabel(mos) {
+  if (mos >= 4.0) return ['excelente', 'var(--green)'];
+  if (mos >= 3.5) return ['buena', 'var(--green)'];
+  if (mos >= 2.5) return ['regular', 'var(--yellow)'];
+  if (mos >= 1.5) return ['mala', 'var(--orange)'];
+  return ['inservible', 'var(--red)'];
+}
+function _vtMetricRow(label, before, after, unit, betterLow) {
+  const fmt = v => (v == null ? '—' : v + (unit || ''));
+  return `<tr><td>${escHtml(label)}</td>
+    <td style="text-align:right;color:var(--muted)">${fmt(before)}</td>
+    <td style="text-align:right;color:var(--green)">${fmt(after)}</td></tr>`;
+}
+function vtRender(res) {
+  const el = document.getElementById('vt-result');
+  if (!res) { el.innerHTML = ''; return; }
+  if (res.status === 'running') {
+    el.innerHTML = `<div style="font-size:12px;color:var(--yellow)">Ejecutando fase: <b>${escHtml(res.phase||'…')}</b>… (puede tardar ~1 min)</div>`;
+    return;
+  }
+  if (res.status === 'error') {
+    el.innerHTML = `<div style="font-size:12px;color:var(--red)">Error: ${escHtml(res.error||'')}</div>`;
+    return;
+  }
+  const b = res.before || {}, a = res.after || {};
+  const tb = b.tshark || {}, ta = a.tshark || {};
+  const cb = res.finished_at || Date.now();   // cache-buster para el audio
+  const ep = res.endpoints || {};
+  const [bl, bc] = _vtMosLabel(b.mos || 1), [al, ac] = _vtMosLabel(a.mos || 1);
+  const audioCol = (ph, m) => `
+    <div style="flex:1;min-width:0">
+      <div style="font-size:10px;color:var(--dim);margin-bottom:3px">${ph==='before'?'SIN QoS':'CON QoS'}${m.loss_pct!=null?` · ${m.loss_pct}% perdido`:''}</div>
+      ${m.audio_file?`<audio controls preload="none" style="width:100%;height:32px" src="/api/voip-test/audio/${ph}?t=${cb}"></audio>`:'<span style="color:var(--dim);font-size:11px">—</span>'}
+      ${m.pcap_file?`<a href="/api/voip-test/pcap/${ph}" style="font-size:10px;color:#5794f2">descargar .pcap</a>`:''}
+    </div>`;
+  const tsRow = (label, vb, va, unit) => `<tr><td>${label}</td>
+    <td style="text-align:right;color:var(--muted)">${vb!=null?vb+unit:'—'}</td>
+    <td style="text-align:right;color:var(--green)">${va!=null?va+unit:'—'}</td></tr>`;
+  el.innerHTML = `
+    <div style="font-size:11px;color:var(--dim);margin:4px 0 8px">
+      Llamada <b>${escHtml(ep.sender||'?')} → ${escHtml(ep.receiver||'?')}</b> (RTP) cruzando el troncal,
+      troncal limitado a ${res.config?res.config.link_mbps:'?'} Mbps con saturación de fondo.
+    </div>
+    <table class="qi-table">
+      <thead><tr><th>Métrica</th><th style="text-align:right">SIN QoS</th><th style="text-align:right">CON QoS</th></tr></thead>
+      <tbody>
+        ${_vtMetricRow('Pérdida de paquetes', b.loss_pct, a.loss_pct, ' %')}
+        ${_vtMetricRow('Jitter', b.jitter_ms, a.jitter_ms, ' ms')}
+        ${_vtMetricRow('Throughput recibido', b.throughput_kbps, a.throughput_kbps, ' kbps')}
+        <tr><td><b>MOS (calidad)</b></td>
+          <td style="text-align:right"><b>${b.mos||'—'}</b> <span style="color:${bc}">${bl}</span></td>
+          <td style="text-align:right"><b>${a.mos||'—'}</b> <span style="color:${ac}">${al}</span></td></tr>
+      </tbody>
+    </table>
+    <div style="margin:10px 0 4px;font-size:11px;color:var(--muted)">🔊 Audio recibido reconstruido de los paquetes reales (oye la diferencia):</div>
+    <div style="display:flex;gap:12px">${audioCol('before', b)}${audioCol('after', a)}</div>
+    ${(tb.loss_pct!=null||ta.loss_pct!=null) ? `
+    <div style="margin-top:10px">
+      <div style="font-size:11px;color:var(--muted)">✔ Medidas en Wireshark sobre el pcap capturado:</div>
+      <table class="qi-table"><thead><tr><th>Wireshark mide</th><th style="text-align:right">SIN QoS</th><th style="text-align:right">CON QoS</th></tr></thead>
+        <tbody>${tsRow('Pérdida', tb.loss_pct, ta.loss_pct, ' %')}${tsRow('Jitter medio', tb.jitter_ms, ta.jitter_ms, ' ms')}</tbody></table>
+    </div>
+    <details class="qi-tc" data-tc-key="tshark"><summary>Ver análisis RTP crudo de Wireshark (tshark -z rtp,streams)</summary>
+      <div class="qi-tc-body"><pre class="qi-tc-pre" style="white-space:pre-wrap">${escHtml((tb.raw||'')+'\n\n'+(ta.raw||''))}</pre></div>
+    </details>` : ''}
+    ${qiTcBlock((res.qos_plan||{}).tc_commands, 'voiptest')}`;
+}
+let _vtPoll = null;
+async function vtRefresh() {
+  try {
+    const d = await fetch('/api/voip-test/result').then(r => r.json());
+    vtRender(d.result);
+    if (d.result && (d.result.status === 'done' || d.result.status === 'error')) {
+      if (_vtPoll) { clearInterval(_vtPoll); _vtPoll = null; }
+      document.getElementById('vt-btn').disabled = false;
+    }
+  } catch {}
+}
+async function vtRun() {
+  const link = Number(document.getElementById('vt-mbps').value) || 10;
+  document.getElementById('vt-btn').disabled = true;
+  document.getElementById('vt-msg').textContent = 'Lanzando prueba (antes/después)…';
+  try {
+    await fetch('/api/voip-test', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ link_mbps: link }),
+    });
+    document.getElementById('vt-msg').textContent = '';
+    if (_vtPoll) clearInterval(_vtPoll);
+    _vtPoll = setInterval(vtRefresh, 2500);
+    vtRefresh();
+  } catch (e) {
+    document.getElementById('vt-msg').textContent = 'Red: ' + e;
+    document.getElementById('vt-btn').disabled = false;
+  }
+}
+
+clRefresh();
+tiRefresh();
+vtRefresh();
+setInterval(clRefresh, 15000);
+setInterval(tiRefresh, 8000);
 </script>
 </body>
 </html>

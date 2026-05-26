@@ -8,7 +8,7 @@ import threading
 from collections import defaultdict
 from datetime import datetime
 
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, jsonify, render_template, request, send_from_directory
 
 _IP_RE = re.compile(r"^\d+\.\d+\.\d+\.\d+$")
 _RUN_NAME_RE = re.compile(r"^[A-Za-z0-9 _.\-]{1,80}$")
@@ -40,6 +40,13 @@ _RUN_FILES = (
     "server_services.json",
     "failover_state.json",
     "qos_intent_state.json",
+    # Router central + prueba VoIP (métricas, audios reconstruidos y capturas).
+    "central_link.json",
+    "voip_test_result.json",
+    "voip_audio_before.wav",
+    "voip_audio_after.wav",
+    "voip_capture_before.pcap",
+    "voip_capture_after.pcap",
 )
 
 app = Flask(__name__)
@@ -1082,6 +1089,7 @@ def api_qos_intent_apply():
                 plan.get("target_host"),
                 plan.get("apps") or [],
                 plan.get("total_mbps") or 50.0,
+                scope=plan.get("scope", "host"),
             )
         except ValueError as e:
             return jsonify({"ok": False, "error": str(e)}), 400
@@ -1110,6 +1118,65 @@ def api_qos_intent_clear():
         return jsonify({"ok": False,
                         "error": f"{type(e).__name__}: {e}"}), 500
     return jsonify({"ok": True, "cleared": cleared, "count": len(cleared)})
+
+
+# ── Router central / identificación de tráfico / prueba VoIP ─────────────────
+
+@app.route("/api/central-link", methods=["GET"])
+def api_central_link():
+    """Enlace troncal central detectado al desplegar (tmp/central_link.json)."""
+    return jsonify({"central": _load_json("central_link.json", None)})
+
+
+@app.route("/api/traffic-id", methods=["GET"])
+def api_traffic_id():
+    """Identificación automática del tráfico por host desde los flujos sFlow."""
+    from agents.traffic_identifier import identify_from_flows
+    flows_path = os.path.join(_active_dir(), "flows.json")
+    topo_path  = os.path.join(_active_dir(), "topology.json")
+    try:
+        data = identify_from_flows(flows_path=flows_path, topo_path=topo_path,
+                                   min_bytes=int(request.args.get("min_bytes", 20000)))
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"{type(e).__name__}: {e}"}), 500
+    return jsonify({"ok": True, **data})
+
+
+@app.route("/api/voip-test", methods=["POST"])
+def api_voip_test():
+    """Lanza la prueba VoIP antes/después en segundo plano."""
+    from agents import voip_test
+    payload = request.get_json(silent=True) or {}
+    secs = payload.get("secs")          # None → la llamada dura lo que el audio
+    secs = int(secs) if secs else None
+    link = float(payload.get("link_mbps") or 10.0)
+    return jsonify(voip_test.run_test_async(secs=secs, link_mbps=link))
+
+
+@app.route("/api/voip-test/result", methods=["GET"])
+def api_voip_test_result():
+    """Estado/resultado de la última prueba VoIP (sondeo desde el dashboard)."""
+    from agents import voip_test
+    return jsonify({"result": voip_test.load_result()})
+
+
+@app.route("/api/voip-test/audio/<phase>", methods=["GET"])
+def api_voip_test_audio(phase):
+    """Sirve el WAV reconstruido (lo que se OYÓ) de cada fase: before|after."""
+    if phase not in ("before", "after"):
+        return jsonify({"error": "fase inválida"}), 400
+    return send_from_directory(_active_dir(), f"voip_audio_{phase}.wav",
+                               mimetype="audio/wav")
+
+
+@app.route("/api/voip-test/pcap/<phase>", methods=["GET"])
+def api_voip_test_pcap(phase):
+    """Descarga el pcap real capturado de cada fase (para abrir en Wireshark)."""
+    if phase not in ("before", "after"):
+        return jsonify({"error": "fase inválida"}), 400
+    return send_from_directory(_active_dir(), f"voip_capture_{phase}.pcap",
+                               mimetype="application/vnd.tcpdump.pcap",
+                               as_attachment=True)
 
 
 # ── runs guardados ────────────────────────────────────────────────────────────
