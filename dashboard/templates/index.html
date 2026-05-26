@@ -557,7 +557,7 @@
     </div>
     <div class="panel" style="flex:1">
       <div class="panel-hd">
-        <span class="panel-title">Tráfico por switch — último sample</span>
+        <span class="panel-title">Tráfico por switch</span>
         <span class="panel-hint">Tráfico de entrada (RX) por switch</span>
       </div>
       <div class="panel-body">
@@ -645,14 +645,14 @@
   <div class="row">
     <div class="panel">
       <div class="panel-hd">
-        <span class="panel-title">Alta disponibilidad — Failover</span>
+        <span class="panel-title">Redundancia en servidores</span>
         <span class="panel-hint" id="fo-hint">esperando datos…</span>
       </div>
       <div class="panel-body" id="fo-body" style="display:flex;align-items:center;gap:24px;flex-wrap:wrap;min-height:48px">
         <span style="color:var(--dim);font-size:11px">Sin par de failover configurado.</span>
       </div>
       <div class="panel-hd" style="border-top:1px solid var(--border);margin-top:8px;padding-top:8px">
-        <span class="panel-title" style="font-size:12px">Timeline de caídas y recuperaciones</span>
+        <span class="panel-title" style="font-size:12px">Timeline de caídas</span>
         <span class="panel-hint" id="fo-tl-hint">—</span>
       </div>
       <div class="panel-body" id="fo-timeline" style="min-height:80px;font-size:11px"></div>
@@ -663,7 +663,7 @@
   <div class="row">
     <div class="panel">
       <div class="panel-hd">
-        <span class="panel-title">QoS por intent · &quot;qué voy a usar&quot;</span>
+        <span class="panel-title">QoS personalizado</span>
         <span class="panel-hint" id="qi-hint">describe en lenguaje natural qué apps usarás y se reparte el ancho de banda</span>
       </div>
       <div class="panel-body">
@@ -715,7 +715,7 @@
   <div class="row">
     <div class="panel" style="flex:1">
       <div class="panel-hd">
-        <span class="panel-title">Router central &amp; prueba VoIP</span>
+        <span class="panel-title">Prueba VoIP</span>
         <span class="panel-hint">priorizar VoIP donde el tráfico se concentra y comprobar el antes/después</span>
       </div>
       <div class="panel-body">
@@ -2755,6 +2755,8 @@ async function clRefresh() {
 }
 
 // ── Identificación de tráfico ─────────────────────────────────────────────────
+// Nombre visible de cada app en el panel de identificación (solo display).
+function _tiLabel(x) { return x === 'web_browsing' ? 'web' : x; }
 async function tiRefresh() {
   try {
     const d = await fetch('/api/traffic-id').then(r => r.json());
@@ -2764,7 +2766,7 @@ async function tiRefresh() {
     }
     const det = (d.detected_apps || []).length
       ? `<div style="margin-bottom:8px">Apps detectadas en la red: ${
-          d.detected_apps.map(a => `<span class="qi-tier interactive" style="margin-right:4px">${escHtml(a)}</span>`).join('')}</div>`
+          d.detected_apps.map(a => `<span class="qi-tier interactive" style="margin-right:4px">${escHtml(_tiLabel(a))}</span>`).join('')}</div>`
       : '';
     let rows = '';
     for (const [host, he] of Object.entries(d.hosts).slice(0, 12)) {
@@ -2772,7 +2774,7 @@ async function tiRefresh() {
         const kb = Math.round((ae.bytes || 0) / 1024);
         const isApp = label !== 'otro';
         return `<span class="qi-tier ${isApp ? 'interactive' : 'best_effort'}" title="${kb} KB"
-                 style="margin-right:4px">${escHtml(label)}</span>`;
+                 style="margin-right:4px">${escHtml(_tiLabel(label))}</span>`;
       }).join('');
       rows += `<tr><td><b>${escHtml(host)}</b></td><td>${apps}</td></tr>`;
     }
@@ -2836,8 +2838,7 @@ function vtRender(res) {
           <td style="text-align:right"><b>${a.mos||'—'}</b> <span style="color:${ac}">${al}</span></td></tr>
       </tbody>
     </table>
-    <div style="margin:10px 0 4px;font-size:11px;color:var(--muted)">🔊 Audio recibido reconstruido de los paquetes reales (oye la diferencia):</div>
-    <div style="display:flex;gap:12px">${audioCol('before', b)}${audioCol('after', a)}</div>
+    <div style="display:flex;gap:12px;margin-top:10px">${audioCol('before', b)}${audioCol('after', a)}</div>
     ${(tb.loss_pct!=null||ta.loss_pct!=null) ? `
     <div style="margin-top:10px">
       <div style="font-size:11px;color:var(--muted)">✔ Medidas en Wireshark sobre el pcap capturado:</div>
