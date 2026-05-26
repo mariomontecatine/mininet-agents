@@ -45,6 +45,7 @@ from agents.sflow import (
     fetch_flows,
 )
 from agents.attack_tool import maybe_inject_anomaly, build_host_port_map
+from agents.central_link import compute_central_link
 from agents.attack_report import generate_report as generate_anomaly_report
 from agents.failover import (
     load_server_info, auto_select_pair,
@@ -460,7 +461,9 @@ def run_aiops_pipeline():
         "anomaly_injections.jsonl", "flow_alerts.jsonl",
         "attack_report.md", "anomaly_report.md",
         "host_port_map.json", "topology.json", "port_baseline.json",
-        "server_services.json",
+        "server_services.json", "central_link.json", "voip_test_result.json",
+        "voip_audio_before.wav", "voip_audio_after.wav",
+        "voip_capture_before.pcap", "voip_capture_after.pcap",
         # failover
         "failover_state.json", "failover_requests.json", "failover_history.jsonl",
         # QoS por intent del usuario
@@ -603,6 +606,19 @@ def run_aiops_pipeline():
         print(f"[INFO] Host→puerto OVS: {host_port}")
     except Exception as _e:
         print(f"[WARN] No se pudo construir host_port_map: {_e}")
+
+    # Router/enlace central: el troncal cuello de botella donde aplicaremos QoS
+    # de red. Se calcula UNA vez aquí, con el grafo físico ya disponible.
+    try:
+        central = compute_central_link(links)
+        if central:
+            print(f"[INFO] Enlace central detectado: troncal {central['trunk_link']} "
+                  f"→ shaping en {central['shaping_port']} "
+                  f"({central['hosts_behind'].get(central['shaping_port'], 0)} hosts detrás)")
+        else:
+            print("[WARN] No se pudo determinar el enlace central de la topología.")
+    except Exception as _e:
+        print(f"[WARN] No se pudo calcular el enlace central: {_e}")
 
     # =======================================================
     # === FASE 2: TRÁFICO + COLECTOR LIVE ===================

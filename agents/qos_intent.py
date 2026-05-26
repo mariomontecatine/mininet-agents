@@ -29,6 +29,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from utils import config
 from utils.ssh_client import get_ssh_connection, send_tmux_command
 from agents import apps_catalog
+from agents.central_link import load_central_link
 
 
 TMP_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tmp")
@@ -70,6 +71,20 @@ _KEYWORD_MAP = {
     "ftp_download": ["ftp", "transferencia ftp", "descarga ftp"],
     "email":        ["email", "correo", "smtp", "mail"],
 }
+
+# Frases que indican que la prioridad es para TODA la red (ámbito 'network'):
+# se aplica en el troncal del router central, no en un host concreto.
+_NETWORK_SCOPE_PATTERNS = [
+    "en la red", "toda la red", "red entera", "a nivel de red", "en toda la red",
+    "para la red", "de la red", "a partir de ahora", "todo el tráfico",
+    "todo el trafico", "global", "en todos los hosts", "siempre que haya",
+]
+
+
+def _detect_network_scope(text):
+    """True si el usuario pide priorizar a nivel de red (no en un host)."""
+    t = (text or "").lower()
+    return any(p in t for p in _NETWORK_SCOPE_PATTERNS)
 
 
 def parse_qos_intent_heuristic(text):
@@ -234,14 +249,19 @@ def _clear_state():
 
 # ─── Construcción y validación del plan ──────────────────────────────────────
 
-def build_qos_plan(target_host, apps_request, total_mbps=50.0):
+def build_qos_plan(target_host, apps_request, total_mbps=50.0, scope="host"):
     """Construye un plan QoS estructurado a partir de una solicitud de alto nivel.
 
-    target_host:    nombre del host destinatario (ej. 'h1').
+    target_host:    nombre del host destinatario (ej. 'h1'). Se ignora si
+                    scope='network'.
     apps_request:   lista de {"app": str, "min_mbps"?: float, "max_mbps"?: float}.
                     Solo "app" es obligatorio; el resto cae a los defaults del
                     catálogo.
     total_mbps:     velocidad total de línea para el HTB raíz.
+    scope:          'host'    → se aplica en el puerto OVS del host (borde).
+                    'network' → se aplica en el troncal del router CENTRAL
+                                (tmp/central_link.json), donde se concentra y
+                                satura el tráfico entre subredes.
 
     Devuelve un dict listo para apply_qos_plan(), o lanza ValueError describiendo
     el primer problema encontrado.
@@ -249,15 +269,27 @@ def build_qos_plan(target_host, apps_request, total_mbps=50.0):
     if total_mbps is None or total_mbps <= 0:
         raise ValueError("total_mbps debe ser > 0")
 
-    target_port = _resolve_host_port(target_host)
-    if not target_port:
-        # En vez de fallar, intentamos describir qué hosts hay disponibles
-        # — útil para el LLM si se equivoca de nombre.
-        available = sorted(_load_host_port_map().keys())
-        raise ValueError(
-            f"Host '{target_host}' no está en host_port_map.json. "
-            f"Hosts disponibles: {available}"
-        )
+    central = None
+    if scope == "network":
+        central = load_central_link()
+        if not central or not central.get("shaping_port"):
+            raise ValueError(
+                "No hay enlace central calculado todavía. Despliega la red "
+                "(se calcula al arrancar) y reintenta."
+            )
+        target_port = central["shaping_port"]
+        # Etiqueta legible para el dashboard: el troncal del switch central.
+        target_host = f"RED · {central['central_switch']}"
+    else:
+        target_port = _resolve_host_port(target_host)
+        if not target_port:
+            # En vez de fallar, intentamos describir qué hosts hay disponibles
+            # — útil para el LLM si se equivoca de nombre.
+            available = sorted(_load_host_port_map().keys())
+            raise ValueError(
+                f"Host '{target_host}' no está en host_port_map.json. "
+                f"Hosts disponibles: {available}"
+            )
 
     if not apps_request:
         raise ValueError("La lista de apps está vacía. Indica al menos una.")
@@ -334,6 +366,8 @@ def build_qos_plan(target_host, apps_request, total_mbps=50.0):
         "total_mbps":  float(total_mbps),
         "apps":        resolved,
         "capped":      capped,
+        "scope":       scope,
+        "central":     central if scope == "network" else None,
         "generated_at": datetime.now().isoformat(timespec="seconds"),
     }
 
@@ -469,7 +503,8 @@ def apply_qos_plan(plan):
     if port in plans:
         merged_apps = _merge_apps(plans[port].get("apps", []), plan["apps"])
         # Reconstruye (revalida + recalcula capping con la línea más reciente).
-        merged = build_qos_plan(host, merged_apps, plan["total_mbps"])
+        merged = build_qos_plan(host, merged_apps, plan["total_mbps"],
+                                scope=plan.get("scope", "host"))
         merged["parsed_by"] = plan.get("parsed_by")
         merged["merged_from"] = len(plans[port].get("apps", []))
         plan = merged
@@ -547,7 +582,16 @@ _TOOL_SCHEMA = [
                 "properties": {
                     "target_host": {
                         "type": "string",
-                        "description": "Host del usuario (ej. 'h1', 'h2')."
+                        "description": "Host del usuario (ej. 'h1', 'h2'). Solo si scope='host'."
+                    },
+                    "scope": {
+                        "type": "string",
+                        "enum": ["host", "network"],
+                        "description": ("'host' = priorizar para un host concreto. "
+                                        "'network' = priorizar ese tráfico en TODA la "
+                                        "red (se aplica en el router central). Usa "
+                                        "'network' si el usuario dice 'en la red', "
+                                        "'toda la red' o 'a partir de ahora'."),
                     },
                     "total_mbps": {
                         "type": "number",
@@ -621,6 +665,10 @@ def parse_qos_intent_llm(user_text, default_host=None, default_total_mbps=50.0,
     available_hosts = sorted(_load_host_port_map().keys())
     catalog_lines   = apps_catalog.describe_catalog()
     fallback_host   = _resolve_default_host(default_host)
+    # El ámbito de red lo decide en última instancia el texto del usuario: si
+    # menciona "la red"/"a partir de ahora", forzamos scope='network' aunque el
+    # LLM no lo haya marcado (los modelos pequeños lo olvidan a menudo).
+    text_network_scope = _detect_network_scope(user_text)
 
     def _from_heuristic(reason):
         if llm_only:
@@ -634,18 +682,20 @@ def parse_qos_intent_llm(user_text, default_host=None, default_total_mbps=50.0,
                 f"No pude identificar ninguna app del catálogo en tu mensaje. "
                 f"{reason} Apps soportadas: {apps_catalog.list_apps()}"
             )
-        plan = build_qos_plan(fallback_host, apps, default_total_mbps)
+        scope = "network" if text_network_scope else "host"
+        plan = build_qos_plan(fallback_host, apps, default_total_mbps, scope=scope)
         plan["parsed_by"] = "heuristic"
         plan["fallback_reason"] = reason
         return plan
 
     def _build_from_args(args, source):
+        scope = "network" if (text_network_scope or args.get("scope") == "network") else "host"
         target_host = args.get("target_host") or fallback_host
         if not target_host and available_hosts:
             target_host = available_hosts[0]
         total = args.get("total_mbps") or default_total_mbps
         apps  = args.get("apps") or []
-        plan = build_qos_plan(target_host, apps, total)
+        plan = build_qos_plan(target_host, apps, total, scope=scope)
         plan["parsed_by"] = source
         return plan
 
@@ -670,8 +720,13 @@ def parse_qos_intent_llm(user_text, default_host=None, default_total_mbps=50.0,
         "mapearían al mismo servicio, elige la más adecuada.\n"
         "4. Si el usuario no da números, omite min_mbps/max_mbps (se usarán los "
         "del catálogo).\n"
-        "5. LLAMA a build_qos_plan. Si por algún motivo no puedes, responde con "
-        "el JSON {\"target_host\":..., \"total_mbps\":..., \"apps\":[{\"app\":...}]}."
+        "5. ÁMBITO: si el usuario habla de un host concreto ('en h1', 'para h3') "
+        "usa scope='host' con ese target_host. Si habla de TODA la red ('en la "
+        "red', 'toda la red', 'a partir de ahora prioriza...') usa "
+        "scope='network' (no hace falta target_host: se aplica en el router "
+        "central).\n"
+        "6. LLAMA a build_qos_plan. Si por algún motivo no puedes, responde con "
+        "el JSON {\"scope\":..., \"target_host\":..., \"total_mbps\":..., \"apps\":[{\"app\":...}]}."
     )
 
     try:
