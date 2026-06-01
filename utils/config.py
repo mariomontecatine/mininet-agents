@@ -116,11 +116,15 @@ FAN_IN_BYTES_THRESHOLD = 12 * 1024 * 1024  # 12 MB combinados en ventana sFlow
 # de 12 MB + multiplicador de rol servidor (5×) el floor queda en 60 MB hacia
 # un srv*, separando holgadamente el tráfico de usuarios reales de los ataques
 # (DDoS hping3 más intenso → 150-300 MB agregados hacia la víctima).
-SURGE_BYTES_THRESHOLD = 20 * 1024 * 1024  # 20 MB en un solo flujo → DoS volumétrico
-# Calibrado para reducir falsos positivos: el flujo único legítimo más grande
-# observado es ~2.5 MB en 20 s. Threshold de 20 MB deja 8× de margen.
-# El DoS volumétrico tras la subida de intensidad (-i u50 -d 1400) genera
-# 25-40 MB por flujo en la misma ventana → cruza claramente el umbral.
+SURGE_BYTES_THRESHOLD = 10 * 1024 * 1024  # 10 MB en un solo flujo → DoS volumétrico
+# RECALIBRADO (medido en la VM real, no teórico): el DoS hping3 single-source
+# (-i u50 -d 1400) NO alcanza los 25-40 MB/ventana que se asumían — en esta VM
+# (WSL2) rinde ~12-16 MB en la ventana sFlow de 20 s, con pico observado de
+# 15.75 MB. El umbral previo de 20 MB lo dejaba SIEMPRE por debajo → 0 DoS
+# detectados. El flujo único legítimo más grande medido es ~1.5 MB (bulk hasta
+# ~2.5-3.8 MB), así que 10 MB separa limpiamente: ~4× sobre el legítimo y por
+# debajo del pico DoS, que cruza el umbral en ≥2 ventanas consecutivas (basta
+# para la confirmación N=2 del watcher).
 
 # --- Capa A: multiplicadores por rol de puerto ---
 # El detector aplica el umbral base × multiplier según rol topológico del puerto.

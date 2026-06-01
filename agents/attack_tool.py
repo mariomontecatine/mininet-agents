@@ -184,13 +184,14 @@ def _attack_port_scan(ssh, src_host, target_ips, duration):
 def _attack_dos_volumetric(ssh, src_host, victim_ip, duration, service_info):
     """DoS volumétrico contra el puerto real del servicio víctima vía hping3.
 
-    Tasa: ~20 000 pps · 1 400 B → ~225 Mbps teóricos. En Mininet real produce
-    25-40 MB en la ventana sFlow de 20 s, claramente por encima del umbral
-    SURGE_BYTES_THRESHOLD (20 MB) y muy lejos del flujo legítimo máximo
-    (~2.5 MB). `-k` mantiene el sport fijo para que sFlow agregue todos los
-    paquetes en UN único flujo (sin -k cada paquete usa sport distinto →
-    fragmentación masiva). `timeout` asegura que pare al final aunque el
-    proceso siga.
+    Tasa: ~20 000 pps · 1 400 B → ~225 Mbps teóricos. En la VM real (WSL2) NO
+    se alcanza ese teórico: medido produce ~12-16 MB por flujo en la ventana
+    sFlow de 20 s (pico observado 15.75 MB), aún muy por encima del flujo
+    legítimo máximo (~1.5 MB) pero por debajo de los 25-40 MB que se asumían.
+    Por eso SURGE_BYTES_THRESHOLD se recalibró a 10 MB (ver utils/config.py).
+    `-k` mantiene el sport fijo para que sFlow agregue todos los paquetes en UN
+    único flujo (sin -k cada paquete usa sport distinto → fragmentación
+    masiva). `timeout` asegura que pare al final aunque el proceso siga.
     """
     transport, dport, flag = _service_attack_params(service_info)
     cmd = (
