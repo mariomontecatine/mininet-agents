@@ -17,6 +17,55 @@ TMP_DIR    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tmp")
 CACHE_FILE = os.path.join(TMP_DIR, "topology_cache.json")
 os.makedirs(TMP_DIR, exist_ok=True)
 
+
+def _autosave_run(name):
+    """Guarda el run actual en saved_runs/<name> vía el endpoint del dashboard.
+
+    Reusa la misma ruta que el botón "Guardar" de la UI (copia _RUN_FILES +
+    escribe _run.json). Si el nombre ya existe (409) reintenta con sufijo
+    horario para no perder la simulación.
+    """
+    import urllib.request
+    import urllib.error
+    # Margen para que los colectores background escriban el último snapshot.
+    time.sleep(3)
+    url = f"http://127.0.0.1:{config.DASHBOARD_PORT}/api/runs/save"
+    body = json.dumps({"name": name,
+                       "notes": "Generado por el driver de simulaciones"}).encode()
+    req = urllib.request.Request(
+        url, data=body, headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            resp = json.loads(r.read().decode())
+        if resp.get("ok"):
+            print(f"[AUTOSAVE] Run guardado: saved_runs/{resp['name']} "
+                  f"({len(resp.get('files', []))} ficheros)")
+            registrar_log(f"AUTOSAVE: run '{resp['name']}' guardado")
+        else:
+            print(f"[AUTOSAVE] Falló: {resp.get('error')}")
+    except urllib.error.HTTPError as e:
+        if e.code == 409:
+            return _autosave_run(f"{name} {datetime.now().strftime('%H%M%S')}")
+        print(f"[AUTOSAVE] HTTPError: {e}")
+    except Exception as e:
+        print(f"[AUTOSAVE] Error guardando run: {e}")
+
+
+def _atomic_dump(path, data):
+    """Escribe JSON de forma atómica (temp + os.replace).
+
+    Los hilos colectores reescriben estos ficheros cada 5 s mientras el
+    dashboard los lee cada pocos segundos. Sin atomicidad, un lector puede
+    pillar una escritura a medias (JSON truncado) y, si se mata el proceso
+    durante el dump, el fichero queda corrupto en disco. os.replace es atómico
+    en el mismo sistema de ficheros, así que el lector ve siempre el contenido
+    íntegro anterior o el nuevo completo, nunca un estado intermedio.
+    """
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+    os.replace(tmp, path)
+
 sys.path.append(os.path.join(os.path.dirname(__file__), "agents"))
 
 from agents.deploy_agent import (
@@ -224,8 +273,7 @@ def _live_collector():
                 "ports": deltas,
             })
             live_data = live_data[-2000:]
-            with open(live_file, "w", encoding="utf-8") as f:
-                json.dump(live_data, f, ensure_ascii=False)
+            _atomic_dump(live_file, live_data)
 
         except Exception:
             pass
@@ -259,8 +307,7 @@ def _sflow_collector():
             if not snapshot:
                 continue
 
-            with open(flows_file, "w", encoding="utf-8") as f:
-                json.dump(snapshot, f, ensure_ascii=False)
+            _atomic_dump(flows_file, snapshot)
 
             # Append al historial — solo si la marca temporal cambió (evita
             # duplicar si el daemon aún no ha hecho un nuevo flush).
@@ -437,7 +484,17 @@ def print_header(texto):
     print("=" * 60 + "\n")
 
 
-def run_aiops_pipeline():
+def run_aiops_pipeline(topology_prompt=None, intent_override=None,
+                       max_cycles=None, auto_save=None, reuse_cache=None):
+    """Pipeline NOC.
+
+    Parámetros opcionales (todos None = comportamiento interactivo original):
+      topology_prompt  descripción de la topología (evita el input()).
+      intent_override  dict de intent ya construido (evita el LLM).
+      max_cycles       detiene el bucle tras N ciclos (None = infinito).
+      auto_save        nombre de saved_run a guardar al detenerse (None = no).
+      reuse_cache      True/False fuerza reusar/ignorar la caché sin preguntar.
+    """
     print_header("INICIANDO SUPERVISOR AIOPS (MODO NOC CONTINUO)")
 
     # Reset de estado en memoria (defensivo: si se re-entra al pipeline dentro
@@ -499,7 +556,10 @@ def run_aiops_pipeline():
     cache = _load_topology_cache()
     use_cache = False
 
-    if cache:
+    if reuse_cache is not None:
+        # Modo dirigido (driver): no preguntar, respetar la decisión recibida.
+        use_cache = bool(reuse_cache) and bool(cache)
+    elif cache:
         desc   = _describe_intent(cache.get("intent", {}))
         req    = cache.get("user_request", "—")
         print(f"\n[CACHÉ] Topología guardada encontrada:")
@@ -521,8 +581,15 @@ def run_aiops_pipeline():
         code         = build_python_script(intent)
         print(f"\n[CACHÉ] Topología cargada — se omite la generación IA. "
               f"Script regenerado con build_python_script actual.")
+    elif intent_override is not None:
+        # Intent inyectado por el driver: sin LLM ni input. No tocamos la caché
+        # del usuario para no clobberearla con topologías generadas en batch.
+        intent       = intent_override
+        user_request = topology_prompt or _describe_intent(intent)
+        code         = build_python_script(intent)
+        print(f"\n[DRIVER] Topología inyectada: {user_request}")
     else:
-        user_request = input(
+        user_request = topology_prompt if topology_prompt is not None else input(
             "Describe la topología de red (Ej: 'una red en árbol con profundidad 2 y fanout 4'):\n> "
         )
         intent = generate_network_intent(user_request)
@@ -674,8 +741,12 @@ def run_aiops_pipeline():
     reglas_activas = _reglas_activas
     ciclos_limpios = _ciclos_limpios
 
+    stopped_reason = "manual"
     try:
         while True:
+            if max_cycles is not None and ciclo > max_cycles:
+                stopped_reason = "max_cycles"
+                break
             _current_ciclo = ciclo
             cycle_t0 = time.monotonic()
             print_header(f"CICLO DE SUPERVISIÓN #{ciclo}")
@@ -925,31 +996,60 @@ def run_aiops_pipeline():
             ciclo += 1
 
     except KeyboardInterrupt:
+        stopped_reason = "manual"
+
+    # ── Apagado ordenado: se ejecuta tanto en Ctrl+C como al alcanzar el
+    #    tope de ciclos (modo driver). ───────────────────────────────────────
+    if stopped_reason == "max_cycles":
+        print_header(f"SUPERVISOR DETENIDO — TOPE DE {max_cycles} CICLOS")
+        registrar_log(f"=== APAGADO DEL SISTEMA (tope de {max_cycles} ciclos) ===")
+    else:
         print_header("SUPERVISOR DETENIDO POR EL USUARIO")
         registrar_log("=== APAGADO DEL SISTEMA (Intervención manual) ===")
-        stop_failover_loop()
-        stop_background_traffic()
-        try:
-            from utils.ssh_client import get_ssh_connection
-            _ssh = get_ssh_connection()
-            remove_sflow_from_bridges(_ssh)
-            stop_sflow_daemon(_ssh)
-        except Exception:
-            pass
-        # ── Reporte de detección de anomalías ──────────────────────────────
-        try:
-            report_path, results = generate_anomaly_report()
-            total = len(results)
-            det   = sum(1 for r in results if r["detected"])
-            pct   = (100.0 * det / total) if total else 0.0
-            print(f"\n[REPORT] Anomalías inyectadas: {total} · detectadas: {det} ({pct:.0f}%)")
-            print(f"[REPORT] Informe completo: {report_path}")
-            registrar_log(f"REPORT anomalías: {det}/{total} detectadas")
-        except Exception as _e:
-            print(f"[WARN] No se pudo generar el reporte de anomalías: {_e}")
-        close_persistent_connection()
-        print("Sistema NOC detenido. ¡Hasta pronto!")
+    stop_failover_loop()
+    stop_background_traffic()
+    try:
+        from utils.ssh_client import get_ssh_connection
+        _ssh = get_ssh_connection()
+        remove_sflow_from_bridges(_ssh)
+        stop_sflow_daemon(_ssh)
+    except Exception:
+        pass
+    # ── Reporte de detección de anomalías ──────────────────────────────────
+    try:
+        report_path, results = generate_anomaly_report()
+        total = len(results)
+        det   = sum(1 for r in results if r["detected"])
+        pct   = (100.0 * det / total) if total else 0.0
+        print(f"\n[REPORT] Anomalías inyectadas: {total} · detectadas: {det} ({pct:.0f}%)")
+        print(f"[REPORT] Informe completo: {report_path}")
+        registrar_log(f"REPORT anomalías: {det}/{total} detectadas")
+    except Exception as _e:
+        print(f"[WARN] No se pudo generar el reporte de anomalías: {_e}")
+    # ── Autoguardado del run (modo driver) ──────────────────────────────────
+    if auto_save:
+        _autosave_run(auto_save)
+    close_persistent_connection()
+    print("Sistema NOC detenido. ¡Hasta pronto!")
+
+
+def _run_from_env():
+    """Entrada para el driver de simulaciones: lee parámetros de variables de
+    entorno. Sin variables, equivale al modo interactivo de siempre."""
+    intent_override = None
+    reuse_cache = None
+    intent_file = os.environ.get("SIM_INTENT_FILE")
+    if intent_file and os.path.exists(intent_file):
+        with open(intent_file, encoding="utf-8") as f:
+            intent_override = json.load(f)
+        reuse_cache = False  # nunca reusar caché si nos inyectan un intent
+    prompt   = os.environ.get("SIM_PROMPT")
+    save_as  = os.environ.get("SIM_SAVE_AS")
+    max_c    = os.environ.get("SIM_MAX_CYCLES")
+    max_c    = int(max_c) if max_c else None
+    run_aiops_pipeline(topology_prompt=prompt, intent_override=intent_override,
+                       max_cycles=max_c, auto_save=save_as, reuse_cache=reuse_cache)
 
 
 if __name__ == "__main__":
-    run_aiops_pipeline()
+    _run_from_env()
