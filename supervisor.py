@@ -527,6 +527,8 @@ def run_aiops_pipeline(topology_prompt=None, intent_override=None,
         "qos_intent_state.json",
         # informes y artefactos de agentes
         "ultimo_informe.txt", "ultima_rafaga_realista.txt",
+        # analista NOC: consultas + digest archivado (por sesión)
+        "analyst_history.jsonl", "analyst_report.md",
         # audit log: se reinicia por sesión — para histórico usa saved_runs/
         "noc_audit.log",
         "noc_audit.log.1", "noc_audit.log.2", "noc_audit.log.3",

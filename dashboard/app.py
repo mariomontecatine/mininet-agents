@@ -42,6 +42,8 @@ _RUN_FILES = (
     "qos_intent_state.json",
     # Router central + prueba VoIP (métricas, audios reconstruidos y capturas).
     "central_link.json",
+    # Consultas al analista + el digest que vio en cada una (auditoría)
+    "analyst_history.jsonl",
     "voip_test_result.json",
     "voip_audio_before.wav",
     "voip_audio_after.wav",
@@ -1118,6 +1120,69 @@ def api_qos_intent_clear():
         return jsonify({"ok": False,
                         "error": f"{type(e).__name__}: {e}"}), 500
     return jsonify({"ok": True, "cleared": cleared, "count": len(cleared)})
+
+
+# ── Analista NOC (informes y preguntas en lenguaje natural) ─────────────────
+# Ambos endpoints pasan _active_dir() como fuente: si estás viendo un run
+# guardado, el analista habla de ESE run y no del estado vivo.
+
+@app.route("/api/analyst/summary", methods=["GET"])
+def api_analyst_summary():
+    """Informe narrativo del estado de la red."""
+    from agents import noc_analyst
+    try:
+        window = int(request.args.get("window") or 0) or None
+    except ValueError:
+        window = None
+    try:
+        result = noc_analyst.summarize(window_min=window,
+                                       source_dir=_active_dir())
+    except Exception as e:
+        return jsonify({"ok": False,
+                        "error": f"{type(e).__name__}: {e}"}), 500
+    return jsonify({"ok": True, **result})
+
+
+@app.route("/api/analyst/ask", methods=["POST"])
+def api_analyst_ask():
+    """Pregunta libre sobre el estado de la red.
+
+    Body: {"question": "...", "history"?: [{"role","content"}, ...]}
+    """
+    from agents import noc_analyst
+    payload = request.get_json(silent=True) or {}
+    question = (payload.get("question") or "").strip()
+    if not question:
+        return jsonify({"ok": False, "error": "La pregunta está vacía."}), 400
+    history = payload.get("history") or []
+    if not isinstance(history, list):
+        history = []
+    try:
+        result = noc_analyst.answer(question, history=history,
+                                    source_dir=_active_dir())
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"ok": False,
+                        "error": f"{type(e).__name__}: {e}"}), 500
+    return jsonify({"ok": True, **result})
+
+
+@app.route("/api/analyst/history", methods=["GET"])
+def api_analyst_history():
+    """Consultas archivadas con el digest que el modelo tenía en cada una.
+
+    Es lo que permite juzgar una respuesta a posteriori: si el analista dijo
+    'no hubo ataques', aquí se ve si es que mintió o si en ese instante
+    todavía no había ocurrido nada.
+    """
+    from agents import noc_analyst
+    try:
+        limit = int(request.args.get("limit") or 0) or None
+    except ValueError:
+        limit = None
+    rows = noc_analyst.load_history(limit=limit, source_dir=_active_dir())
+    return jsonify({"ok": True, "entries": rows, "count": len(rows)})
 
 
 # ── Router central / identificación de tráfico / prueba VoIP ─────────────────

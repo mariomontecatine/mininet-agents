@@ -328,6 +328,34 @@
     }
     .qi-suggest button:hover { border-color:var(--blue); color:var(--blue); }
 
+    /* ── Analista NOC (conversación) ── */
+    #an-chat { margin-top:10px; max-height:340px; overflow-y:auto;
+               display:flex; flex-direction:column; gap:8px; }
+    #an-chat:empty { margin-top:0; }
+    .an-turn { border:1px solid var(--border); border-radius:3px; padding:8px 10px;
+               background:var(--panel-hd); }
+    .an-turn.user { background:transparent; border-style:dashed; }
+    .an-role { font-size:9px; text-transform:uppercase; letter-spacing:.08em;
+               color:var(--muted); margin-bottom:4px; }
+    .an-turn.assistant .an-role { color:var(--blue); }
+    .an-body { font-size:12px; line-height:1.55; color:var(--text);
+               white-space:pre-wrap; }
+    .an-meta { margin-top:6px; font-size:10px; color:var(--dim);
+               border-top:1px solid var(--border); padding-top:5px; }
+    .an-ts { float:right; font-size:9px; color:var(--dim); letter-spacing:0;
+             text-transform:none; }
+    /* Evidencia: el digest exacto que recibió el modelo en esa consulta */
+    .an-evidence { margin-top:6px; }
+    .an-evidence summary { cursor:pointer; color:var(--blue); font-size:10px;
+                           user-select:none; letter-spacing:.03em; }
+    .an-evidence summary:hover { text-decoration:underline; }
+    .an-context {
+      margin-top:6px; max-height:280px; overflow:auto;
+      background:var(--bg); border:1px solid var(--border); border-radius:3px;
+      padding:8px 10px; font-size:10.5px; line-height:1.5; color:var(--muted);
+      white-space:pre-wrap; word-break:break-word;
+    }
+
     /* leyenda desplegable */
     .qi-help { margin-top:10px; font-size:11px; color:var(--muted); }
     .qi-help summary { cursor:pointer; color:var(--blue); font-size:11px;
@@ -656,6 +684,32 @@
         <span class="panel-hint" id="fo-tl-hint">—</span>
       </div>
       <div class="panel-body" id="fo-timeline" style="min-height:80px;font-size:11px"></div>
+    </div>
+  </div>
+
+  <!-- ROW 3d-bis: analista NOC en lenguaje natural -->
+  <div class="row">
+    <div class="panel">
+      <div class="panel-hd">
+        <span class="panel-title">Analista NOC</span>
+        <span class="panel-hint" id="an-hint">pregunta en lenguaje natural sobre el estado de la red · modelo local, tarda unos minutos · cada respuesta guarda los datos que tenía el analista, para poder auditarla después</span>
+      </div>
+      <div class="panel-body">
+        <div class="qi-input">
+          <textarea id="an-text" placeholder="Ej: ¿qué está pasando ahora mismo en la red?"></textarea>
+          <div class="qi-actions">
+            <button class="icon-btn primary" onclick="anAsk()"     id="an-btn-ask">Preguntar</button>
+            <button class="icon-btn"         onclick="anSummary()" id="an-btn-sum">Resumen ahora</button>
+            <button class="icon-btn"         onclick="anLoadHistory()" id="an-btn-hist"
+                    title="Recupera las consultas archivadas de esta ejecución">Recargar historial</button>
+            <button class="icon-btn"         onclick="anReset()"   id="an-btn-reset"
+                    title="Vacía solo la vista; el archivo se conserva">Vaciar vista</button>
+          </div>
+        </div>
+        <div class="qi-suggest" id="an-suggest"></div>
+        <div class="qi-msg" id="an-msg"></div>
+        <div id="an-chat"></div>
+      </div>
     </div>
   </div>
 
@@ -2116,6 +2170,7 @@ async function loadRun(name) {
     updateStatus(); updateLiveMetrics(); updateMetrics();
     updateFlows(); updateSecurity(); updateQosTimeline();
     updateServices(); updateProtoTraffic(); pollTopology();
+    anLoadHistory();   // las consultas archivadas de ESE run
   } catch (e) {
     alert('Error de red: ' + e);
   }
@@ -2134,6 +2189,7 @@ async function returnToLive() {
     updateStatus(); updateLiveMetrics(); updateMetrics();
     updateFlows(); updateSecurity(); updateQosTimeline();
     updateServices(); updateProtoTraffic(); pollTopology();
+    anLoadHistory();   // las consultas archivadas de ESE run
   } catch (_) {}
 }
 
@@ -2496,6 +2552,170 @@ function qiMsg(kind, text) {
   m.textContent = text || '';
 }
 
+/* ── Analista NOC ───────────────────────────────────────────────────────── */
+
+const AN_SUGGESTIONS = [
+  "¿Qué está pasando ahora mismo en la red?",
+  "¿Qué puerto tiene más tráfico y por qué?",
+  "¿Hay algún ataque en curso?",
+  "¿Qué restricciones de QoS hay activas y desde cuándo?",
+  "¿Se detectaron los ataques que se inyectaron?",
+];
+
+let _anHistory = [];   // [{role, content}] — se manda al backend como contexto
+let _anBusy    = false;
+
+function anMsg(kind, text) {
+  const m = document.getElementById('an-msg');
+  m.className = 'qi-msg ' + (kind || 'info');
+  m.textContent = text || '';
+}
+
+function anInitSuggestions() {
+  const sug = document.getElementById('an-suggest');
+  if (sug) sug.innerHTML = AN_SUGGESTIONS.map(t =>
+    `<button onclick="anUseSuggestion(this)">${escHtml(t)}</button>`
+  ).join('');
+}
+
+function anUseSuggestion(btn) {
+  document.getElementById('an-text').value = btn.textContent;
+}
+
+function anBusy(on, label) {
+  _anBusy = on;
+  ['an-btn-ask', 'an-btn-sum', 'an-btn-hist', 'an-btn-reset'].forEach(id => {
+    const b = document.getElementById(id);
+    if (b) b.disabled = on;
+  });
+  if (on) anMsg('info', label || 'Consultando al modelo local… puede tardar.');
+}
+
+function anRender() {
+  const wrap = document.getElementById('an-chat');
+  if (!_anHistory.length) { wrap.innerHTML = ''; return; }
+  wrap.innerHTML = _anHistory.map(t => {
+    const meta = t.meta
+      ? `<div class="an-meta">${escHtml(t.meta)}</div>`
+      : '';
+    // El digest que el modelo tenía delante en ese instante. Es lo que permite
+    // comprobar después si la respuesta era correcta o si simplemente aún no
+    // había ocurrido nada.
+    const evidence = t.context
+      ? `<details class="an-evidence">`
+      +   `<summary>Ver los datos que tenía el analista al responder`
+      +   (t.cycle != null ? ` (ciclo ${escHtml(String(t.cycle))})` : '')
+      +   `</summary>`
+      +   `<pre class="an-context">${escHtml(t.context)}</pre>`
+      + `</details>`
+      : '';
+    return `<div class="an-turn ${t.role}">`
+         + `<div class="an-role">${t.role === 'user' ? 'Tú' : 'Analista'}`
+         + (t.ts ? `<span class="an-ts">${escHtml(t.ts)}</span>` : '')
+         + `</div>`
+         + `<div class="an-body">${escHtml(t.content)}</div>${meta}${evidence}</div>`;
+  }).join('');
+  wrap.scrollTop = wrap.scrollHeight;
+}
+
+/* Recarga las consultas archivadas del directorio activo (sesión viva o run
+   guardado). Así el panel sobrevive a un F5 y se pueden auditar las preguntas
+   hechas durante una ejecución pasada. */
+async function anLoadHistory() {
+  try {
+    const d = await fetch('/api/analyst/history').then(r => r.json());
+    if (!d.ok) return;
+    _anHistory = [];
+    (d.entries || []).forEach(e => {
+      if (e.kind === 'ask' && e.question)
+        _anHistory.push({ role: 'user', content: e.question, ts: e.ts });
+      _anHistory.push({
+        role: 'assistant',
+        content: e.answer || '',
+        meta: anMeta(e),
+        context: e.context || '',
+        cycle: e.cycle,
+        ts: e.ts,
+      });
+    });
+    anRender();
+  } catch (e) { /* sin historial: el panel arranca vacío */ }
+}
+
+function anMeta(d) {
+  const bits = [];
+  if (d.model) bits.push(d.model);
+  if (typeof d.elapsed_ms === 'number') bits.push((d.elapsed_ms / 1000).toFixed(1) + ' s');
+  if (d.tool_calls && d.tool_calls.length)
+    bits.push('herramientas: ' + d.tool_calls.map(t => t.tool).join(', '));
+  if (d.sources && d.sources.length) bits.push('fuentes: ' + d.sources.join(', '));
+  return bits.join(' · ');
+}
+
+async function anAsk() {
+  if (_anBusy) return;
+  const ta = document.getElementById('an-text');
+  const q = (ta.value || '').trim();
+  if (!q) { anMsg('err', 'Escribe una pregunta.'); return; }
+
+  // El historial que se envía son solo los turnos de conversación, sin metadatos.
+  const sent = _anHistory.map(t => ({ role: t.role, content: t.content }));
+  _anHistory.push({ role: 'user', content: q });
+  anRender();
+  ta.value = '';
+  anBusy(true, 'Analizando la telemetría…');
+  try {
+    const r = await fetch('/api/analyst/ask', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ question: q, history: sent }),
+    });
+    const d = await r.json();
+    if (!d.ok) {
+      anMsg('err', d.error || 'Error consultando al analista.');
+      _anHistory.pop();
+      anRender();
+      return;
+    }
+    _anHistory.push({ role: 'assistant', content: d.answer, meta: anMeta(d),
+                      context: d.context, cycle: d.cycle });
+    anRender();
+    anMsg('ok', '');
+    document.getElementById('an-msg').className = 'qi-msg';
+  } catch (e) {
+    anMsg('err', 'Fallo de red: ' + e);
+    _anHistory.pop();
+    anRender();
+  } finally {
+    anBusy(false);
+  }
+}
+
+async function anSummary() {
+  if (_anBusy) return;
+  anBusy(true, 'Redactando el informe…');
+  try {
+    const d = await fetch('/api/analyst/summary').then(r => r.json());
+    if (!d.ok) { anMsg('err', d.error || 'Error generando el informe.'); return; }
+    _anHistory.push({ role: 'assistant', content: d.report, meta: anMeta(d),
+                      context: d.context, cycle: d.cycle });
+    anRender();
+    document.getElementById('an-msg').className = 'qi-msg';
+  } catch (e) {
+    anMsg('err', 'Fallo de red: ' + e);
+  } finally {
+    anBusy(false);
+  }
+}
+
+/* Vacía solo la vista (y con ella el contexto de conversación que se manda en
+   la siguiente pregunta). El archivo queda intacto: se recupera con Recargar. */
+function anReset() {
+  _anHistory = [];
+  anRender();
+  document.getElementById('an-msg').className = 'qi-msg';
+}
+
 async function qiLoadCatalog() {
   try {
     const d = await fetch('/api/qos-intent/catalog').then(r => r.json());
@@ -2736,6 +2956,8 @@ document.getElementById('qi-mbps').addEventListener('input', _qiInvalidatePrevie
 
 qiLoadCatalog();
 qiRefreshState();
+anInitSuggestions();
+anLoadHistory();
 setInterval(qiLoadCatalog,  15000);
 setInterval(qiRefreshState, 10000);
 

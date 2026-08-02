@@ -49,6 +49,23 @@ MCP_SERVER_PORT = 5001
 # servidor queda de solo consulta. Útil para demostrarlo sin riesgo.
 MCP_READ_ONLY = False
 
+# --- Agente analista NOC (informes en lenguaje natural) ---
+# Modelo que redacta los informes y responde preguntas sobre el estado de red.
+#
+# Se deja en 3b, no en 7b, por una medida hecha en esta máquina (8 núcleos, sin
+# GPU, 8 GB de RAM): el 7b ocupa 4.6 GB y entra en swap, hasta el punto de que
+# ni siquiera una petición trivial terminaba en 10 minutos. El 3b (2.1 GB) sí
+# cabe en memoria. La calidad del informe baja algo, pero el diseño lo
+# compensa: el contexto ya llega agregado y etiquetado desde
+# agents/telemetry_digest.py, así que el modelo redacta más que razona.
+#
+# Con GPU o con más RAM, subir a "qwen2.5:7b" mejora notablemente la redacción
+# y el tool-calling. Es un cambio de una línea.
+MODEL_ANALYST = "qwen2.5:3b"
+ANALYST_LLM_TIMEOUT = 600  # segundos máx por respuesta (inferencia por CPU)
+ANALYST_WINDOW_MIN = 5  # ventana por defecto de telemetría que se resume
+ANALYST_MAX_TOOL_ROUNDS = 4  # iteraciones máx del bucle de tool-calling
+
 # --- Tráfico bulk (simulación de usuarios reales) ---
 DURACION_BULK = 35  # segundos de duración de cada ráfaga iperf
 ESPERA_POST_BULK = 25  # segundos de margen tras lanzar los clientes
