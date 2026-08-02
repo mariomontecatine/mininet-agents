@@ -40,6 +40,15 @@ QOS_INTENT_LLM_TIMEOUT = 600
 # error claro en vez de adivinar por keywords. Útil para evaluar el LLM puro.
 QOS_INTENT_LLM_ONLY = False
 
+# --- Servidor MCP (Model Context Protocol) ---
+# Expone las capacidades de QoS y la telemetría como tools/resources estándar,
+# consumibles por cualquier cliente MCP (Inspector, editores, o el analista de
+# abajo). Puerto propio para no chocar con el dashboard.
+MCP_SERVER_PORT = 5001
+# Si True, las tools que ESCRIBEN (aplicar/limpiar QoS) no se registran: el
+# servidor queda de solo consulta. Útil para demostrarlo sin riesgo.
+MCP_READ_ONLY = False
+
 # --- Tráfico bulk (simulación de usuarios reales) ---
 DURACION_BULK = 35  # segundos de duración de cada ráfaga iperf
 ESPERA_POST_BULK = 25  # segundos de margen tras lanzar los clientes
