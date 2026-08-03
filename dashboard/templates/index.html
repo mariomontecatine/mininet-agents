@@ -328,22 +328,54 @@
     }
     .qi-suggest button:hover { border-color:var(--blue); color:var(--blue); }
 
-    /* ── Analista NOC (conversación) ── */
-    #an-chat { margin-top:10px; max-height:340px; overflow-y:auto;
-               display:flex; flex-direction:column; gap:8px; }
+    /* ── Analista NOC (conversación) ──
+       Bocadillos, pero con la misma gramática visual que el resto del panel:
+       plano, sin sombras ni degradados, radios pequeños y colores del tema.
+       La esquina recta del lado de quien habla hace de "pico" sin recurrir a
+       un triángulo, que a este tamaño quedaría sucio. */
+    #an-chat { margin-top:12px; max-height:420px; overflow-y:auto;
+               display:flex; flex-direction:column; gap:10px; padding-right:4px; }
     #an-chat:empty { margin-top:0; }
-    .an-turn { border:1px solid var(--border); border-radius:3px; padding:8px 10px;
-               background:var(--panel-hd); }
-    .an-turn.user { background:transparent; border-style:dashed; }
+
+    .an-row { display:flex; flex-direction:column; max-width:82%; }
+    .an-row.user      { align-self:flex-end;   align-items:flex-end; }
+    .an-row.assistant { align-self:flex-start; align-items:flex-start; }
+
     .an-role { font-size:9px; text-transform:uppercase; letter-spacing:.08em;
-               color:var(--muted); margin-bottom:4px; }
-    .an-turn.assistant .an-role { color:var(--blue); }
-    .an-body { font-size:12px; line-height:1.55; color:var(--text);
-               white-space:pre-wrap; }
-    .an-meta { margin-top:6px; font-size:10px; color:var(--dim);
+               color:var(--muted); margin-bottom:4px; padding:0 2px; }
+    .an-row.assistant .an-role { color:var(--blue); }
+    .an-ts { color:var(--dim); letter-spacing:0; text-transform:none;
+             margin-left:6px; }
+
+    .an-bubble { border:1px solid var(--border); padding:9px 12px;
+                 background:var(--panel-hd); width:fit-content; }
+    .an-row.user .an-bubble {
+      border-radius:6px 6px 2px 6px;
+      background:rgba(87,148,242,.10); border-color:rgba(87,148,242,.30);
+    }
+    .an-row.assistant .an-bubble { border-radius:6px 6px 6px 2px; }
+
+    .an-body { font-size:12px; line-height:1.6; color:var(--text);
+               white-space:pre-wrap; word-break:break-word; }
+    .an-meta { margin-top:7px; font-size:10px; color:var(--dim);
                border-top:1px solid var(--border); padding-top:5px; }
-    .an-ts { float:right; font-size:9px; color:var(--dim); letter-spacing:0;
-             text-transform:none; }
+
+    /* Indicador de "escribiendo": tres puntos en bucle. El modelo local tarda
+       minutos, así que sin señal visible el panel parece colgado. */
+    .an-typing { display:flex; gap:5px; align-items:center; padding:12px 14px; }
+    .an-typing span {
+      width:6px; height:6px; border-radius:50%; background:var(--blue);
+      opacity:.35; animation:an-blink 1.4s infinite ease-in-out both;
+    }
+    .an-typing span:nth-child(2) { animation-delay:.2s; }
+    .an-typing span:nth-child(3) { animation-delay:.4s; }
+    @keyframes an-blink {
+      0%, 80%, 100% { opacity:.25; transform:translateY(0); }
+      40%           { opacity:1;   transform:translateY(-3px); }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .an-typing span { animation:none; opacity:.6; }
+    }
     /* Evidencia: el digest exacto que recibió el modelo en esa consulta */
     .an-evidence { margin-top:6px; }
     .an-evidence summary { cursor:pointer; color:var(--blue); font-size:10px;
@@ -2564,11 +2596,23 @@ const AN_SUGGESTIONS = [
 
 let _anHistory = [];   // [{role, content}] — se manda al backend como contexto
 let _anBusy    = false;
+let _anTyping  = false; // pinta el bocadillo de "escribiendo"
 
 function anMsg(kind, text) {
   const m = document.getElementById('an-msg');
   m.className = 'qi-msg ' + (kind || 'info');
   m.textContent = text || '';
+}
+
+/* En un bocadillo la fecha completa estorba: basta la hora. */
+function anTime(iso) {
+  if (!iso) return '';
+  const m = String(iso).match(/(\d{2}:\d{2})/);
+  return m ? m[1] : '';
+}
+
+function anNow() {
+  return new Date().toTimeString().slice(0, 5);
 }
 
 function anInitSuggestions() {
@@ -2584,17 +2628,18 @@ function anUseSuggestion(btn) {
 
 function anBusy(on, label) {
   _anBusy = on;
+  _anTyping = on;
   ['an-btn-ask', 'an-btn-sum', 'an-btn-hist', 'an-btn-reset'].forEach(id => {
     const b = document.getElementById(id);
     if (b) b.disabled = on;
   });
   if (on) anMsg('info', label || 'Consultando al modelo local… puede tardar.');
+  anRender();   // pinta o retira el bocadillo de los tres puntos
 }
 
 function anRender() {
   const wrap = document.getElementById('an-chat');
-  if (!_anHistory.length) { wrap.innerHTML = ''; return; }
-  wrap.innerHTML = _anHistory.map(t => {
+  let html = _anHistory.map(t => {
     const meta = t.meta
       ? `<div class="an-meta">${escHtml(t.meta)}</div>`
       : '';
@@ -2609,12 +2654,24 @@ function anRender() {
       +   `<pre class="an-context">${escHtml(t.context)}</pre>`
       + `</details>`
       : '';
-    return `<div class="an-turn ${t.role}">`
+    return `<div class="an-row ${t.role}">`
          + `<div class="an-role">${t.role === 'user' ? 'Tú' : 'Analista'}`
-         + (t.ts ? `<span class="an-ts">${escHtml(t.ts)}</span>` : '')
+         + (t.ts ? `<span class="an-ts">${escHtml(anTime(t.ts))}</span>` : '')
          + `</div>`
-         + `<div class="an-body">${escHtml(t.content)}</div>${meta}${evidence}</div>`;
+         + `<div class="an-bubble">`
+         +   `<div class="an-body">${escHtml(t.content)}</div>${meta}${evidence}`
+         + `</div></div>`;
   }).join('');
+
+  if (_anTyping) {
+    html += `<div class="an-row assistant">`
+          +   `<div class="an-role">Analista</div>`
+          +   `<div class="an-bubble an-typing">`
+          +     `<span></span><span></span><span></span>`
+          +   `</div></div>`;
+  }
+
+  wrap.innerHTML = html;
   wrap.scrollTop = wrap.scrollHeight;
 }
 
@@ -2660,7 +2717,7 @@ async function anAsk() {
 
   // El historial que se envía son solo los turnos de conversación, sin metadatos.
   const sent = _anHistory.map(t => ({ role: t.role, content: t.content }));
-  _anHistory.push({ role: 'user', content: q });
+  _anHistory.push({ role: 'user', content: q, ts: anNow() });
   anRender();
   ta.value = '';
   anBusy(true, 'Analizando la telemetría…');
@@ -2678,7 +2735,7 @@ async function anAsk() {
       return;
     }
     _anHistory.push({ role: 'assistant', content: d.answer, meta: anMeta(d),
-                      context: d.context, cycle: d.cycle });
+                      context: d.context, cycle: d.cycle, ts: anNow() });
     anRender();
     anMsg('ok', '');
     document.getElementById('an-msg').className = 'qi-msg';
@@ -2698,7 +2755,7 @@ async function anSummary() {
     const d = await fetch('/api/analyst/summary').then(r => r.json());
     if (!d.ok) { anMsg('err', d.error || 'Error generando el informe.'); return; }
     _anHistory.push({ role: 'assistant', content: d.report, meta: anMeta(d),
-                      context: d.context, cycle: d.cycle });
+                      context: d.context, cycle: d.cycle, ts: anNow() });
     anRender();
     document.getElementById('an-msg').className = 'qi-msg';
   } catch (e) {
