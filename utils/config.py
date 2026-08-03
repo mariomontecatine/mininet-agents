@@ -65,6 +65,26 @@ MODEL_ANALYST = "qwen2.5:3b"
 ANALYST_LLM_TIMEOUT = 600  # segundos máx por respuesta (inferencia por CPU)
 ANALYST_WINDOW_MIN = 5  # ventana por defecto de telemetría que se resume
 ANALYST_MAX_TOOL_ROUNDS = 4  # iteraciones máx del bucle de tool-calling
+# Segundos que se reutiliza el mismo digest antes de reconstruirlo.
+#
+# No es una optimización de E/S: construirlo cuesta milisegundos. Es para que
+# el PROMPT no cambie. Ollama reutiliza el KV cache mientras el texto coincida
+# carácter a carácter desde el principio, y a la primera diferencia reprocesa
+# todo. Medido en esta máquina: contexto idéntico → 5-14 s; contexto distinto →
+# 120-305 s. Con TTL, las preguntas seguidas de una conversación comparten
+# prompt y caen al primer rango.
+#
+# CUIDADO al bajarlo: el TTL tiene que ser MAYOR que lo que tarda una respuesta,
+# o la caché no sirve de nada. Con 60 s no servía — cada respuesta cuesta
+# 240-400 s en esta máquina, así que el contexto caducaba mientras el modelo
+# aún estaba contestando la pregunta anterior y la siguiente lo reconstruía
+# siempre. Medido: las tres preguntas de una conversación salían con
+# "antigüedad 0" y ~300 s cada una.
+#
+# El precio es que una respuesta puede reflejar datos de hasta TTL segundos
+# antes; por eso la antigüedad se devuelve y se muestra en el panel. A 0 se
+# desactiva la caché.
+ANALYST_CACHE_TTL = 600
 
 # --- Tráfico bulk (simulación de usuarios reales) ---
 DURACION_BULK = 35  # segundos de duración de cada ráfaga iperf

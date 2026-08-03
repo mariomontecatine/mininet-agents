@@ -57,6 +57,9 @@ _GROUNDING = (
     "3. Si un dato no está disponible, di literalmente: 'No tengo ese dato en "
     "la telemetría'. No especules.\n"
     "4. Cuando cites un evento, incluye su marca de tiempo o su ciclo.\n"
+    "4b. Las secciones marcadas '(ya calculado)' o formuladas como pregunta "
+    "contienen la respuesta hecha: úsala literalmente en vez de deducirla de "
+    "las listas de detalle. Cada suceso se menciona UNA sola vez.\n"
     "5. Escribe en español, en prosa clara y sin markdown.\n"
     "6. No propongas comandos concretos de tc ni de OpenFlow: tu papel es "
     "diagnosticar y explicar, no actuar."
@@ -69,11 +72,10 @@ _SUMMARY_SYSTEM = (
     "en un solo párrafo o dos. Cubre, si hay datos: qué está pasando "
     "(normalidad o incidente y de qué tipo), qué puertos y hosts están "
     "implicados, y qué mitigaciones de QoS hay activas y desde cuándo.\n\n"
-    "Ojo con dos listas que NO son lo mismo: 'anomalías que el sistema detectó' "
-    "es lo que el NOC vio, y 'ataques que se lanzaron de verdad' es lo que "
-    "realmente ocurrió. Si un ataque aparece en la segunda y no en la primera, "
-    "pasó desapercibido; no digas que no hubo ataques solo porque no haya "
-    "detecciones.\n\n"
+    "El contexto trae dos secciones con las cuentas YA RESUELTAS: si hay algún "
+    "ataque en curso, y cuántos de los lanzados se detectaron. Cópialas tal "
+    "cual. No las recalcules a partir de las listas de detalle ni contradigas "
+    "sus cifras.\n\n"
     "Escribe para un operador humano que quiere entender la situación de un "
     "vistazo, no para una máquina.\n\n" + _GROUNDING
 )
@@ -99,12 +101,42 @@ def _client():
     )
 
 
+# ─── Caché de contexto ───────────────────────────────────────────────────────
+# No está para ahorrar E/S — construir el digest cuesta milisegundos. Está para
+# que el PROMPT NO CAMBIE entre preguntas seguidas.
+#
+# Ollama reutiliza el KV cache mientras el texto coincida carácter a carácter
+# desde el principio, y a la primera diferencia reprocesa todo. Como el digest
+# empieza por el número de ciclo y la marca de tiempo, cada reconstrucción
+# invalidaba el caché entero. Medido en esta máquina: mismo contexto → 5-14 s;
+# contexto distinto → 120-305 s. Reutilizándolo durante unos segundos, una
+# conversación de varias preguntas solo paga el precio completo en la primera.
+_context_cache: dict = {}
+
+
 def _context_block(window_min=None, source_dir=None, compact=False):
     window_min = window_min or getattr(config, "ANALYST_WINDOW_MIN", 5)
+    ttl = getattr(config, "ANALYST_CACHE_TTL", 60)
+    # source_dir en la clave: al cambiar a un run archivado se reconstruye solo.
+    key = (source_dir or telemetry_digest.TMP_DIR, window_min, compact)
+
+    if ttl > 0:
+        hit = _context_cache.get(key)
+        if hit and (time.time() - hit["built_at"]) < ttl:
+            return hit["ctx"], hit["text"], int(time.time() - hit["built_at"])
+
     ctx = telemetry_digest.build_network_context(window_min=window_min,
                                                  source_dir=source_dir,
                                                  compact=compact)
-    return ctx, telemetry_digest.render_context_text(ctx)
+    text = telemetry_digest.render_context_text(ctx)
+    if ttl > 0:
+        _context_cache[key] = {"ctx": ctx, "text": text, "built_at": time.time()}
+    return ctx, text, 0
+
+
+def invalidate_context_cache():
+    """Fuerza la reconstrucción en la próxima consulta."""
+    _context_cache.clear()
 
 
 # ─── Registro auditable ──────────────────────────────────────────────────────
@@ -177,7 +209,7 @@ def summarize(window_min=None, source_dir=None) -> dict:
     started = time.time()
     # Perfil compacto: el informe narrativo no necesita el detalle completo y en
     # inferencia por CPU el prompt es lo que cuesta.
-    ctx, text = _context_block(window_min, source_dir, compact=True)
+    ctx, text, age = _context_block(window_min, source_dir, compact=True)
 
     if not _has_data(ctx):
         return {
@@ -197,7 +229,7 @@ def summarize(window_min=None, source_dir=None) -> dict:
         ],
         # num_predict acota la generación: el informe pedido son 5-8 frases, y
         # sin tope los modelos pequeños siguen escribiendo y duplican la espera.
-        options={"temperature": 0.2, "num_predict": 400},
+        options={"temperature": 0, "num_predict": 400},
     )
     report = ((response.get("message", {}) or {}).get("content") or "").strip()
 
@@ -209,6 +241,7 @@ def summarize(window_min=None, source_dir=None) -> dict:
         "sources": _sources_for(ctx),
         "cycle": ctx.get("cycle"),
         "context": text,
+        "context_age_sec": age,
     }
     _record_history("summary", None, report, text, result, source_dir=source_dir)
     return result
@@ -231,7 +264,7 @@ def answer(question, history=None, window_min=None, source_dir=None) -> dict:
     # historial y los esquemas de las herramientas, y todo junto debe caber en
     # la ventana del modelo. Si se desborda, Ollama trunca por silencio y el
     # modelo responde inventándose los datos que le faltan.
-    ctx, text = _context_block(window_min, source_dir, compact=True)
+    ctx, text, age = _context_block(window_min, source_dir, compact=True)
 
     messages = [{"role": "system", "content": _ANSWER_SYSTEM},
                 {"role": "user", "content": f"TELEMETRÍA DE LA RED:\n\n{text}"}]
@@ -269,6 +302,7 @@ def answer(question, history=None, window_min=None, source_dir=None) -> dict:
         "cycle": ctx.get("cycle"),
         "context": text,
         "context_chars": len(text),
+        "context_age_sec": age,
     }
     _record_history("ask", question, result["answer"], text, result,
                     source_dir=source_dir)
@@ -279,7 +313,7 @@ def _answer_without_tools(messages) -> str:
     response = _client().chat(
         model=getattr(config, "MODEL_ANALYST", "qwen2.5:7b"),
         messages=messages,
-        options={"temperature": 0.2, "num_predict": 400},
+        options={"temperature": 0, "num_predict": 400},
     )
     return ((response.get("message", {}) or {}).get("content") or "").strip()
 

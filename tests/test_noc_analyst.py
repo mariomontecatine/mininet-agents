@@ -139,8 +139,11 @@ def test_el_contexto_en_texto_cabe_en_el_prompt(run_dir):
     assert "srv2" in text
     # Detección y verdad-terreno van en secciones separadas y etiquetadas: sin
     # eso el modelo las mezcla y afirma que no hubo ataques.
-    assert "ANOMALÍAS QUE EL SISTEMA DETECTÓ" in text
-    assert "ATAQUES QUE SE LANZARON DE VERDAD" in text
+    assert "ANOMALÍAS DETECTADAS EN LOS ÚLTIMOS" in text
+    assert "DETALLE DE ESOS MISMOS ATAQUES INYECTADOS" in text
+    # Un solo nombre para el conjunto: con dos, el modelo los tomaba por
+    # poblaciones distintas y sumaba ataques que no existían.
+    assert "DE VERDAD" not in text
 
 
 def test_el_perfil_compacto_reduce_el_contexto_a_la_mitad(run_dir):
@@ -177,7 +180,7 @@ def test_un_ddos_multiorigen_no_aparece_como_atacante_None(tmp_path):
     text = telemetry_digest.render_context_text(
         telemetry_digest.build_network_context(source_dir=str(tmp_path)))
     assert "None" not in text
-    assert "5 hosts (h4, h11, h1…)" in text
+    assert "desde 5 hosts a la vez (h4, h11, h1…)" in text
     assert "srv2 -> srv4" in text
 
 
@@ -193,6 +196,401 @@ def test_jsonl_con_lineas_corruptas_no_rompe_la_lectura(tmp_path):
     alerts = telemetry_digest.read_jsonl("flow_alerts.jsonl",
                                          source_dir=str(tmp_path))
     assert [a["type"] for a in alerts] == ["ddos", "dos_volumetric"]
+
+
+# ─── Conclusiones precalculadas ──────────────────────────────────────────────
+# Cada test de aquí corresponde a un fallo REAL observado del modelo local, que
+# tenía el dato delante y aun así respondía mal por no saber calcular.
+
+def test_la_correlacion_se_da_hecha_y_coincide_con_el_scorecard(run_dir):
+    """El 3b decía 'no se detectó ninguno' teniendo ambas listas delante."""
+    corr = telemetry_digest.correlate_attacks(source_dir=str(run_dir))
+    assert corr["total"] == 1
+    assert corr["detected"] == 1
+    assert corr["detection_rate"] == 100
+    assert corr["missed"] == []
+
+    text = telemetry_digest.render_context_text(
+        telemetry_digest.build_network_context(source_dir=str(run_dir)))
+    assert "DETECTÓ 1 de 1 (100%)" in text
+    assert "Ninguno pasó desapercibido" in text
+    # Detección y mitigación se dan por separado: el modelo las fundía en un
+    # "los mitigó todos" que exageraba el rendimiento del sistema.
+    assert f"mitigar {corr['mitigated']} de {corr['total']}" in text
+    assert "Detectar y mitigar son cosas distintas" in text
+
+
+def test_los_ataques_sin_mitigar_se_nombran_uno_a_uno(tmp_path):
+    """Con solo el recuento ('8 de 9'), el modelo se inventaba CUÁL faltaba."""
+    _write_lines(tmp_path, "anomaly_injections.jsonl", [{
+        "type": "ddos", "ts_start": "2026-06-01T17:00:00",
+        "ts_start_epoch": 1780326000.0, "duration_sec": 40,
+        "attackers": ["h9", "h7", "h6", "h1"], "attacker_ports": ["s3-eth9"],
+        "victim": "srv6", "victim_service": "ssh",
+    }])
+    corr = telemetry_digest.correlate_attacks(source_dir=str(tmp_path))
+    assert corr["mitigated"] == 0
+    assert corr["unmitigated"][0]["victim"] == "srv6"
+
+    text = telemetry_digest.render_context_text(
+        telemetry_digest.build_network_context(source_dir=str(tmp_path)))
+    assert "El único ataque SIN mitigar es exactamente este" in text
+    assert "-> srv6" in text
+
+
+def test_si_todos_se_mitigaron_se_dice_explicitamente(run_dir):
+    text = telemetry_digest.render_context_text(
+        telemetry_digest.build_network_context(source_dir=str(run_dir)))
+    corr = telemetry_digest.correlate_attacks(source_dir=str(run_dir))
+    if corr["unmitigated"]:
+        assert "SIN mitigar" in text
+    else:
+        assert "Todos ellos recibieron mitigación QoS." in text
+    # El operador pregunta por ataques "inyectados"; el sistema los llama
+    # "lanzados". Con el término solo en una forma, el modelo no ligaba la
+    # pregunta con la sección y respondía justo lo contrario de lo que ponía.
+    # Se comprueba la raíz para que valga en singular y en plural.
+    for raiz in ("INYECTADOS", "LANZADOS", "inyectad", "lanzad", "DETECTÓ"):
+        assert raiz in text
+
+
+def test_la_concordancia_y_el_matiz_se_ajustan_al_recuento(tmp_path):
+    """Con "De 1 ataqueS" y un "en su mayoría" fijo aunque fuese 100%, el
+    modelo copiaba la vaguedad: respondía "detectó 1 de los ataques"."""
+    def _texto():
+        return telemetry_digest.render_context_text(
+            telemetry_digest.build_network_context(source_dir=str(tmp_path)))
+
+    uno = {"type": "dos_volumetric", "ts_start": "2026-06-01T17:00:00",
+           "ts_start_epoch": 1780326000.0, "duration_sec": 30,
+           "attacker": "h1", "attacker_ports": ["s3-eth2"], "victim": "srv1",
+           "victim_service": "http"}
+    _write_lines(tmp_path, "anomaly_injections.jsonl", [uno])
+    _write_lines(tmp_path, "flow_alerts.jsonl", [{
+        "type": "dos_volumetric", "host": "h1", "victim": "srv1",
+        "ts": "2026-06-01T17:00:10",
+    }])
+    text = _texto()
+    assert "De 1 ataque inyectado (lanzado)" in text   # singular
+    assert "SÍ, TODOS." in text                        # 100%, sin vaguedades
+    assert "en su mayoría" not in text
+
+    # Con uno detectado y otro que no, el matiz cambia.
+    otro = dict(uno, ts_start="2026-06-01T18:00:00",
+                ts_start_epoch=1780329600.0, attacker="h9",
+                attacker_ports=["s3-eth9"], victim="srv2")
+    _write_lines(tmp_path, "anomaly_injections.jsonl", [uno, otro])
+    text = _texto()
+    assert "De 2 ataques inyectados (lanzados)" in text  # plural
+    assert "SÍ, la mayoría." in text
+    assert "(50%)" in text
+
+
+def test_los_puertos_troncales_se_marcan_para_explicar_la_carga(run_dir):
+    """Preguntado "¿qué puerto va más cargado Y POR QUÉ?", contestaba solo el
+    qué: veía el número pero no que ese puerto es el troncal."""
+    _write(run_dir, "central_link.json", {
+        "central_switch": "s2", "shaping_port": "s1-eth3",
+        "ports": ["s1-eth3", "s1-eth4"], "hosts_behind": {"s1-eth3": 14},
+    })
+    summary = telemetry_digest.summarize_ports(window_min=60,
+                                               source_dir=str(run_dir))
+    fila = {r["port"]: r for r in summary["ports"]}["s1-eth3"]
+    assert fila["trunk"] is True
+
+    text = telemetry_digest.render_context_text(
+        telemetry_digest.build_network_context(source_dir=str(run_dir)))
+    assert "s1-eth3 [troncal central]" in text
+    # La explicación del rol va una sola vez, no repetida en cada línea.
+    assert text.count("por ahí pasa el tráfico entre subredes") == 1
+
+
+def test_un_ataque_no_detectado_se_nombra_explicitamente(tmp_path):
+    _write_lines(tmp_path, "anomaly_injections.jsonl", [{
+        "id": "INJ-9", "type": "dos_volumetric",
+        "ts_start": "2026-06-01T10:00:00",
+        "ts_start_epoch": 1780300800.0, "duration_sec": 30,
+        "attacker": "h9", "attacker_ports": ["s3-eth9"],
+        "victim": "srv1", "victim_service": "http",
+    }])
+    corr = telemetry_digest.correlate_attacks(source_dir=str(tmp_path))
+    assert corr["detected"] == 0
+    assert corr["missed"][0]["attacker"] == "h9"
+
+    text = telemetry_digest.render_context_text(
+        telemetry_digest.build_network_context(source_dir=str(tmp_path)))
+    assert "Pasaron desapercibidos 1" in text
+    assert "h9 -> srv1" in text
+
+
+def test_un_ataque_vivo_se_marca_como_en_curso(tmp_path):
+    """Preguntado por '¿hay ataques en curso?' respondía que no mientras uno
+    seguía corriendo: tenía inicio y duración, pero no sabía restarlos."""
+    from datetime import datetime as _dt, timedelta as _td
+    hace_10s = _dt.now() - _td(seconds=10)
+    _write_lines(tmp_path, "anomaly_injections.jsonl", [{
+        "type": "dos_volumetric", "ts_start": hace_10s.isoformat(timespec="seconds"),
+        "duration_sec": 60, "attacker": "h2", "victim": "srv3",
+        "victim_service": "http",
+    }])
+    # source_dir distinto de tmp/ usa la marca más reciente de los datos, así
+    # que forzamos la referencia al reloj para simular la sesión viva.
+    running = telemetry_digest.attacks_in_progress(source_dir=str(tmp_path),
+                                                   reference=_dt.now())
+    assert len(running) == 1
+    assert running[0]["victim"] == "srv3"
+    assert 8 <= running[0]["started_ago_sec"] <= 12
+    assert running[0]["remaining_sec"] > 0
+
+
+def test_en_un_run_archivado_la_referencia_sale_de_los_datos(run_dir):
+    """El reloj no sirve para juzgar un run de hace semanas: el instante de
+    referencia es la marca más reciente del propio run. Aquí el ataque empezó
+    a las 17:05:22 y dura 57 s, y el último evento del run es 17:05:35, así
+    que en ese instante seguía en curso."""
+    running = telemetry_digest.attacks_in_progress(source_dir=str(run_dir))
+    assert len(running) == 1
+    assert running[0]["victim"] == "srv4"
+
+    text = telemetry_digest.render_context_text(
+        telemetry_digest.build_network_context(source_dir=str(run_dir)))
+    assert "SÍ — 1 ataque(s) en curso" in text
+
+
+def test_un_ataque_terminado_no_figura_en_curso(run_dir):
+    """Mismo run, pero con un ataque muy anterior al último evento."""
+    _write_lines(run_dir, "anomaly_injections.jsonl", [{
+        "type": "dos_volumetric", "ts_start": "2026-06-01T16:00:00",
+        "duration_sec": 30, "attacker": "h1", "victim": "srv1",
+        "victim_service": "http",
+    }])
+    assert telemetry_digest.attacks_in_progress(source_dir=str(run_dir)) == []
+    text = telemetry_digest.render_context_text(
+        telemetry_digest.build_network_context(source_dir=str(run_dir)))
+    assert "NO. Ningún ataque está activo" in text
+
+
+def test_las_detecciones_repetidas_se_agrupan(run_dir):
+    """El detector dispara varias veces por ataque; sin agrupar, el modelo las
+    enumeraba como incidentes distintos."""
+    alerts = [
+        {"type": "ddos", "host": "srv1", "victim": "srv2", "service": "http",
+         "port": "s1-eth2", "bytes": 100, "ts": "2026-06-01T17:00:00"},
+        {"type": "ddos", "host": "srv1", "victim": "srv2", "service": "http",
+         "port": "s1-eth2", "bytes": 500, "ts": "2026-06-01T17:00:30"},
+        {"type": "dos_volumetric", "host": "h3", "victim": "srv4",
+         "service": "ssh", "port": "s3-eth4", "bytes": 90,
+         "ts": "2026-06-01T17:01:00"},
+    ]
+    grouped = telemetry_digest.group_alerts(alerts)
+    assert len(grouped) == 2
+    assert grouped[0]["count"] == 2
+    assert grouped[0]["max_bytes"] == 500      # se conserva el pico
+    assert grouped[0]["first_ts"] == "2026-06-01T17:00:00"
+    assert grouped[1]["count"] == 1
+
+
+def test_las_acciones_posteriores_al_ciclo_cuentan_como_activas(tmp_path):
+    """state.json se escribe por ciclo, pero las acciones [FLOW] van entre
+    ciclos: el digest decía 'ninguna' y acto seguido listaba un apply."""
+    _write(tmp_path, "state.json", {
+        "ciclo": 3, "timestamp": "2026-06-01T17:00:00",
+        "estado_red": "ESTABLE", "reglas_activas": {},
+    })
+    _write(tmp_path, "qos_history.json", [
+        {"ts": "2026-06-01T17:00:15", "cycle": 3, "port": "s3-eth2",
+         "action": "SHAPING", "event": "apply", "protocol": "ssh"},
+    ])
+    rules = telemetry_digest.effective_mitigations(source_dir=str(tmp_path))
+    assert rules["s3-eth2"]["action"] == "SHAPING"
+
+    text = telemetry_digest.render_context_text(
+        telemetry_digest.build_network_context(source_dir=str(tmp_path)))
+    assert "MITIGACIONES ACTIVAS === ninguna" not in text
+    assert "s3-eth2: SHAPING" in text
+
+
+def test_una_retirada_posterior_desactiva_la_regla(tmp_path):
+    _write(tmp_path, "state.json", {
+        "ciclo": 3, "timestamp": "2026-06-01T17:00:00",
+        "reglas_activas": {"s3-eth2": {"action": "SHAPING", "ciclo": 2}},
+    })
+    _write(tmp_path, "qos_history.json", [
+        {"ts": "2026-06-01T17:00:20", "port": "s3-eth2", "event": "remove"},
+    ])
+    assert telemetry_digest.effective_mitigations(source_dir=str(tmp_path)) == {}
+
+
+def test_no_se_expone_la_hora_del_muestreo_sflow(run_dir):
+    """flows.json la estampa el reloj de la VM, que puede ir desfasado del
+    anfitrión (se midieron 21 h): dos líneas temporales confunden al modelo."""
+    text = telemetry_digest.render_context_text(
+        telemetry_digest.build_network_context(source_dir=str(run_dir)))
+    assert "ÚLTIMO MUESTREO" in text
+    assert "17:05:20" not in text          # la ts de flows.json del fixture
+    assert "01/06 17:05:20" not in text
+
+
+# ─── Ventana temporal y topes ────────────────────────────────────────────────
+
+def test_la_ventana_recorta_el_detalle_pero_no_el_marcador(tmp_path):
+    """Lo delicado del recorte: si al acotar a N minutos el marcador global
+    dijese '0 ataques', se rompería la pregunta clave del TFG. La ventana
+    recorta el DETALLE; los contadores siguen siendo de toda la ejecución."""
+    viejo = {"type": "ddos", "ts_start": "2026-06-01T10:00:00",
+             "ts_start_epoch": 1780300800.0, "duration_sec": 30,
+             "attacker": "h1", "attacker_ports": ["s3-eth2"], "victim": "srv1",
+             "victim_service": "http"}
+    nuevo = dict(viejo, ts_start="2026-06-01T12:00:00",
+                 ts_start_epoch=1780308000.0, attacker="h2",
+                 attacker_ports=["s3-eth3"], victim="srv2")
+    _write_lines(tmp_path, "anomaly_injections.jsonl", [viejo, nuevo])
+
+    # Detalle: solo el de dentro de la ventana de 5 min.
+    detalle = telemetry_digest.recent_injections(source_dir=str(tmp_path),
+                                                 window_min=5)
+    assert [d["victim"] for d in detalle] == ["srv2"]
+
+    # Marcador: los dos, porque correlate_attacks no mira la ventana.
+    corr = telemetry_digest.correlate_attacks(source_dir=str(tmp_path))
+    assert corr["total"] == 2
+
+    text = telemetry_digest.render_context_text(
+        telemetry_digest.build_network_context(source_dir=str(tmp_path),
+                                               window_min=5))
+    assert "De 2 ataques inyectados" in text     # contador global intacto
+    assert "srv1" not in text.split("=== DETALLE")[1]  # detalle recortado
+
+
+def test_sin_ventana_no_se_recorta_nada(tmp_path):
+    _write_lines(tmp_path, "flow_alerts.jsonl", [
+        {"type": "ddos", "host": "h1", "ts": "2026-06-01T10:00:00"},
+        {"type": "ddos", "host": "h2", "ts": "2026-06-01T12:00:00"},
+    ])
+    assert len(telemetry_digest.recent_alerts(source_dir=str(tmp_path))) == 2
+    assert len(telemetry_digest.recent_alerts(source_dir=str(tmp_path),
+                                              window_min=5)) == 1
+
+
+def test_la_ventana_se_ancla_al_ultimo_evento_no_al_reloj(tmp_path):
+    """Sobre un run archivado hace semanas el reloj no sirve de referencia."""
+    _write_lines(tmp_path, "flow_alerts.jsonl", [
+        {"type": "ddos", "host": "h1", "ts": "2020-01-01T10:00:00"},
+        {"type": "ddos", "host": "h2", "ts": "2020-01-01T10:02:00"},
+    ])
+    rows = telemetry_digest.recent_alerts(source_dir=str(tmp_path),
+                                          window_min=5)
+    assert len(rows) == 2, "ambas están dentro de 5 min del último evento"
+
+
+def test_las_listas_de_excepciones_tienen_tope(tmp_path):
+    """missed y unmitigated recorren TODA la ejecución: sin tope crecían sin
+    límite en un run largo."""
+    inyecciones = [{
+        "type": "dos_volumetric", "ts_start": f"2026-06-01T10:{i:02d}:00",
+        "ts_start_epoch": 1780300800.0 + i * 60, "duration_sec": 30,
+        "attacker": f"h{i}", "attacker_ports": [f"s3-eth{i}"],
+        "victim": "srv1", "victim_service": "http",
+    } for i in range(20)]
+    _write_lines(tmp_path, "anomaly_injections.jsonl", inyecciones)
+
+    corr = telemetry_digest.correlate_attacks(source_dir=str(tmp_path))
+    assert corr["missed_total"] == 20                    # el recuento, entero
+    assert len(corr["missed"]) == telemetry_digest.MAX_EXCEPTIONS
+
+    text = telemetry_digest.render_context_text(
+        telemetry_digest.build_network_context(source_dir=str(tmp_path)))
+    assert "Pasaron desapercibidos 20" in text
+    assert "se listan los 5 últimos" in text
+
+
+def test_las_mitigaciones_activas_tienen_tope(tmp_path):
+    _write(tmp_path, "state.json", {
+        "ciclo": 9, "timestamp": "2026-06-01T17:00:00",
+        "reglas_activas": {f"s1-eth{i}": {"action": "SHAPING", "ciclo": i}
+                           for i in range(12)},
+    })
+    text = telemetry_digest.render_context_text(
+        telemetry_digest.build_network_context(source_dir=str(tmp_path)))
+    assert "puertos más con mitigación activa" in text
+
+
+# ─── Caché de contexto ───────────────────────────────────────────────────────
+
+def test_el_ttl_supera_el_tiempo_de_una_respuesta(monkeypatch):
+    """Regresión de un error real: con TTL=60 s y respuestas de 240-400 s, el
+    contexto caducaba mientras el modelo aún contestaba la pregunta anterior,
+    así que la caché nunca llegaba viva a la siguiente consulta."""
+    from utils import config as cfg
+    assert cfg.ANALYST_CACHE_TTL > cfg.ANALYST_LLM_TIMEOUT / 2, (
+        "el TTL debe cubrir al menos una respuesta lenta o la caché es inútil"
+    )
+
+
+def test_dos_consultas_seguidas_comparten_contexto_identico(run_dir, monkeypatch):
+    """La medida que gana la latencia: Ollama solo reutiliza su caché si el
+    prompt coincide carácter a carácter desde el principio."""
+    monkeypatch.setattr(noc_analyst.config, "ANALYST_CACHE_TTL", 60)
+    noc_analyst.invalidate_context_cache()
+
+    _, texto1, edad1 = noc_analyst._context_block(source_dir=str(run_dir))
+    _, texto2, edad2 = noc_analyst._context_block(source_dir=str(run_dir))
+
+    assert texto1 == texto2, "el prompt debe ser idéntico byte a byte"
+    assert edad1 == 0        # la primera lo construye
+    assert edad2 >= 0        # la segunda lo reutiliza
+
+
+def test_el_ttl_a_cero_desactiva_la_cache(run_dir, monkeypatch):
+    monkeypatch.setattr(noc_analyst.config, "ANALYST_CACHE_TTL", 0)
+    noc_analyst.invalidate_context_cache()
+    _, _, edad1 = noc_analyst._context_block(source_dir=str(run_dir))
+    _, _, edad2 = noc_analyst._context_block(source_dir=str(run_dir))
+    assert edad1 == edad2 == 0, "sin caché, siempre recién construido"
+
+
+def test_la_cache_caduca(run_dir, monkeypatch):
+    monkeypatch.setattr(noc_analyst.config, "ANALYST_CACHE_TTL", 60)
+    noc_analyst.invalidate_context_cache()
+    noc_analyst._context_block(source_dir=str(run_dir))
+
+    # Envejecemos la entrada más allá del TTL.
+    for entrada in noc_analyst._context_cache.values():
+        entrada["built_at"] -= 120
+    _, _, edad = noc_analyst._context_block(source_dir=str(run_dir))
+    assert edad == 0, "pasado el TTL debe reconstruirse"
+
+
+def test_cambiar_de_run_invalida_la_cache(run_dir, tmp_path, monkeypatch):
+    """Al cargar un run archivado el analista debe hablar de ESE run."""
+    monkeypatch.setattr(noc_analyst.config, "ANALYST_CACHE_TTL", 60)
+    noc_analyst.invalidate_context_cache()
+
+    otro = tmp_path / "otro_run"
+    otro.mkdir()
+    _write(otro, "state.json", {"ciclo": 999, "timestamp": "2026-06-01T20:00:00",
+                                "estado_red": "ESTABLE"})
+
+    _, texto_a, _ = noc_analyst._context_block(source_dir=str(run_dir))
+    _, texto_b, _ = noc_analyst._context_block(source_dir=str(otro))
+    assert texto_a != texto_b
+    assert "Ciclo: 999" in texto_b
+
+
+def test_la_antiguedad_del_contexto_llega_a_la_respuesta(run_dir, monkeypatch):
+    """Si la respuesta describe datos de hace un rato, hay que poder saberlo."""
+    monkeypatch.setattr(noc_analyst.config, "ANALYST_CACHE_TTL", 60)
+    monkeypatch.setattr(mcp_ollama_bridge, "chat_with_tools",
+                        lambda *a, **kw: ("ok", []))
+    noc_analyst.invalidate_context_cache()
+
+    primera = noc_analyst.answer("¿qué tal?", source_dir=str(run_dir))
+    assert primera["context_age_sec"] == 0
+
+    for entrada in noc_analyst._context_cache.values():
+        entrada["built_at"] -= 20
+    segunda = noc_analyst.answer("¿y ahora?", source_dir=str(run_dir))
+    assert segunda["context_age_sec"] >= 20
 
 
 # ─── Analista ────────────────────────────────────────────────────────────────
@@ -314,7 +712,7 @@ def test_cada_consulta_archiva_el_digest_que_vio_el_modelo(run_dir, monkeypatch)
     # La prueba del delito: el contexto archivado contiene los ataques que SÍ
     # había, así que la respuesta se puede refutar después.
     assert "dos_volumetric" in entry["context"]
-    assert "ATAQUES QUE SE LANZARON DE VERDAD" in entry["context"]
+    assert "DETALLE DE ESOS MISMOS ATAQUES INYECTADOS" in entry["context"]
     assert "flow_alerts.jsonl" in entry["sources"]
 
 

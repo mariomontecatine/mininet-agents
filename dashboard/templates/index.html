@@ -2703,6 +2703,9 @@ function anMeta(d) {
   const bits = [];
   if (d.model) bits.push(d.model);
   if (typeof d.elapsed_ms === 'number') bits.push((d.elapsed_ms / 1000).toFixed(1) + ' s');
+  // Si el digest venía de caché, la respuesta describe la red de hace unos
+  // segundos. Se dice, porque si no el operador no puede saberlo.
+  if (d.context_age_sec) bits.push('datos de hace ' + d.context_age_sec + ' s');
   if (d.tool_calls && d.tool_calls.length)
     bits.push('herramientas: ' + d.tool_calls.map(t => t.tool).join(', '));
   if (d.sources && d.sources.length) bits.push('fuentes: ' + d.sources.join(', '));

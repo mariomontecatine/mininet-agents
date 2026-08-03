@@ -128,7 +128,7 @@ async def _chat_loop(server, model, messages, allowed_tools, max_rounds,
 
 
 def chat_with_tools(server, messages, model=None, allowed_tools=None,
-                    max_rounds=None, timeout=None, temperature=0.2):
+                    max_rounds=None, timeout=None, temperature=0.0):
     """Ejecuta un bucle de tool-calling contra `server` y devuelve (texto, traza).
 
     server:        instancia de MCPServer (en proceso) o URL de un servidor MCP.
